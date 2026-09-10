@@ -256,7 +256,7 @@ class PrebuiltRootfsRunner:
         except EnvironmentSnapshotError as exc:
             raise PrebuiltRunnerError(str(exc)) from exc
         if actual_digest != snapshot_manifest.tree_sha256:
-            raise PrebuiltRunnerError("prepared execution rootfs no longer matches its environment snapshot: expected {snapshot_manifest.tree_sha256}, got {actual_digest}")
+            raise PrebuiltRunnerError(f"prepared execution rootfs no longer matches its environment snapshot: expected {snapshot_manifest.tree_sha256}, got {actual_digest}")
 
         template_run_dir = self.config.template_run_dir.resolve(strict=False)
         _validate_directory(template_run_dir, "template run directory")
@@ -300,7 +300,7 @@ class PrebuiltRootfsRunner:
                 raise PrebuiltRunnerError(f"replay store changed after the execution contract was bound: expected {self.config.replay_store_expected_sha256}, got {replay_store_sha256}")
             assert template_network_policy_path is not None
             try:
-                validate_replay_policy(policy=load_network_policy(template_network_policy_path),replay_store=ReplayStore(replay_store_path)
+                validate_replay_policy(policy=load_network_policy(template_network_policy_path),replay_store=ReplayStore(replay_store_path))
             except (NetworkReplayError,OSError,TypeError,ValueError,json.JSONDecodeError) as exc:
                 raise PrebuiltRunnerError(f"invalid deterministic replay preflight: {exc}") from exc
 
@@ -547,7 +547,7 @@ class PrebuiltRootfsRunner:
                 "environment_tree_sha256": context.environment_tree_sha256,
                 "execution_rootfs": str(context.execution_rootfs),
                 "template_run_dir": str(context.template_run_dir),
-                "template_runtime_sha256": _sha256_filecontext.template_runtime_path),
+                "template_runtime_sha256": _sha256_file(context.template_runtime_path),
                 "host_binary": str(context.host_binary),
                 "host_binary_sha256": _sha256_file(context.host_binary),
                 "guest_binary": context.guest_binary,
@@ -607,7 +607,7 @@ class PrebuiltRootfsRunner:
         (destination / "responses").mkdir()
         shutil.copy2(source.index_path, destination / "index.json")
         for entry in source.load_entries():
-            for source_path in (source.request_blob_path(entry), source.response_blob_path(entry):
+            for source_path in (source.request_blob_path(entry), source.response_blob_path(entry)):
                 relative = source_path.relative_to(source.root)
                 target = destination / relative
                 target.parent.mkdir(parents=True, exist_ok=True)

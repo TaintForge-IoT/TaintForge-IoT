@@ -24,6 +24,7 @@ from taintforge_env.repair_plan import (
     RepairRisk,
     make_decision_id,
 )
+from taintforge_env.replay_store import ReplayStore
 from taintforge_env.synthesis_loop import (
     EnvironmentSynthesisLoop,
     LoopOutcome,
@@ -119,6 +120,8 @@ class SynthesisLoopTests(unittest.TestCase):
             "scripts/parse_qemu_strace.py",
             "scripts/plan_repairs.py",
             "scripts/generate_report.py",
+            "scripts/start_network_emulator.py",
+            "scripts/start_transparent_logger.py",
         ):
             path = self.project / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,6 +312,142 @@ class SynthesisLoopTests(unittest.TestCase):
                 runner_factory=FakeRunnerFactory(),
             ).run()
         self.assertFalse(self.session.exists())
+
+    def test_controlled_service_script_drift_is_rejected(self) -> None:
+        loop = EnvironmentSynthesisLoop(
+            self.config(network_mode="controlled", initialize_only=True),
+            runner_factory=FakeRunnerFactory(),
+        )
+        loop.run()
+        for name in ("start_network_emulator.py", "start_transparent_logger.py"):
+            with self.subTest(script=name):
+                script = self.project / "scripts" / name
+                original = script.read_bytes()
+                try:
+                    script.write_bytes(original + b"\n# changed responder\n")
+                    with self.assertRaisesRegex(SynthesisLoopError, "modified"):
+                        EnvironmentSynthesisLoop.verify_session(self.session)
+                    with self.assertRaisesRegex(SynthesisLoopError, "configuration drift"):
+                        loop.run()
+                finally:
+                    script.write_bytes(original)
+
+    def test_replay_store_is_bound_and_passed_to_runner(self) -> None:
+        replay_script = self.project / "scripts" / "start_network_replay.py"
+        replay_script.write_text("# test replay entrypoint\n", encoding="utf-8")
+        write_json(
+            self.template / "config" / "network_policy.json",
+            {
+                "mode": "replay",
+                "allow_internet": False,
+                "services": [
+                    {
+                        "service_type": "tcp",
+                        "role": "c2",
+                        "remote_ip": "203.0.113.10",
+                        "remote_port": 48101,
+                        "domain": None,
+                        "bind_ip": "127.0.0.1",
+                        "bind_port": 48101,
+                        "protocol_hint": "c2_binary",
+                    }
+                ],
+                "catch_all": {"enabled": True},
+            },
+        )
+        replay = ReplayStore(self.root / "replay-store")
+        replay.add(
+            transport="tcp",
+            remote_ip="203.0.113.10",
+            remote_port=48101,
+            request_bytes=b"hello",
+            response_bytes=b"world",
+            protocol_hint="c2_binary",
+        )
+        digest = replay.validate()["store_sha256"]
+        factory = FakeRunnerFactory(automatic_sequence=[False])
+
+        result = EnvironmentSynthesisLoop(
+            self.config(
+                network_mode="replay",
+                replay_store_path=replay.root,
+            ),
+            runner_factory=factory,
+        ).run()
+
+        self.assertEqual(result.outcome, LoopOutcome.COMPLETED)
+        self.assertEqual(factory.configs[0].network_mode, "replay")
+        self.assertEqual(factory.configs[0].replay_store_path, replay.root.resolve())
+        self.assertEqual(
+            factory.configs[0].replay_store_expected_sha256,
+            digest,
+        )
+        binding = json.loads((self.session / "synthesis_loop.json").read_text())
+        self.assertEqual(binding["replay_store_path"], str(replay.root.resolve()))
+        self.assertEqual(binding["replay_store_sha256"], digest)
+        self.assertEqual(binding["replay_store_entries"], 1)
+        self.assertTrue(
+            EnvironmentSynthesisLoop.verify_session(self.session)[
+                "binding_verified"
+            ]
+        )
+
+    def test_replay_store_drift_is_rejected_on_resume_and_verify(self) -> None:
+        replay_script = self.project / "scripts" / "start_network_replay.py"
+        replay_script.write_text("# test replay entrypoint\n", encoding="utf-8")
+        write_json(
+            self.template / "config" / "network_policy.json",
+            {
+                "mode": "replay",
+                "allow_internet": False,
+                "services": [
+                    {
+                        "service_type": "tcp",
+                        "role": "c2",
+                        "remote_ip": "203.0.113.10",
+                        "remote_port": 48101,
+                        "domain": None,
+                        "bind_ip": "127.0.0.1",
+                        "bind_port": 48101,
+                        "protocol_hint": "c2_binary",
+                    }
+                ],
+            },
+        )
+        replay = ReplayStore(self.root / "replay-store")
+        replay.add(
+            transport="tcp",
+            remote_ip="203.0.113.10",
+            remote_port=48101,
+            request_bytes=b"hello",
+            response_bytes=b"first",
+            protocol_hint="c2_binary",
+        )
+        EnvironmentSynthesisLoop(
+            self.config(
+                network_mode="replay",
+                replay_store_path=replay.root,
+                initialize_only=True,
+            ),
+            runner_factory=FakeRunnerFactory(),
+        ).run()
+        replay.add(
+            transport="tcp",
+            remote_ip="203.0.113.10",
+            remote_port=48101,
+            request_bytes=b"hello",
+            response_bytes=b"changed",
+            protocol_hint="c2_binary",
+            replace=True,
+        )
+
+        with self.assertRaisesRegex(SynthesisLoopError, "configuration drift"):
+            EnvironmentSynthesisLoop(
+                self.config(network_mode="replay", replay_store_path=None),
+                runner_factory=FakeRunnerFactory(),
+            ).run()
+        with self.assertRaisesRegex(SynthesisLoopError, "modified"):
+            EnvironmentSynthesisLoop.verify_session(self.session)
 
     def test_template_configuration_drift_is_rejected(self) -> None:
         EnvironmentSynthesisLoop(

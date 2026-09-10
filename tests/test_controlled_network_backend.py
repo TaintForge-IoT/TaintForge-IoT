@@ -12,6 +12,7 @@ from taintforge_env.controlled_network_backend import (
     ControlledNetworkConfig,
     ControlledNetworkError,
 )
+from taintforge_env.replay_store import ReplayStore
 
 
 class FakeResult:
@@ -110,6 +111,7 @@ class ControlledNetworkBackendTests(unittest.TestCase):
         (self.project / "scripts").mkdir(parents=True)
         for name in (
             "start_network_emulator.py",
+            "start_network_replay.py",
             "start_transparent_logger.py",
         ):
             (self.project / "scripts" / name).write_text(
@@ -163,7 +165,15 @@ class ControlledNetworkBackendTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def make_backend(self, *, self_test: bool = False, supervisor=None):
+    def make_backend(
+        self,
+        *,
+        self_test: bool = False,
+        supervisor=None,
+        responder_mode: str = "emulated",
+        replay_store_path: Path | None = None,
+        replay_store_expected_sha256: str | None = None,
+    ):
         return ControlledNetworkBackend(
             ControlledNetworkConfig(
                 project_root=self.project,
@@ -172,6 +182,11 @@ class ControlledNetworkBackendTests(unittest.TestCase):
                 session_id="session-test",
                 iteration_index=2,
                 self_test=self_test,
+                responder_mode=responder_mode,
+                replay_store_path=replay_store_path,
+                replay_store_expected_sha256=(
+                    replay_store_expected_sha256
+                ),
                 process_start_grace_seconds=0,
             ),
             executor=self.executor,
@@ -292,6 +307,107 @@ class ControlledNetworkBackendTests(unittest.TestCase):
             backend.setup()
         manifest = json.loads(backend.manifest_path.read_text())
         self.assertEqual(manifest["state"], "failed")
+
+    @patch("taintforge_env.controlled_network_backend.shutil.which", return_value="/bin/tool")
+    def test_replay_mode_uses_exact_responder_and_disables_catch_all(
+        self,
+        _which,
+    ) -> None:
+        write_json(
+            self.policy,
+            {
+                "mode": "replay",
+                "allow_internet": False,
+                "services": [
+                    {
+                        "service_type": "tcp",
+                        "role": "http",
+                        "remote_ip": "203.0.113.10",
+                        "remote_port": 80,
+                        "bind_ip": "10.10.0.1",
+                        "bind_port": 80,
+                        "protocol_hint": "text",
+                    },
+                    {
+                        "service_type": "tcp",
+                        "role": "loopback-http",
+                        "remote_ip": "127.0.0.1",
+                        "remote_port": 80,
+                        "bind_ip": "127.0.0.1",
+                        "bind_port": 80,
+                        "protocol_hint": "text",
+                    },
+                ],
+                "catch_all": {"enabled": True},
+            },
+        )
+        store_path = self.root / "replay-store"
+        store = ReplayStore(store_path)
+        for remote_ip in ("203.0.113.10", "127.0.0.1"):
+            store.add(
+                transport="tcp",
+                remote_ip=remote_ip,
+                remote_port=80,
+                request_bytes=b"GET / HTTP/1.0\r\n\r\n",
+                response_bytes=b"HTTP/1.0 200 OK\r\n\r\n",
+                protocol_hint="text",
+            )
+        digest = store.validate()["store_sha256"]
+
+        backend = self.make_backend(
+            responder_mode="replay",
+            replay_store_path=store_path,
+            replay_store_expected_sha256=digest,
+        )
+        result = backend.setup()
+        self.assertFalse(result.plan.catch_all_enabled)
+        commands = [process.command for process in self.supervisor.started]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(
+            all("scripts/start_network_replay.py" in command for command in commands)
+        )
+        self.assertTrue(all("--store" in command for command in commands))
+        self.assertFalse(
+            any("start_transparent_logger.py" in command for command in commands)
+        )
+        manifest = json.loads(backend.manifest_path.read_text())
+        self.assertEqual(manifest["responder_mode"], "replay")
+        self.assertEqual(manifest["replay_store_sha256"], digest)
+        backend.cleanup()
+
+    @patch("taintforge_env.controlled_network_backend.shutil.which", return_value="/bin/tool")
+    def test_replay_mode_refuses_incomplete_service_coverage(self, _which) -> None:
+        write_json(
+            self.policy,
+            {
+                "mode": "replay",
+                "allow_internet": False,
+                "services": [
+                    {
+                        "service_type": "tcp",
+                        "role": "http",
+                        "remote_ip": "203.0.113.10",
+                        "remote_port": 80,
+                        "protocol_hint": "text",
+                    }
+                ],
+                "catch_all": {"enabled": False},
+            },
+        )
+        store = ReplayStore(self.root / "empty-replay-store")
+        store.initialize()
+        digest = store.validate()["store_sha256"]
+        backend = self.make_backend(
+            responder_mode="replay",
+            replay_store_path=store.root,
+            replay_store_expected_sha256=digest,
+        )
+
+        with self.assertRaisesRegex(
+            ControlledNetworkError,
+            "does not cover every effective TCP service",
+        ):
+            backend.setup()
 
     def test_network_names_are_deterministic_and_interface_safe(self) -> None:
         from taintforge_env.controlled_network_backend import _derive_topology

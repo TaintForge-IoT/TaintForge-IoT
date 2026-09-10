@@ -341,7 +341,7 @@ class ControlledNetworkBackend:
         _validate_directory(self.config_dir, "run config directory")
         _validate_directory(self.logs_dir, "run logs directory")
         _validate_regular_file(self.config.template_policy_path,"template network policy")
-        service_scripts = (("scripts/start_network_replay.py") if self.config.responder_mode == "replay" else ("scripts/start_network_emulator.py","scripts/start_transparent_logger.py"))
+        service_scripts = (("scripts/start_network_replay.py",) if self.config.responder_mode == "replay" else ("scripts/start_network_emulator.py","scripts/start_transparent_logger.py"))
         for relative in service_scripts:
             _validate_regular_file(self.config.project_root / relative,relative)
         if self.config.responder_mode == "replay":

@@ -31,6 +31,9 @@ from .prebuilt_runner import (
     PrebuiltRunnerError,
     PrebuiltRunnerResult,
 )
+from .network_policy import load_network_policy
+from .network_replay import NetworkReplayError, validate_replay_policy
+from .replay_store import ReplayStore, ReplayStoreValidationError
 from .target_state_oracle import TargetStateError, TargetStateSpec
 
 
@@ -63,6 +66,7 @@ class SynthesisLoopConfig:
     target_spec_path: Path | None = None
     network_mode: str = "none"
     network_self_test: bool = False
+    replay_store_path: Path | None = None
     max_iterations: int = 5
     timeout_seconds: int = 60
     max_steps: int = 1
@@ -81,11 +85,23 @@ class SynthesisLoopConfig:
             self.binary_path = Path(self.binary_path).resolve(strict=False)
         if self.target_spec_path is not None:
             self.target_spec_path = Path(self.target_spec_path).resolve(strict=False)
+        if self.replay_store_path is not None:
+            self.replay_store_path = Path(self.replay_store_path).resolve(
+                strict=False
+            )
         self.network_mode = str(self.network_mode).strip().lower()
-        if self.network_mode not in {"none", "controlled"}:
-            raise SynthesisLoopError("network_mode must be one of: none, controlled")
+        if self.network_mode not in {"none", "controlled", "replay"}:
+            raise SynthesisLoopError(
+                "network_mode must be one of: none, controlled, replay"
+            )
         if self.network_self_test and self.network_mode != "controlled":
-            raise SynthesisLoopError("network_self_test requires network_mode=controlled")
+            raise SynthesisLoopError(
+                "network_self_test requires network_mode=controlled"
+            )
+        if self.network_mode != "replay" and self.replay_store_path is not None:
+            raise SynthesisLoopError(
+                "replay_store_path is valid only for network_mode=replay"
+            )
         if self.max_iterations < 1:
             raise SynthesisLoopError("max_iterations must be positive")
         if self.timeout_seconds < 1:
@@ -116,27 +132,55 @@ class SynthesisLoopResult:
             "last_iteration_index": self.last_iteration_index,
             "report_json": str(self.report_json),
             "report_markdown": str(self.report_markdown),
-            "event_log": str(self.event_log)
+            "event_log": str(self.event_log),
         }
 
 
 class EnvironmentSynthesisLoop:
+    """Thin orchestration layer over controller and prebuilt runner.
+
+    This class deliberately owns no repair, progress, snapshot, or execution
+    semantics.  It only advances the already-validated state machine:
+
+        prepare -> execute+complete -> inspect session decision -> repeat
+
+    A separate non-blocking loop lock prevents two automation processes from
+    driving the same session concurrently.  Individual controller transitions
+    continue to use the controller's own lock.
+    """
+
     SCHEMA_VERSION = 1
-    LOOP_VERSION = 5
+    LOOP_VERSION = 6
     BINDING_FILENAME = "synthesis_loop.json"
     EVENT_FILENAME = "synthesis_events.jsonl"
     REPORT_JSON_FILENAME = "synthesis_report.json"
     REPORT_MARKDOWN_FILENAME = "synthesis_report.md"
-    REQUIRED_PROJECT_SCRIPTS = ("scripts/capture_runtime_observations.py","scripts/parse_strace.py","scripts/parse_qemu_strace.py","scripts/plan_repairs.py","scripts/generate_report.py")
+    REQUIRED_PROJECT_SCRIPTS = (
+        "scripts/capture_runtime_observations.py",
+        "scripts/parse_strace.py",
+        "scripts/parse_qemu_strace.py",
+        "scripts/plan_repairs.py",
+        "scripts/generate_report.py",
+    )
 
-    def __init__(self,config: SynthesisLoopConfig,*,runner_factory: RunnerFactory = PrebuiltRootfsRunner) -> None:
+    def __init__(
+        self,
+        config: SynthesisLoopConfig,
+        *,
+        runner_factory: RunnerFactory = PrebuiltRootfsRunner,
+    ) -> None:
         self.config = config
         self.runner_factory = runner_factory
         self.binding_path = self.config.session_dir / self.BINDING_FILENAME
         self.event_path = self.config.session_dir / self.EVENT_FILENAME
         self.report_json_path = self.config.session_dir / self.REPORT_JSON_FILENAME
-        self.report_markdown_path = (self.config.session_dir / self.REPORT_MARKDOWN_FILENAME)
-        self.loop_lock_path = (self.config.session_dir.parent / f".{self.config.session_dir.name}.synthesis-loop.lock")
+        self.report_markdown_path = (
+            self.config.session_dir / self.REPORT_MARKDOWN_FILENAME
+        )
+        self.loop_lock_path = (
+            self.config.session_dir.parent
+            / f".{self.config.session_dir.name}.synthesis-loop.lock"
+        )
         self.execution_resolver = ExecutionBackendResolver()
 
     def run(self) -> SynthesisLoopResult:
@@ -144,32 +188,91 @@ class EnvironmentSynthesisLoop:
             controller, session, binding = self._open_or_initialize()
             invocation_id = int(binding.get("invocations", 0)) + 1
             executions = 0
-            self._append_event("invocation_started",invocation_id=invocation_id,max_steps=self.config.max_steps,initialize_only=self.config.initialize_only)
+            self._append_event(
+                "invocation_started",
+                invocation_id=invocation_id,
+                max_steps=self.config.max_steps,
+                initialize_only=self.config.initialize_only,
+            )
 
             try:
                 controller.verify()
 
                 if self.config.initialize_only:
-                    result = self._finalize(controller=controller,binding=binding,invocation_id=invocation_id,outcome=LoopOutcome.INITIALIZED,stop_reason="initialize_only",executions=0,last_error=None)
-                    self._append_event("invocation_finished",invocation_id=invocation_id,outcome=result.outcome.value,stop_reason=result.stop_reason)
+                    result = self._finalize(
+                        controller=controller,
+                        binding=binding,
+                        invocation_id=invocation_id,
+                        outcome=LoopOutcome.INITIALIZED,
+                        stop_reason="initialize_only",
+                        executions=0,
+                        last_error=None,
+                    )
+                    self._append_event(
+                        "invocation_finished",
+                        invocation_id=invocation_id,
+                        outcome=result.outcome.value,
+                        stop_reason=result.stop_reason,
+                    )
                     return result
 
                 while True:
                     session = controller.load()
                     if session.state == SessionState.COMPLETED:
-                        result = self._finalize(controller=controller,binding=binding,invocation_id=invocation_id,outcome=LoopOutcome.COMPLETED,stop_reason=session.stop_reason,executions=executions,last_error=None)
-                        self._append_event("invocation_finished",invocation_id=invocation_id,outcome=result.outcome.value,stop_reason=result.stop_reason)
+                        result = self._finalize(
+                            controller=controller,
+                            binding=binding,
+                            invocation_id=invocation_id,
+                            outcome=LoopOutcome.COMPLETED,
+                            stop_reason=session.stop_reason,
+                            executions=executions,
+                            last_error=None,
+                        )
+                        self._append_event(
+                            "invocation_finished",
+                            invocation_id=invocation_id,
+                            outcome=result.outcome.value,
+                            stop_reason=result.stop_reason,
+                        )
                         return result
                     if session.state == SessionState.FAILED:
-                        result = self._finalize(controller=controller,binding=binding,invocation_id=invocation_id,outcome=LoopOutcome.INTERVENTION_REQUIRED,stop_reason=session.stop_reason,executions=executions,last_error=None)
-                        self._append_event("invocation_finished",invocation_id=invocation_id,outcome=result.outcome.value,stop_reason=result.stop_reason)
+                        result = self._finalize(
+                            controller=controller,
+                            binding=binding,
+                            invocation_id=invocation_id,
+                            outcome=LoopOutcome.INTERVENTION_REQUIRED,
+                            stop_reason=session.stop_reason,
+                            executions=executions,
+                            last_error=None,
+                        )
+                        self._append_event(
+                            "invocation_finished",
+                            invocation_id=invocation_id,
+                            outcome=result.outcome.value,
+                            stop_reason=result.stop_reason,
+                        )
                         return result
                     if session.state != SessionState.ACTIVE:
-                        raise SynthesisLoopError(f"iteration session is not runnable: {session.state.value}")
+                        raise SynthesisLoopError(
+                            f"iteration session is not runnable: {session.state.value}"
+                        )
 
                     if executions >= self.config.max_steps:
-                        result = self._finalize(controller=controller,binding=binding,invocation_id=invocation_id,outcome=LoopOutcome.PAUSED,stop_reason="invocation_step_limit",executions=executions,last_error=None)
-                        self._append_event("invocation_finished",invocation_id=invocation_id,outcome=result.outcome.value,stop_reason=result.stop_reason)
+                        result = self._finalize(
+                            controller=controller,
+                            binding=binding,
+                            invocation_id=invocation_id,
+                            outcome=LoopOutcome.PAUSED,
+                            stop_reason="invocation_step_limit",
+                            executions=executions,
+                            last_error=None,
+                        )
+                        self._append_event(
+                            "invocation_finished",
+                            invocation_id=invocation_id,
+                            outcome=result.outcome.value,
+                            stop_reason=result.stop_reason,
+                        )
                         return result
 
                     latest = session.iterations[-1] if session.iterations else None
@@ -180,18 +283,29 @@ class EnvironmentSynthesisLoop:
                             "iteration_prepared",
                             invocation_id=invocation_id,
                             iteration=latest.index,
-                            environment_snapshot_id=(latest.environment_snapshot_id),
-                            environment_manifest_id=(latest.environment_manifest_id),
-                            environment_manifest_version=(latest.environment_manifest_version),
+                            environment_snapshot_id=(
+                                latest.environment_snapshot_id
+                            ),
+                            environment_manifest_id=(
+                                latest.environment_manifest_id
+                            ),
+                            environment_manifest_version=(
+                                latest.environment_manifest_version
+                            ),
                             attempt_id=latest.attempt_id,
-                            parent_snapshot_id=latest.parent_snapshot_id)
+                            parent_snapshot_id=latest.parent_snapshot_id,
+                        )
                         controller.verify()
                     elif latest.state != IterationState.PREPARED:
-                        raise SynthesisLoopError(f"latest iteration has unsupported state: {latest.state.value}")
+                        raise SynthesisLoopError(
+                            f"latest iteration has unsupported state: {latest.state.value}"
+                        )
 
                     claim = self._load_existing_claim(latest.directory)
                     if claim is not None:
-                        raise SynthesisLoopError(self._claim_intervention_message(latest.index, claim))
+                        raise SynthesisLoopError(
+                            self._claim_intervention_message(latest.index, claim)
+                        )
 
                     runner_config = PrebuiltRunnerConfig(
                         session_dir=self.config.session_dir,
@@ -202,8 +316,19 @@ class EnvironmentSynthesisLoop:
                         binary_path=self.config.binary_path,
                         target_spec_path=self._effective_target_spec_path(),
                         network_mode=self.config.network_mode,
-                        network_self_test=self.config.network_self_test)
-                    self._append_event("iteration_execution_started",invocation_id=invocation_id,iteration=latest.index)
+                        network_self_test=self.config.network_self_test,
+                        replay_store_path=self._effective_replay_store_path(),
+                        replay_store_expected_sha256=(
+                            str(binding.get("replay_store_sha256"))
+                            if self.config.network_mode == "replay"
+                            else None
+                        ),
+                    )
+                    self._append_event(
+                        "iteration_execution_started",
+                        invocation_id=invocation_id,
+                        iteration=latest.index,
+                    )
                     runner = self.runner_factory(runner_config)
                     runner_result = runner.run_and_complete()
                     executions += 1
@@ -219,19 +344,51 @@ class EnvironmentSynthesisLoop:
                         progress=runner_result.progress,
                         target_reached=runner_result.target_reached,
                         network_mode=runner_result.network_mode,
-                        network_manifest=(str(runner_result.network_manifest_path) if runner_result.network_manifest_path is not None else None),
-                        target_evaluation=(str(runner_result.target_evaluation_path) if runner_result.target_evaluation_path is not None else None),
+                        network_manifest=(
+                            str(runner_result.network_manifest_path)
+                            if runner_result.network_manifest_path is not None
+                            else None
+                        ),
+                        target_evaluation=(
+                            str(runner_result.target_evaluation_path)
+                            if runner_result.target_evaluation_path is not None
+                            else None
+                        ),
                     )
                     controller.verify()
             except (IterationControllerError, PrebuiltRunnerError, OSError) as exc:
                 error = f"{type(exc).__name__}: {exc}"
-                self._append_event("invocation_failed",invocation_id=invocation_id,error=error)
-                self._finalize(controller=controller,binding=binding,invocation_id=invocation_id,outcome=LoopOutcome.INTERVENTION_REQUIRED,stop_reason="execution_or_transition_failure",executions=executions,last_error=error)
+                self._append_event(
+                    "invocation_failed",
+                    invocation_id=invocation_id,
+                    error=error,
+                )
+                self._finalize(
+                    controller=controller,
+                    binding=binding,
+                    invocation_id=invocation_id,
+                    outcome=LoopOutcome.INTERVENTION_REQUIRED,
+                    stop_reason="execution_or_transition_failure",
+                    executions=executions,
+                    last_error=error,
+                )
                 raise SynthesisLoopError(str(exc)) from exc
             except SynthesisLoopError as exc:
                 error = f"SynthesisLoopError: {exc}"
-                self._append_event("invocation_failed",invocation_id=invocation_id,error=error)
-                self._finalize(controller=controller,binding=binding,invocation_id=invocation_id,outcome=LoopOutcome.INTERVENTION_REQUIRED,stop_reason="operator_intervention_required",executions=executions,last_error=error)
+                self._append_event(
+                    "invocation_failed",
+                    invocation_id=invocation_id,
+                    error=error,
+                )
+                self._finalize(
+                    controller=controller,
+                    binding=binding,
+                    invocation_id=invocation_id,
+                    outcome=LoopOutcome.INTERVENTION_REQUIRED,
+                    stop_reason="operator_intervention_required",
+                    executions=executions,
+                    last_error=error,
+                )
                 raise
 
     @classmethod
@@ -246,13 +403,16 @@ class EnvironmentSynthesisLoop:
             "session": manifest.to_dict(),
             "report_json": str(session / cls.REPORT_JSON_FILENAME),
             "report_markdown": str(session / cls.REPORT_MARKDOWN_FILENAME),
-            "event_log": str(session / cls.EVENT_FILENAME)
+            "event_log": str(session / cls.EVENT_FILENAME),
         }
 
     @classmethod
     def verify_session(cls, session_dir: str | Path) -> dict[str, Any]:
         session = Path(session_dir).resolve(strict=False)
-        binding = _load_json_object(session / cls.BINDING_FILENAME,"synthesis loop manifest")
+        binding = _load_json_object(
+            session / cls.BINDING_FILENAME,
+            "synthesis loop manifest",
+        )
         if binding.get("schema_version") != cls.SCHEMA_VERSION:
             raise SynthesisLoopError("unsupported synthesis loop schema version")
         if binding.get("loop_version") != cls.LOOP_VERSION:
@@ -270,11 +430,23 @@ class EnvironmentSynthesisLoop:
             raise SynthesisLoopError("synthesis loop iteration budget mismatch")
         session_bindings = {
             "environment_manifest_store": manifest.environment_manifest_store,
-            "seed_environment_manifest_id": (manifest.seed_environment_manifest_id),"sample_sha256": manifest.sample_sha256,"packed_binary_sha256": manifest.packed_binary_sha256,"attempt_goal_id": manifest.goal_id
+            "seed_environment_manifest_id": (
+                manifest.seed_environment_manifest_id
+            ),
+            "sample_sha256": manifest.sample_sha256,
+            "packed_binary_sha256": manifest.packed_binary_sha256,
+            "attempt_goal_id": manifest.goal_id,
         }
-        drift = [key for key, expected in session_bindings.items() if binding.get(key) != expected]
+        drift = [
+            key
+            for key, expected in session_bindings.items()
+            if binding.get(key) != expected
+        ]
         if drift:
-            raise SynthesisLoopError("synthesis loop session binding mismatch: " + ", ".join(drift))
+            raise SynthesisLoopError(
+                "synthesis loop session binding mismatch: "
+                + ", ".join(drift)
+            )
 
         template_runtime = Path(str(binding.get("template_runtime")))
         _validate_regular_file(template_runtime, "bound template runtime")
@@ -286,25 +458,42 @@ class EnvironmentSynthesisLoop:
         if _sha256_file(host_binary) != binding.get("host_binary_sha256"):
             raise SynthesisLoopError("bound host binary was modified")
         if binding.get("host_binary_sha256") != manifest.packed_binary_sha256:
-            raise SynthesisLoopError("bound host binary does not match the session packed binary")
+            raise SynthesisLoopError(
+                "bound host binary does not match the session packed binary"
+            )
         if binding.get("target_elf_sha256") != manifest.sample_sha256:
-            raise SynthesisLoopError("bound target ELF does not match the session sample")
+            raise SynthesisLoopError(
+                "bound target ELF does not match the session sample"
+            )
         bound_goal = binding.get("target_goal_id") or DEFAULT_DISCOVERY_GOAL_ID
         if bound_goal != manifest.goal_id:
-            raise SynthesisLoopError("bound target goal does not match the session attempt goal")
+            raise SynthesisLoopError(
+                "bound target goal does not match the session attempt goal"
+            )
 
         qemu_host_raw = binding.get("qemu_host_path")
         qemu_digest = binding.get("qemu_host_sha256")
         if qemu_host_raw is not None:
-            if not isinstance(qemu_host_raw, str) or not isinstance(qemu_digest,str):
+            if not isinstance(qemu_host_raw, str) or not isinstance(
+                qemu_digest,
+                str,
+            ):
                 raise SynthesisLoopError("bound QEMU identity is invalid")
             qemu_host = Path(qemu_host_raw)
             _validate_regular_file(qemu_host, "bound QEMU executable")
             if _sha256_file(qemu_host) != qemu_digest:
                 raise SynthesisLoopError("bound QEMU executable was modified")
 
-        _verify_bound_file_bundle(binding.get("template_config_files"),binding.get("template_config_bundle_sha256"),"template config")
-        _verify_bound_file_bundle(binding.get("analysis_stack_files"),binding.get("analysis_stack_sha256"),"analysis stack")
+        _verify_bound_file_bundle(
+            binding.get("template_config_files"),
+            binding.get("template_config_bundle_sha256"),
+            "template config",
+        )
+        _verify_bound_file_bundle(
+            binding.get("analysis_stack_files"),
+            binding.get("analysis_stack_sha256"),
+            "analysis stack",
+        )
 
         target_spec_path = binding.get("target_spec_path")
         if target_spec_path is not None:
@@ -317,16 +506,62 @@ class EnvironmentSynthesisLoop:
             if target_spec.goal_id != binding.get("target_goal_id"):
                 raise SynthesisLoopError("bound target-state goal id mismatch")
 
+        replay_store_path = binding.get("replay_store_path")
+        replay_store_sha256 = binding.get("replay_store_sha256")
+        if binding.get("network_mode") == "replay":
+            if not isinstance(replay_store_path, str) or not isinstance(
+                replay_store_sha256,
+                str,
+            ):
+                raise SynthesisLoopError("bound replay store identity is invalid")
+            try:
+                replay_validation = validate_replay_policy(
+                    policy=load_network_policy(
+                        Path(str(binding.get("template_run_dir")))
+                        / "config"
+                        / "network_policy.json"
+                    ),
+                    replay_store=ReplayStore(replay_store_path),
+                )
+            except (
+                NetworkReplayError,
+                ReplayStoreValidationError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise SynthesisLoopError(
+                    f"invalid deterministic replay preflight: {exc}"
+                ) from exc
+            if replay_validation["store_sha256"] != replay_store_sha256:
+                raise SynthesisLoopError("bound replay store was modified")
+            if replay_validation["entries"] != binding.get(
+                "replay_store_entries"
+            ):
+                raise SynthesisLoopError("bound replay store entry count changed")
+        elif (
+            replay_store_path is not None
+            or replay_store_sha256 is not None
+            or binding.get("replay_store_entries") is not None
+        ):
+            raise SynthesisLoopError(
+                "non-replay session contains an unexpected replay store binding"
+            )
+
         return {
             "session_id": manifest.session_id,
             "session_state": manifest.state.value,
             "stop_reason": manifest.stop_reason,
             "iterations": len(manifest.iterations),
             "binding_verified": True,
-            "artifacts_verified": True
+            "artifacts_verified": True,
         }
 
-    def _open_or_initialize(self) -> tuple[IterationController, SessionManifest, dict[str, Any]]:
+    def _open_or_initialize(
+        self,
+    ) -> tuple[IterationController, SessionManifest, dict[str, Any]]:
+        # Validate the execution target before creating any session state.
         target_identity = self._target_identity()
         manifest_path = self.config.session_dir / "session.json"
         if manifest_path.is_symlink():
@@ -338,19 +573,38 @@ class EnvironmentSynthesisLoop:
             session = controller.load()
         else:
             if self.config.seed_rootfs is None or self.config.snapshot_store is None:
-                raise SynthesisLoopError("new session requires --seed-rootfs and --snapshot-store")
-            session = IterationController.initialize(session_dir=self.config.session_dir,snapshot_store=self.config.snapshot_store,seed_rootfs=self.config.seed_rootfs,sample_sha256=target_identity["target_elf_sha256"],packed_binary_sha256=target_identity["host_binary_sha256"],goal_id=(target_identity["target_goal_id"] or DEFAULT_DISCOVERY_GOAL_ID), max_iterations=self.config.max_iterations)
+                raise SynthesisLoopError(
+                    "new session requires --seed-rootfs and --snapshot-store"
+                )
+            session = IterationController.initialize(
+                session_dir=self.config.session_dir,
+                snapshot_store=self.config.snapshot_store,
+                seed_rootfs=self.config.seed_rootfs,
+                sample_sha256=target_identity["target_elf_sha256"],
+                packed_binary_sha256=target_identity["host_binary_sha256"],
+                goal_id=(
+                    target_identity["target_goal_id"]
+                    or DEFAULT_DISCOVERY_GOAL_ID
+                ),
+                max_iterations=self.config.max_iterations,
+            )
             controller = IterationController(self.config.session_dir)
             created_now = True
 
         binding = self._binding_payload(session, target_identity)
         if self.binding_path.exists() or self.binding_path.is_symlink():
-            stored = _load_json_object(self.binding_path,"synthesis loop manifest")
+            stored = _load_json_object(
+                self.binding_path,
+                "synthesis loop manifest",
+            )
             self._verify_config_binding(stored, binding)
             return controller, session, stored
 
         if not created_now and not self.config.adopt_existing_session:
-            raise SynthesisLoopError("existing session is not bound to this synthesis loop; pass --adopt-existing-session after verifying the target")
+            raise SynthesisLoopError(
+                "existing session is not bound to this synthesis loop; "
+                "pass --adopt-existing-session after verifying the target"
+            )
 
         binding["created_at_utc"] = _utc_now()
         binding["updated_at_utc"] = binding["created_at_utc"]
@@ -359,7 +613,11 @@ class EnvironmentSynthesisLoop:
         binding["stop_reason"] = None
         binding["last_error"] = None
         _atomic_write_json(self.binding_path, binding)
-        self._append_event("loop_bound",session_id=session.session_id,adopted=not created_now)
+        self._append_event(
+            "loop_bound",
+            session_id=session.session_id,
+            adopted=not created_now,
+        )
         return controller, session, binding
 
     def _target_identity(self) -> dict[str, Any]:
@@ -367,16 +625,34 @@ class EnvironmentSynthesisLoop:
         _validate_directory(self.config.project_root, "project root")
         runtime_path = self.config.template_run_dir / "config" / "runtime.json"
         runtime = _load_json_object(runtime_path, "template runtime")
-        if self.config.network_mode == "controlled":
-            _validate_regular_file(self.config.template_run_dir / "config" / "network_policy.json","template network policy")
+        if self.config.network_mode in {"controlled", "replay"}:
+            _validate_regular_file(
+                self.config.template_run_dir / "config" / "network_policy.json",
+                "template network policy",
+            )
         try:
-            host_binary = resolve_runtime_host_binary(runtime,self.config.binary_path,self.config.project_root)
+            host_binary = resolve_runtime_host_binary(
+                runtime,
+                self.config.binary_path,
+                self.config.project_root,
+            )
             guest_binary = resolve_runtime_guest_binary(runtime)
-            template_rootfs = _resolve_template_rootfs(runtime,self.config.template_run_dir,self.config.project_root)
-            execution_plan = self.execution_resolver.resolve(runtime=runtime,host_binary=host_binary,rootfs=template_rootfs,guest_binary=guest_binary)
+            template_rootfs = _resolve_template_rootfs(
+                runtime,
+                self.config.template_run_dir,
+                self.config.project_root,
+            )
+            execution_plan = self.execution_resolver.resolve(
+                runtime=runtime,
+                host_binary=host_binary,
+                rootfs=template_rootfs,
+                guest_binary=guest_binary,
+            )
         except ExecutionBackendError as exc:
             raise SynthesisLoopError(str(exc)) from exc
-        template_config_files, template_config_digest = (self._template_config_identity())
+        template_config_files, template_config_digest = (
+            self._template_config_identity()
+        )
         analysis_files, analysis_digest = self._analysis_stack_identity()
         target_spec_path = self._effective_target_spec_path()
         target_spec: TargetStateSpec | None = None
@@ -385,6 +661,36 @@ class EnvironmentSynthesisLoop:
                 target_spec = TargetStateSpec.load(target_spec_path)
             except TargetStateError as exc:
                 raise SynthesisLoopError(str(exc)) from exc
+        replay_store_path = self._effective_replay_store_path()
+        replay_store_sha256: str | None = None
+        replay_store_entries: int | None = None
+        if self.config.network_mode == "replay":
+            if replay_store_path is None:
+                raise SynthesisLoopError(
+                    "network_mode=replay requires --replay-store"
+                )
+            try:
+                replay_validation = validate_replay_policy(
+                    policy=load_network_policy(
+                        self.config.template_run_dir
+                        / "config"
+                        / "network_policy.json"
+                    ),
+                    replay_store=ReplayStore(replay_store_path),
+                )
+            except (
+                NetworkReplayError,
+                ReplayStoreValidationError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise SynthesisLoopError(
+                    f"invalid deterministic replay preflight: {exc}"
+                ) from exc
+            replay_store_sha256 = str(replay_validation["store_sha256"])
+            replay_store_entries = int(replay_validation["entries"])
         return {
             "template_run_dir": str(self.config.template_run_dir),
             "template_runtime": str(runtime_path),
@@ -404,22 +710,51 @@ class EnvironmentSynthesisLoop:
             "qemu_guest_path": execution_plan.qemu_guest_path,
             "analysis_stack_files": analysis_files,
             "analysis_stack_sha256": analysis_digest,
-            "target_spec_path": (str(target_spec_path) if target_spec_path is not None else None),
-            "target_spec_sha256": (target_spec.source_sha256 if target_spec is not None else None),
-            "target_goal_id": (target_spec.goal_id if target_spec is not None else None),
+            "target_spec_path": (
+                str(target_spec_path) if target_spec_path is not None else None
+            ),
+            "target_spec_sha256": (
+                target_spec.source_sha256 if target_spec is not None else None
+            ),
+            "target_goal_id": (
+                target_spec.goal_id if target_spec is not None else None
+            ),
             "timeout_seconds": self.config.timeout_seconds,
             "network_mode": self.config.network_mode,
             "network_self_test": self.config.network_self_test,
+            "replay_store_path": (
+                str(replay_store_path) if replay_store_path is not None else None
+            ),
+            "replay_store_sha256": replay_store_sha256,
+            "replay_store_entries": replay_store_entries,
             "allow_internet": False,
-            "qemu_required_supported": True
+            "qemu_required_supported": True,
         }
 
     def _effective_target_spec_path(self) -> Path | None:
         if self.config.target_spec_path is not None:
             return self.config.target_spec_path
         if self.binding_path.is_file() and not self.binding_path.is_symlink():
-            stored = _load_json_object(self.binding_path,"synthesis loop manifest")
+            stored = _load_json_object(
+                self.binding_path,
+                "synthesis loop manifest",
+            )
             value = stored.get("target_spec_path")
+            if isinstance(value, str) and value:
+                return Path(value).resolve(strict=False)
+        return None
+
+    def _effective_replay_store_path(self) -> Path | None:
+        if self.config.network_mode != "replay":
+            return None
+        if self.config.replay_store_path is not None:
+            return self.config.replay_store_path
+        if self.binding_path.is_file() and not self.binding_path.is_symlink():
+            stored = _load_json_object(
+                self.binding_path,
+                "synthesis loop manifest",
+            )
+            value = stored.get("replay_store_path")
             if isinstance(value, str) and value:
                 return Path(value).resolve(strict=False)
         return None
@@ -427,21 +762,39 @@ class EnvironmentSynthesisLoop:
     def _template_config_identity(self) -> tuple[list[dict[str, Any]], str]:
         config_dir = self.config.template_run_dir / "config"
         _validate_directory(config_dir, "template config directory")
-        names = ("runtime.json", "library_plan.json", "library_resolution.json", "network_policy.json")
+        names = (
+            "runtime.json",
+            "library_plan.json",
+            "library_resolution.json",
+            "network_policy.json",
+        )
         entries: list[dict[str, Any]] = []
         for name in names:
             path = config_dir / name
             if not path.exists():
                 continue
             _validate_regular_file(path, f"template {name}")
-            entries.append({"path": str(path), "sha256": _sha256_file(path)})
+            entries.append(
+                {
+                    "path": str(path),
+                    "sha256": _sha256_file(path),
+                }
+            )
         return entries, _canonical_digest(entries)
 
     def _analysis_stack_identity(self) -> tuple[list[dict[str, Any]], str]:
         paths: list[Path] = []
         module_dir = Path(__file__).resolve().parent
         paths.extend(sorted(module_dir.glob("*.py")))
-        for relative in self.REQUIRED_PROJECT_SCRIPTS:
+        network_scripts = {
+            "none": (),
+            "controlled": (
+                "scripts/start_network_emulator.py",
+                "scripts/start_transparent_logger.py",
+            ),
+            "replay": ("scripts/start_network_replay.py",),
+        }[self.config.network_mode]
+        for relative in (*self.REQUIRED_PROJECT_SCRIPTS, *network_scripts):
             path = self.config.project_root / relative
             _validate_regular_file(path, f"analysis script {relative}")
             paths.append(path)
@@ -453,10 +806,19 @@ class EnvironmentSynthesisLoop:
                 continue
             seen.add(path)
             _validate_regular_file(path, "analysis stack file")
-            entries.append({"path": str(path),"sha256": _sha256_file(path)})
+            entries.append(
+                {
+                    "path": str(path),
+                    "sha256": _sha256_file(path),
+                }
+            )
         return entries, _canonical_digest(entries)
 
-    def _binding_payload(self,session: SessionManifest,target_identity: dict[str, Any]) -> dict[str, Any]:
+    def _binding_payload(
+        self,
+        session: SessionManifest,
+        target_identity: dict[str, Any],
+    ) -> dict[str, Any]:
         self._validate_session_target_identity(session, target_identity)
         return {
             "schema_version": self.SCHEMA_VERSION,
@@ -466,25 +828,45 @@ class EnvironmentSynthesisLoop:
             "snapshot_store": session.snapshot_store,
             "seed_snapshot_id": session.seed_snapshot_id,
             "environment_manifest_store": session.environment_manifest_store,
-            "seed_environment_manifest_id": (session.seed_environment_manifest_id),
+            "seed_environment_manifest_id": (
+                session.seed_environment_manifest_id
+            ),
             "sample_sha256": session.sample_sha256,
             "packed_binary_sha256": session.packed_binary_sha256,
             "attempt_goal_id": session.goal_id,
             "max_iterations": session.max_iterations,
-            **target_identity
+            **target_identity,
         }
 
     @staticmethod
-def _validate_session_target_identity(session: SessionManifest,target_identity: dict[str, Any]) -> None:
+    def _validate_session_target_identity(
+        session: SessionManifest,
+        target_identity: dict[str, Any],
+    ) -> None:
         if session.sample_sha256 != target_identity.get("target_elf_sha256"):
-        raise SynthesisLoopError("session sample does not match the selected target ELF")
-        if session.packed_binary_sha256 != target_identity.get("host_binary_sha256"):
-            raise SynthesisLoopError("session packed binary does not match the selected host binary")
-        goal_id = (target_identity.get("target_goal_id") or DEFAULT_DISCOVERY_GOAL_ID)
+            raise SynthesisLoopError(
+                "session sample does not match the selected target ELF"
+            )
+        if session.packed_binary_sha256 != target_identity.get(
+            "host_binary_sha256"
+        ):
+            raise SynthesisLoopError(
+                "session packed binary does not match the selected host binary"
+            )
+        goal_id = (
+            target_identity.get("target_goal_id")
+            or DEFAULT_DISCOVERY_GOAL_ID
+        )
         if session.goal_id != goal_id:
-            raise SynthesisLoopError("session goal does not match the selected target-state goal")
+            raise SynthesisLoopError(
+                "session goal does not match the selected target-state goal"
+            )
 
-    def _verify_config_binding(self,stored: dict[str, Any],current: dict[str, Any]) -> None:
+    def _verify_config_binding(
+        self,
+        stored: dict[str, Any],
+        current: dict[str, Any],
+    ) -> None:
         if stored.get("schema_version") != self.SCHEMA_VERSION:
             raise SynthesisLoopError("unsupported synthesis loop schema version")
         if stored.get("loop_version") != self.LOOP_VERSION:
@@ -524,12 +906,18 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
             "timeout_seconds",
             "network_mode",
             "network_self_test",
+            "replay_store_path",
+            "replay_store_sha256",
+            "replay_store_entries",
             "allow_internet",
-            "qemu_required_supported"
+            "qemu_required_supported",
         )
         drift = [key for key in keys if stored.get(key) != current.get(key)]
         if drift:
-            raise SynthesisLoopError("synthesis-loop configuration drift detected: " + ", ".join(drift))
+            raise SynthesisLoopError(
+                "synthesis-loop configuration drift detected: "
+                + ", ".join(drift)
+            )
 
     def _load_existing_claim(self, iteration_directory: str) -> dict[str, Any] | None:
         iteration_dir = self.config.session_dir / iteration_directory
@@ -541,17 +929,39 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
         return _load_json_object(claim_path, "execution claim")
 
     @staticmethod
-    def _claim_intervention_message(iteration_index: int, claim: dict[str, Any]) -> str:
+    def _claim_intervention_message(
+        iteration_index: int,
+        claim: dict[str, Any],
+    ) -> str:
         stage = str(claim.get("stage") or "unknown")
         malware_started = claim.get("malware_started")
         retry_safe = claim.get("retry_safe")
         if stage == "failed" and malware_started is False and retry_safe is True:
-            return (f"iteration {iteration_index} has a retry-safe failed execution claim; run reset-safe-failure explicitly before resuming")
+            return (
+                f"iteration {iteration_index} has a retry-safe failed execution "
+                "claim; run reset-safe-failure explicitly before resuming"
+            )
         if stage == "failed":
-            return (f"iteration {iteration_index} has a failed execution claim and cannot reuse its execution rootfs")
-        return (f"iteration {iteration_index} already has execution claim stage {stage!r}; inspect the runner state before resuming")
+            return (
+                f"iteration {iteration_index} has a failed execution claim and "
+                "cannot reuse its execution rootfs"
+            )
+        return (
+            f"iteration {iteration_index} already has execution claim stage "
+            f"{stage!r}; inspect the runner state before resuming"
+        )
 
-    def _finalize(self,*,controller: IterationController,binding: dict[str, Any],invocation_id: int,outcome: LoopOutcome,stop_reason: str | None,executions: int,last_error: str | None) -> SynthesisLoopResult:
+    def _finalize(
+        self,
+        *,
+        controller: IterationController,
+        binding: dict[str, Any],
+        invocation_id: int,
+        outcome: LoopOutcome,
+        stop_reason: str | None,
+        executions: int,
+        last_error: str | None,
+    ) -> SynthesisLoopResult:
         session = controller.load()
         updated = dict(binding)
         updated.update(
@@ -561,25 +971,39 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
                 "outcome": outcome.value,
                 "stop_reason": stop_reason,
                 "last_error": last_error,
-                "last_iteration_index": (session.iterations[-1].index if session.iterations else None),
-                "executions_last_invocation": executions
+                "last_iteration_index": (
+                    session.iterations[-1].index if session.iterations else None
+                ),
+                "executions_last_invocation": executions,
             }
         )
         _atomic_write_json(self.binding_path, updated)
-        self._write_report(session=session,binding=updated,executions=executions)
+        self._write_report(
+            session=session,
+            binding=updated,
+            executions=executions,
+        )
         return SynthesisLoopResult(
             session_id=session.session_id,
             outcome=outcome,
             stop_reason=stop_reason,
             executions_this_invocation=executions,
             total_iterations=len(session.iterations),
-            last_iteration_index=(session.iterations[-1].index if session.iterations else None),
+            last_iteration_index=(
+                session.iterations[-1].index if session.iterations else None
+            ),
             report_json=self.report_json_path,
             report_markdown=self.report_markdown_path,
-            event_log=self.event_path
+            event_log=self.event_path,
         )
 
-    def _write_report(self,*,session: SessionManifest,binding: dict[str, Any],executions: int) -> None:
+    def _write_report(
+        self,
+        *,
+        session: SessionManifest,
+        binding: dict[str, Any],
+        executions: int,
+    ) -> None:
         iterations: list[dict[str, Any]] = []
         for record in session.iterations:
             iterations.append(
@@ -589,7 +1013,9 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
                     "environment_snapshot_id": record.environment_snapshot_id,
                     "parent_snapshot_id": record.parent_snapshot_id,
                     "environment_manifest_id": record.environment_manifest_id,
-                    "environment_manifest_version": (record.environment_manifest_version),
+                    "environment_manifest_version": (
+                        record.environment_manifest_version
+                    ),
                     "attempt_id": record.attempt_id,
                     "attempt_contract": record.attempt_contract,
                     "attempt_result": record.attempt_result,
@@ -611,7 +1037,9 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
             "executions_last_invocation": executions,
             "configuration": {
                 "template_run_dir": binding.get("template_run_dir"),
-                "template_runtime_sha256": binding.get("template_runtime_sha256"),
+                "template_runtime_sha256": binding.get(
+                    "template_runtime_sha256"
+                ),
                 "host_binary": binding.get("host_binary"),
                 "host_binary_sha256": binding.get("host_binary_sha256"),
                 "execution_backend": binding.get("execution_backend"),
@@ -620,20 +1048,31 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
                 "target_elf_sha256": binding.get("target_elf_sha256"),
                 "qemu_host_path": binding.get("qemu_host_path"),
                 "qemu_host_sha256": binding.get("qemu_host_sha256"),
-                "template_config_bundle_sha256": binding.get("template_config_bundle_sha256"),
-                "analysis_stack_sha256": binding.get("analysis_stack_sha256"),
+                "template_config_bundle_sha256": binding.get(
+                    "template_config_bundle_sha256"
+                ),
+                "analysis_stack_sha256": binding.get(
+                    "analysis_stack_sha256"
+                ),
                 "target_spec_path": binding.get("target_spec_path"),
                 "target_spec_sha256": binding.get("target_spec_sha256"),
                 "target_goal_id": binding.get("target_goal_id"),
                 "attempt_goal_id": binding.get("attempt_goal_id"),
                 "sample_sha256": binding.get("sample_sha256"),
-                "packed_binary_sha256": binding.get("packed_binary_sha256"),
-                "seed_environment_manifest_id": binding.get("seed_environment_manifest_id"),
+                "packed_binary_sha256": binding.get(
+                    "packed_binary_sha256"
+                ),
+                "seed_environment_manifest_id": binding.get(
+                    "seed_environment_manifest_id"
+                ),
                 "timeout_seconds": binding.get("timeout_seconds"),
                 "max_iterations": binding.get("max_iterations"),
-                "network_mode": binding.get("network_mode")
+                "network_mode": binding.get("network_mode"),
+                "replay_store_path": binding.get("replay_store_path"),
+                "replay_store_sha256": binding.get("replay_store_sha256"),
+                "replay_store_entries": binding.get("replay_store_entries"),
             },
-            "iterations": iterations
+            "iterations": iterations,
         }
         _atomic_write_json(self.report_json_path, report)
 
@@ -647,6 +1086,8 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
             f"- Loop stop reason: `{binding.get('stop_reason')}`",
             f"- Invocations: `{binding.get('invocations')}`",
             f"- Iterations: `{len(session.iterations)}`",
+            f"- Network mode: `{binding.get('network_mode')}`",
+            f"- Replay store SHA-256: `{binding.get('replay_store_sha256')}`",
             f"- Last error: `{binding.get('last_error')}`",
             "",
             "## Iterations",
@@ -655,20 +1096,33 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
                 "| Index | State | Snapshot | Manifest | Attempt | "
                 "Progress | Stop reason |"
             ),
-            "|---:|---|---|---|---|---|---|"
+            "|---:|---|---|---|---|---|---|",
         ]
         for item in iterations:
             progress = item["progress"] or {}
             classification = progress.get("classification", "n/a")
             lines.append(
-                f"| {item['index']} | `{item['state']}` | `{item['environment_snapshot_id']}` | `{item['environment_manifest_id']}` | `{item['attempt_id']}` | `{classification}` | `{item['stop_reason']}` |")
-        _atomic_write_text(self.report_markdown_path,"\n".join(lines).rstrip() + "\n")
+                "| "
+                f"{item['index']} | `{item['state']}` | "
+                f"`{item['environment_snapshot_id']}` | "
+                f"`{item['environment_manifest_id']}` | "
+                f"`{item['attempt_id']}` | "
+                f"`{classification}` | `{item['stop_reason']}` |"
+            )
+        _atomic_write_text(
+            self.report_markdown_path,
+            "\n".join(lines).rstrip() + "\n",
+        )
 
     def _append_event(self, event: str, **fields: Any) -> None:
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
         if self.event_path.is_symlink():
             raise SynthesisLoopError("synthesis event log must not be a symlink")
-        payload = {"timestamp_utc": _utc_now(),"event": event,**fields}
+        payload = {
+            "timestamp_utc": _utc_now(),
+            "event": event,
+            **fields,
+        }
         with self.event_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, sort_keys=True) + "\n")
             stream.flush()
@@ -683,14 +1137,20 @@ def _validate_session_target_identity(session: SessionManifest,target_identity: 
             try:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise SynthesisLoopError("another synthesis-loop process is driving this session") from exc
+                raise SynthesisLoopError(
+                    "another synthesis-loop process is driving this session"
+                ) from exc
             try:
                 yield
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _resolve_template_rootfs(runtime: dict[str, Any],template_run_dir: Path,project_root: Path) -> Path:
+def _resolve_template_rootfs(
+    runtime: dict[str, Any],
+    template_run_dir: Path,
+    project_root: Path,
+) -> Path:
     raw = runtime.get("rootfs")
     if isinstance(raw, str) and raw:
         path = Path(raw)
@@ -728,7 +1188,11 @@ def _load_json_object(path: Path, label: str) -> dict[str, Any]:
     return raw
 
 
-def _verify_bound_file_bundle(raw_entries: Any,expected_digest: Any,label: str) -> None:
+def _verify_bound_file_bundle(
+    raw_entries: Any,
+    expected_digest: Any,
+    label: str,
+) -> None:
     if not isinstance(raw_entries, list):
         raise SynthesisLoopError(f"bound {label} file list is invalid")
     entries: list[dict[str, Any]] = []
@@ -751,7 +1215,11 @@ def _verify_bound_file_bundle(raw_entries: Any,expected_digest: Any,label: str) 
 
 
 def _canonical_digest(payload: Any) -> str:
-    encoded = json.dumps(payload,sort_keys=True,separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 

@@ -277,7 +277,7 @@ def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore) ->
     covered_exchanges = 0
     for service in policy.services:
         if service.service_type != "tcp":
-            raise NetworkReplayError("deterministic replay v1 supports TCP services only: {service.service_type}")
+            raise NetworkReplayError(f"deterministic replay v1 supports TCP services only: {service.service_type}")
         if service.remote_ip is None or service.remote_port is None:
             raise NetworkReplayError("deterministic replay service requires remote_ip and remote_port")
         try:
@@ -285,12 +285,12 @@ def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore) ->
         except ValueError as exc:
             raise NetworkReplayError(f"deterministic replay service has invalid remote_ip: {service.remote_ip}") from exc
         if remote_ip.version != 4:
-            raise NetworkReplayError("deterministic replay v1 supports IPv4 services only: {service.remote_ip}")
+            raise NetworkReplayError(f"deterministic replay v1 supports IPv4 services only: {service.remote_ip}")
         try:
             exchanges = replay_store.exchanges_for_endpoint(transport="tcp",remote_ip=service.remote_ip,remote_port=service.remote_port,protocol_hint=service.protocol_hint)
         except ReplayStoreValidationError as exc:
             raise NetworkReplayError(str(exc)) from exc
         if not exchanges:
-            raise NetworkReplayError("replay store has no exact TCP exchange for {service.remote_ip}:{service.remote_port} protocol_hint={service.protocol_hint!r}")
+            raise NetworkReplayError(f"replay store has no exact TCP exchange for {service.remote_ip}:{service.remote_port} protocol_hint={service.protocol_hint!r}")
         covered_exchanges += len(exchanges)
     return {**store_validation,"covered_services": len(policy.services),"covered_exchanges": covered_exchanges}

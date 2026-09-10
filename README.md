@@ -604,6 +604,47 @@ Session schema v2 intentionally does not adopt older unbound controller
 sessions: their sample, goal, and attempt provenance cannot be reconstructed
 reliably after the fact.
 
+### Deterministic network replay
+
+The Phase 2 commands `scripts/run_synthesis_loop.py run` and
+`scripts/run_prebuilt_iteration.py validate|run` accept `--network replay`
+and `--replay-store`. The store is created with `scripts/replay_store.py` and
+must cover every service declared in the template's `network_policy.json`.
+Original IPv4 address, TCP port, protocol hint, and request bytes must match.
+
+Replay supports split TCP requests and consecutive exchanges on one connection.
+Unknown requests receive no response and close the connection. Unknown
+endpoints are dropped; the generic catch-all responder is disabled. Empty TCP
+requests, ambiguous request prefixes, UDP policies, and `--network-self-test`
+are rejected in replay mode.
+
+Store validation verifies request and response blobs and returns `store_sha256`.
+The digest covers endpoint and request identity, response contents, response
+delay, and connection-close behavior. The synthesis loop binds this identity;
+resume and verify reject changes. Each attempt uses a private verified copy
+under `iterations/NNNN/run/config/replay_store/`.
+
+After the first invocation, the loop can reuse the bound store path when
+`--replay-store` is omitted. The selected network service scripts also belong to
+the analysis bundle: changing them blocks resume and verification.
+
+This implementation uses synthesis binding version 6. A session bound to an
+older loop or analysis-code version requires a new session directory; editing
+the old binding to bypass verification is not a migration.
+
+Run the replay regression tests from the repository root with Python 3.11+:
+
+```bash
+PYTHONPATH="$PWD:$PWD/tests" python -m compileall -q taintforge_env scripts tests
+PYTHONPATH="$PWD:$PWD/tests" python -m unittest -v \
+  test_replay_store test_network_replay test_replay_cli \
+  test_controlled_network_backend test_prebuilt_runner test_synthesis_loop
+```
+
+The tests include real loopback TCP exchanges and CLI initialize/resume/verify
+and prebuilt validation. Guest execution and namespace/firewall management in
+unit tests use test doubles; a privileged VM acceptance run remains separate.
+
 ## Tests
 
 Run the Python test suite:
