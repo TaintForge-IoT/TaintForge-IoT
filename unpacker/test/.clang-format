@@ -1,0 +1,27 @@
+# Formatting baseline: clang-format 20.1.8.
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++11
+IndentWidth: 4
+ContinuationIndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+SortIncludes: Never
+IncludeBlocks: Preserve
+ReflowComments: Never
+BreakStringLiterals: false
+PointerAlignment: Right
+DerivePointerAlignment: false
+SeparateDefinitionBlocks: Always
+InsertBraces: false
+RemoveBracesLLVM: false
+QualifierAlignment: Leave
+FixNamespaceComments: false
