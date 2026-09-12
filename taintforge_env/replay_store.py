@@ -85,6 +85,15 @@ class ReplayLookup:
     response_bytes: bytes | None
 
 
+@dataclass(slots=True, frozen=True)
+class ReplayExchange:
+    """One integrity-checked request/response exchange ready for replay."""
+
+    entry: ReplayEntry
+    request_bytes: bytes
+    response_bytes: bytes
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -214,7 +223,7 @@ def parse_response(raw: dict[str, Any]) -> ReplayResponse:
             "Replay response is missing valid metadata"
         ) from exc
 
-    safe_relative_path(blob_path)
+    relative_blob_path = safe_relative_path(blob_path)
 
     if len(digest) != 64:
         raise ReplayStoreValidationError(
@@ -227,6 +236,13 @@ def parse_response(raw: dict[str, Any]) -> ReplayResponse:
         raise ReplayStoreValidationError(
             "Response sha256 is not hexadecimal"
         ) from exc
+
+    expected_blob_path = Path("responses") / f"{digest.lower()}.bin"
+    if relative_blob_path != expected_blob_path:
+        raise ReplayStoreValidationError(
+            "Response blob_path must match its content digest: "
+            f"expected {expected_blob_path}, got {relative_blob_path}"
+        )
 
     if size < 0:
         raise ReplayStoreValidationError(
@@ -300,6 +316,7 @@ class ReplayStore:
         self.max_response_bytes = max_response_bytes
 
     def initialize(self) -> None:
+        self._validate_layout_symlinks(allow_missing=True)
         self.root.mkdir(parents=True, exist_ok=True)
         self.requests_dir.mkdir(parents=True, exist_ok=True)
         self.responses_dir.mkdir(parents=True, exist_ok=True)
@@ -476,30 +493,13 @@ class ReplayStore:
             if entry.entry_id != fingerprint:
                 continue
 
-            blob_path = self.root / safe_relative_path(entry.response.blob_path)
-
-            if not blob_path.is_file():
-                raise ReplayStoreValidationError(
-                    f"Replay response blob is missing: {blob_path}"
-                )
-
-            response_bytes = blob_path.read_bytes()
-
-            if len(response_bytes) != entry.response.size:
-                raise ReplayStoreValidationError(
-                    f"Replay response size mismatch: {blob_path}"
-                )
-
-            if sha256_bytes(response_bytes) != entry.response.sha256:
-                raise ReplayStoreValidationError(
-                    f"Replay response digest mismatch: {blob_path}"
-                )
+            exchange = self.load_exchange(entry)
 
             return ReplayLookup(
                 hit=True,
                 fingerprint=fingerprint,
                 entry=entry,
-                response_bytes=response_bytes,
+                response_bytes=exchange.response_bytes,
             )
 
         return ReplayLookup(
@@ -509,36 +509,95 @@ class ReplayStore:
             response_bytes=None,
         )
 
+    def load_exchange(self, entry: ReplayEntry) -> ReplayExchange:
+        """Load and verify both blobs referenced by one replay entry."""
+
+        self._validate_layout_symlinks(allow_missing=False)
+        request_path = self.request_blob_path(entry)
+        response_path = self.response_blob_path(entry)
+        self._validate_blob_path(request_path, "request")
+        self._validate_blob_path(response_path, "response")
+        request_bytes = self._read_verified_blob(
+            request_path,
+            expected_size=entry.request.payload_size,
+            expected_sha256=entry.request.payload_sha256,
+            label="request",
+        )
+        response_bytes = self._read_verified_blob(
+            response_path,
+            expected_size=entry.response.size,
+            expected_sha256=entry.response.sha256,
+            label="response",
+        )
+        return ReplayExchange(
+            entry=entry,
+            request_bytes=request_bytes,
+            response_bytes=response_bytes,
+        )
+
+    def exchanges_for_endpoint(
+        self,
+        *,
+        transport: str,
+        remote_ip: str,
+        remote_port: int,
+        protocol_hint: str | None = None,
+    ) -> list[ReplayExchange]:
+        """Return verified exchanges for one exact endpoint contract."""
+
+        normalized_transport = normalize_transport(transport)
+        normalized_ip = normalize_ip(remote_ip)
+        normalized_port = normalize_port(remote_port)
+        normalized_hint = normalize_protocol_hint(protocol_hint)
+        matches = [
+            self.load_exchange(entry)
+            for entry in self.load_entries()
+            if entry.request.transport == normalized_transport
+            and entry.request.remote_ip == normalized_ip
+            and entry.request.remote_port == normalized_port
+            and entry.request.protocol_hint == normalized_hint
+        ]
+        matches.sort(key=lambda item: item.entry.entry_id)
+        if normalized_transport == "tcp":
+            self._validate_tcp_framing(matches)
+        return matches
+
+    def request_blob_path(self, entry: ReplayEntry) -> Path:
+        return self.root / "requests" / f"{entry.entry_id}.bin"
+
+    def response_blob_path(self, entry: ReplayEntry) -> Path:
+        return self.root / safe_relative_path(entry.response.blob_path)
+
     def validate(self) -> dict[str, Any]:
+        self._validate_layout_symlinks(allow_missing=False)
         entries = self.load_entries()
         errors: list[str] = []
 
+        exchanges: list[ReplayExchange] = []
+
         for entry in entries:
-            response_path = self.root / safe_relative_path(
-                entry.response.blob_path
+            try:
+                exchanges.append(self.load_exchange(entry))
+            except ReplayStoreValidationError as exc:
+                errors.append(str(exc))
+
+        groups: dict[tuple[str, str, int, str | None], list[ReplayExchange]] = {}
+        for exchange in exchanges:
+            request = exchange.entry.request
+            key = (
+                request.transport,
+                request.remote_ip,
+                request.remote_port,
+                request.protocol_hint,
             )
-
-            if not response_path.is_file():
-                errors.append(
-                    f"missing response blob for {entry.entry_id}: "
-                    f"{response_path}"
-                )
+            groups.setdefault(key, []).append(exchange)
+        for key, group in groups.items():
+            if key[0] != "tcp":
                 continue
-
-            actual_size = response_path.stat().st_size
-            actual_digest = sha256_file(response_path)
-
-            if actual_size != entry.response.size:
-                errors.append(
-                    f"size mismatch for {entry.entry_id}: "
-                    f"{actual_size} != {entry.response.size}"
-                )
-
-            if actual_digest != entry.response.sha256:
-                errors.append(
-                    f"sha256 mismatch for {entry.entry_id}: "
-                    f"{actual_digest} != {entry.response.sha256}"
-                )
+            try:
+                self._validate_tcp_framing(group)
+            except ReplayStoreValidationError as exc:
+                errors.append(str(exc))
 
         if errors:
             raise ReplayStoreValidationError(
@@ -546,13 +605,94 @@ class ReplayStore:
                 + "\n- ".join(errors)
             )
 
+        identity_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "entries": [
+                {
+                    "entry_id": exchange.entry.entry_id,
+                    "request": exchange.entry.request.canonical_dict(),
+                    "response": {
+                        "sha256": exchange.entry.response.sha256,
+                        "size": exchange.entry.response.size,
+                        "close_after_send": (
+                            exchange.entry.response.close_after_send
+                        ),
+                        "delay_ms": exchange.entry.response.delay_ms,
+                    },
+                }
+                for exchange in sorted(
+                    exchanges,
+                    key=lambda item: item.entry.entry_id,
+                )
+            ],
+        }
+        store_sha256 = sha256_bytes(
+            json.dumps(
+                identity_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "entries": len(entries),
             "store_path": str(self.root),
+            "store_sha256": store_sha256,
         }
 
+    @staticmethod
+    def _validate_tcp_framing(exchanges: list[ReplayExchange]) -> None:
+        """Reject byte streams that cannot be framed without guessing."""
+
+        ordered = sorted(exchanges, key=lambda item: item.request_bytes)
+        for exchange in ordered:
+            if not exchange.request_bytes:
+                raise ReplayStoreValidationError(
+                    "TCP replay requests must not be empty: "
+                    f"{exchange.entry.entry_id}"
+                )
+        for index, current in enumerate(ordered):
+            for candidate in ordered[index + 1 :]:
+                if not candidate.request_bytes.startswith(current.request_bytes):
+                    break
+                raise ReplayStoreValidationError(
+                    "TCP replay request prefix ambiguity for endpoint "
+                    f"{current.entry.request.remote_ip}:"
+                    f"{current.entry.request.remote_port}: "
+                    f"{current.entry.entry_id} prefixes "
+                    f"{candidate.entry.entry_id}"
+                )
+
+    @staticmethod
+    def _read_verified_blob(
+        path: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+        label: str,
+    ) -> bytes:
+        if path.is_symlink():
+            raise ReplayStoreValidationError(
+                f"Replay {label} blob must not be a symlink: {path}"
+            )
+        if not path.is_file():
+            raise ReplayStoreValidationError(
+                f"Replay {label} blob is missing: {path}"
+            )
+        data = path.read_bytes()
+        if len(data) != expected_size:
+            raise ReplayStoreValidationError(
+                f"Replay {label} size mismatch: {path}"
+            )
+        if sha256_bytes(data) != expected_sha256:
+            raise ReplayStoreValidationError(
+                f"Replay {label} digest mismatch: {path}"
+            )
+        return data
+
     def _load_index(self) -> dict[str, Any]:
+        self._validate_layout_symlinks(allow_missing=True)
         if not self.index_path.exists():
             raise ReplayStoreValidationError(
                 f"Replay index does not exist: {self.index_path}"
@@ -579,6 +719,7 @@ class ReplayStore:
         return raw
 
     def _atomic_write_index(self, data: dict[str, Any]) -> None:
+        self._validate_layout_symlinks(allow_missing=True)
         self.root.mkdir(parents=True, exist_ok=True)
 
         fd, temp_name = tempfile.mkstemp(
@@ -608,9 +749,15 @@ class ReplayStore:
             temp_path.unlink(missing_ok=True)
 
     def _write_blob(self, path: Path, data: bytes) -> None:
+        self._validate_layout_symlinks(allow_missing=True)
+        self._validate_blob_path(path, "store")
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if path.exists():
+            if path.is_symlink():
+                raise ReplayStoreValidationError(
+                    f"Replay blob must not be a symlink: {path}"
+                )
             if path.read_bytes() != data:
                 raise ReplayStoreValidationError(
                     f"Replay blob collision: {path}"
@@ -642,3 +789,34 @@ class ReplayStore:
             path.chmod(0o700 if directory else 0o600)
         except FileNotFoundError:
             return
+
+    def _validate_layout_symlinks(self, *, allow_missing: bool) -> None:
+        for path, label in (
+            (self.root, "root"),
+            (self.requests_dir, "requests directory"),
+            (self.responses_dir, "responses directory"),
+            (self.index_path, "index"),
+        ):
+            if path.is_symlink():
+                raise ReplayStoreValidationError(
+                    f"Replay store {label} must not be a symlink: {path}"
+                )
+            if not allow_missing and not path.exists():
+                raise ReplayStoreValidationError(
+                    f"Replay store {label} is missing: {path}"
+                )
+
+    def _validate_blob_path(self, path: Path, label: str) -> None:
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as exc:
+            raise ReplayStoreValidationError(
+                f"Replay {label} blob escapes the store: {path}"
+            ) from exc
+        current = self.root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ReplayStoreValidationError(
+                    f"Replay {label} blob path contains a symlink: {current}"
+                )

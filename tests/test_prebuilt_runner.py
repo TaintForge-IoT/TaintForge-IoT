@@ -20,6 +20,7 @@ from taintforge_env.prebuilt_runner import (
     PrebuiltRunnerConfig,
     PrebuiltRunnerError,
 )
+from taintforge_env.replay_store import ReplayStore
 from tests.elf_fixture import write_elf
 
 
@@ -310,6 +311,8 @@ class PrebuiltRunnerTests(unittest.TestCase):
         target_spec: Path | None = None,
         network_mode: str = "none",
         network_self_test: bool = False,
+        replay_store: Path | None = None,
+        replay_store_expected_sha256: str | None = None,
         network_backend_factory=None,
     ) -> PrebuiltRootfsRunner:
         return PrebuiltRootfsRunner(
@@ -322,6 +325,10 @@ class PrebuiltRunnerTests(unittest.TestCase):
                 target_spec_path=target_spec,
                 network_mode=network_mode,
                 network_self_test=network_self_test,
+                replay_store_path=replay_store,
+                replay_store_expected_sha256=(
+                    replay_store_expected_sha256
+                ),
             ),
             executor=executor or FakeExecutor(),
             network_backend_factory=network_backend_factory,
@@ -665,6 +672,125 @@ class PrebuiltRunnerTests(unittest.TestCase):
     def test_network_self_test_requires_controlled_mode(self) -> None:
         with self.assertRaisesRegex(PrebuiltRunnerError, "requires"):
             self.make_runner(network_self_test=True)
+
+    def test_replay_mode_requires_store(self) -> None:
+        with self.assertRaisesRegex(PrebuiltRunnerError, "requires replay_store"):
+            self.make_runner(network_mode="replay")
+
+    def test_replay_run_binds_and_copies_exact_store(self) -> None:
+        _write_json(
+            self.template / "config" / "network_policy.json",
+            {
+                "mode": "replay",
+                "allow_internet": False,
+                "services": [
+                    {
+                        "service_type": "tcp",
+                        "role": "c2",
+                        "remote_ip": "203.0.113.10",
+                        "remote_port": 48101,
+                        "domain": None,
+                        "bind_ip": "127.0.0.1",
+                        "bind_port": 48101,
+                        "protocol_hint": "c2_binary",
+                    }
+                ],
+                "catch_all": {"enabled": True},
+            },
+        )
+        replay_path = self.base / "replay-store"
+        replay = ReplayStore(replay_path)
+        replay.add(
+            transport="tcp",
+            remote_ip="203.0.113.10",
+            remote_port=48101,
+            request_bytes=b"hello",
+            response_bytes=b"world",
+            protocol_hint="c2_binary",
+        )
+        digest = replay.validate()["store_sha256"]
+        executor = FakeExecutor()
+        created: list[FakeNetworkBackend] = []
+
+        def factory(config, command_executor):
+            backend = FakeNetworkBackend(config, command_executor)
+            created.append(backend)
+            return backend
+
+        runner = self.make_runner(
+            executor,
+            network_mode="replay",
+            replay_store=replay_path,
+            replay_store_expected_sha256=digest,
+            network_backend_factory=factory,
+        )
+        with patch.object(runner, "_check_host_dependencies", return_value=None):
+            result = runner.run_and_complete()
+
+        copied = result.run_dir / "config" / "replay_store"
+        self.assertEqual(result.network_mode, "replay")
+        self.assertEqual(created[0].config.responder_mode, "replay")
+        self.assertEqual(created[0].config.replay_store_path, copied)
+        self.assertEqual(
+            created[0].config.replay_store_expected_sha256,
+            digest,
+        )
+        self.assertEqual(ReplayStore(copied).validate()["store_sha256"], digest)
+        manifest = json.loads(
+            (result.run_dir / "config" / "prebuilt_runner_manifest.json").read_text()
+        )
+        self.assertEqual(manifest["replay_store_sha256"], digest)
+        self.assertEqual(manifest["copied_replay_store_path"], str(copied))
+
+    def test_replay_store_drift_is_rejected_before_claim(self) -> None:
+        _write_json(
+            self.template / "config" / "network_policy.json",
+            {
+                "mode": "replay",
+                "allow_internet": False,
+                "services": [
+                    {
+                        "service_type": "tcp",
+                        "role": "c2",
+                        "remote_ip": "203.0.113.10",
+                        "remote_port": 48101,
+                        "domain": None,
+                        "bind_ip": "127.0.0.1",
+                        "bind_port": 48101,
+                        "protocol_hint": "c2_binary",
+                    }
+                ],
+            },
+        )
+        replay = ReplayStore(self.base / "replay-store")
+        replay.add(
+            transport="tcp",
+            remote_ip="203.0.113.10",
+            remote_port=48101,
+            request_bytes=b"hello",
+            response_bytes=b"first",
+            protocol_hint="c2_binary",
+        )
+        expected = replay.validate()["store_sha256"]
+        replay.add(
+            transport="tcp",
+            remote_ip="203.0.113.10",
+            remote_port=48101,
+            request_bytes=b"hello",
+            response_bytes=b"changed",
+            protocol_hint="c2_binary",
+            replace=True,
+        )
+
+        with self.assertRaisesRegex(PrebuiltRunnerError, "changed after"):
+            self.make_runner(
+                network_mode="replay",
+                replay_store=replay.root,
+                replay_store_expected_sha256=expected,
+            ).validate()
+        self.assertFalse(
+            (self.session / "iterations" / "0000" / "execution_attempt.json").exists()
+        )
 
     def test_infrastructure_failure_records_retry_safe_claim(self) -> None:
         runner = self.make_runner(FakeExecutor(infrastructure_fail=True))

@@ -16,7 +16,12 @@ from taintforge_env.synthesis_loop import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Drive the TaintForge-IoT environment synthesis state machine: prepare an immutable iteration, execute its prebuilt rootfs, complete the observation, and repeat until a controller stop condition or invocation step limit is reached. Native and static QEMU user-mode execution are selected automatically from the bound ELF target."
+            "Drive the TaintForge-IoT environment synthesis state machine: "
+            "prepare an immutable iteration, execute its prebuilt rootfs, "
+            "complete the observation, and repeat until a controller stop "
+            "condition or invocation step limit is reached. Native and "
+            "static QEMU user-mode execution are selected automatically from "
+            "the bound ELF target."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -40,11 +45,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=int, default=60)
     run.add_argument(
         "--network",
-        choices=("none", "controlled"),
+        choices=("none", "controlled", "replay"),
         default="none",
         help=(
             "Execution network backend. controlled preserves known endpoints, "
-            "captures unknown TCP/UDP attempts, and blocks real Internet egress."
+            "captures unknown TCP/UDP attempts, and blocks real Internet egress; "
+            "replay answers only exact stored TCP requests and fails closed."
+        ),
+    )
+    run.add_argument(
+        "--replay-store",
+        type=Path,
+        help=(
+            "ReplayStore directory required by --network replay. The store "
+            "digest becomes part of the immutable synthesis binding."
         ),
     )
     run.add_argument(
@@ -111,6 +125,7 @@ def main() -> int:
                 target_spec_path=args.target_spec,
                 network_mode=args.network,
                 network_self_test=args.network_self_test,
+                replay_store_path=args.replay_store,
                 max_iterations=args.max_iterations,
                 timeout_seconds=args.timeout,
                 max_steps=args.max_steps,

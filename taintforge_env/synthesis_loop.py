@@ -31,6 +31,9 @@ from .prebuilt_runner import (
     PrebuiltRunnerError,
     PrebuiltRunnerResult,
 )
+from .network_policy import load_network_policy
+from .network_replay import NetworkReplayError, validate_replay_policy
+from .replay_store import ReplayStore, ReplayStoreValidationError
 from .target_state_oracle import TargetStateError, TargetStateSpec
 
 
@@ -63,6 +66,7 @@ class SynthesisLoopConfig:
     target_spec_path: Path | None = None
     network_mode: str = "none"
     network_self_test: bool = False
+    replay_store_path: Path | None = None
     max_iterations: int = 5
     timeout_seconds: int = 60
     max_steps: int = 1
@@ -81,14 +85,22 @@ class SynthesisLoopConfig:
             self.binary_path = Path(self.binary_path).resolve(strict=False)
         if self.target_spec_path is not None:
             self.target_spec_path = Path(self.target_spec_path).resolve(strict=False)
+        if self.replay_store_path is not None:
+            self.replay_store_path = Path(self.replay_store_path).resolve(
+                strict=False
+            )
         self.network_mode = str(self.network_mode).strip().lower()
-        if self.network_mode not in {"none", "controlled"}:
+        if self.network_mode not in {"none", "controlled", "replay"}:
             raise SynthesisLoopError(
-                "network_mode must be one of: none, controlled"
+                "network_mode must be one of: none, controlled, replay"
             )
         if self.network_self_test and self.network_mode != "controlled":
             raise SynthesisLoopError(
                 "network_self_test requires network_mode=controlled"
+            )
+        if self.network_mode != "replay" and self.replay_store_path is not None:
+            raise SynthesisLoopError(
+                "replay_store_path is valid only for network_mode=replay"
             )
         if self.max_iterations < 1:
             raise SynthesisLoopError("max_iterations must be positive")
@@ -125,8 +137,20 @@ class SynthesisLoopResult:
 
 
 class EnvironmentSynthesisLoop:
+    """Thin orchestration layer over controller and prebuilt runner.
+
+    This class deliberately owns no repair, progress, snapshot, or execution
+    semantics.  It only advances the already-validated state machine:
+
+        prepare -> execute+complete -> inspect session decision -> repeat
+
+    A separate non-blocking loop lock prevents two automation processes from
+    driving the same session concurrently.  Individual controller transitions
+    continue to use the controller's own lock.
+    """
+
     SCHEMA_VERSION = 1
-    LOOP_VERSION = 5
+    LOOP_VERSION = 6
     BINDING_FILENAME = "synthesis_loop.json"
     EVENT_FILENAME = "synthesis_events.jsonl"
     REPORT_JSON_FILENAME = "synthesis_report.json"
@@ -293,6 +317,12 @@ class EnvironmentSynthesisLoop:
                         target_spec_path=self._effective_target_spec_path(),
                         network_mode=self.config.network_mode,
                         network_self_test=self.config.network_self_test,
+                        replay_store_path=self._effective_replay_store_path(),
+                        replay_store_expected_sha256=(
+                            str(binding.get("replay_store_sha256"))
+                            if self.config.network_mode == "replay"
+                            else None
+                        ),
                     )
                     self._append_event(
                         "iteration_execution_started",
@@ -476,6 +506,49 @@ class EnvironmentSynthesisLoop:
             if target_spec.goal_id != binding.get("target_goal_id"):
                 raise SynthesisLoopError("bound target-state goal id mismatch")
 
+        replay_store_path = binding.get("replay_store_path")
+        replay_store_sha256 = binding.get("replay_store_sha256")
+        if binding.get("network_mode") == "replay":
+            if not isinstance(replay_store_path, str) or not isinstance(
+                replay_store_sha256,
+                str,
+            ):
+                raise SynthesisLoopError("bound replay store identity is invalid")
+            try:
+                replay_validation = validate_replay_policy(
+                    policy=load_network_policy(
+                        Path(str(binding.get("template_run_dir")))
+                        / "config"
+                        / "network_policy.json"
+                    ),
+                    replay_store=ReplayStore(replay_store_path),
+                )
+            except (
+                NetworkReplayError,
+                ReplayStoreValidationError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise SynthesisLoopError(
+                    f"invalid deterministic replay preflight: {exc}"
+                ) from exc
+            if replay_validation["store_sha256"] != replay_store_sha256:
+                raise SynthesisLoopError("bound replay store was modified")
+            if replay_validation["entries"] != binding.get(
+                "replay_store_entries"
+            ):
+                raise SynthesisLoopError("bound replay store entry count changed")
+        elif (
+            replay_store_path is not None
+            or replay_store_sha256 is not None
+            or binding.get("replay_store_entries") is not None
+        ):
+            raise SynthesisLoopError(
+                "non-replay session contains an unexpected replay store binding"
+            )
+
         return {
             "session_id": manifest.session_id,
             "session_state": manifest.state.value,
@@ -552,7 +625,7 @@ class EnvironmentSynthesisLoop:
         _validate_directory(self.config.project_root, "project root")
         runtime_path = self.config.template_run_dir / "config" / "runtime.json"
         runtime = _load_json_object(runtime_path, "template runtime")
-        if self.config.network_mode == "controlled":
+        if self.config.network_mode in {"controlled", "replay"}:
             _validate_regular_file(
                 self.config.template_run_dir / "config" / "network_policy.json",
                 "template network policy",
@@ -588,6 +661,36 @@ class EnvironmentSynthesisLoop:
                 target_spec = TargetStateSpec.load(target_spec_path)
             except TargetStateError as exc:
                 raise SynthesisLoopError(str(exc)) from exc
+        replay_store_path = self._effective_replay_store_path()
+        replay_store_sha256: str | None = None
+        replay_store_entries: int | None = None
+        if self.config.network_mode == "replay":
+            if replay_store_path is None:
+                raise SynthesisLoopError(
+                    "network_mode=replay requires --replay-store"
+                )
+            try:
+                replay_validation = validate_replay_policy(
+                    policy=load_network_policy(
+                        self.config.template_run_dir
+                        / "config"
+                        / "network_policy.json"
+                    ),
+                    replay_store=ReplayStore(replay_store_path),
+                )
+            except (
+                NetworkReplayError,
+                ReplayStoreValidationError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise SynthesisLoopError(
+                    f"invalid deterministic replay preflight: {exc}"
+                ) from exc
+            replay_store_sha256 = str(replay_validation["store_sha256"])
+            replay_store_entries = int(replay_validation["entries"])
         return {
             "template_run_dir": str(self.config.template_run_dir),
             "template_runtime": str(runtime_path),
@@ -619,6 +722,11 @@ class EnvironmentSynthesisLoop:
             "timeout_seconds": self.config.timeout_seconds,
             "network_mode": self.config.network_mode,
             "network_self_test": self.config.network_self_test,
+            "replay_store_path": (
+                str(replay_store_path) if replay_store_path is not None else None
+            ),
+            "replay_store_sha256": replay_store_sha256,
+            "replay_store_entries": replay_store_entries,
             "allow_internet": False,
             "qemu_required_supported": True,
         }
@@ -632,6 +740,21 @@ class EnvironmentSynthesisLoop:
                 "synthesis loop manifest",
             )
             value = stored.get("target_spec_path")
+            if isinstance(value, str) and value:
+                return Path(value).resolve(strict=False)
+        return None
+
+    def _effective_replay_store_path(self) -> Path | None:
+        if self.config.network_mode != "replay":
+            return None
+        if self.config.replay_store_path is not None:
+            return self.config.replay_store_path
+        if self.binding_path.is_file() and not self.binding_path.is_symlink():
+            stored = _load_json_object(
+                self.binding_path,
+                "synthesis loop manifest",
+            )
+            value = stored.get("replay_store_path")
             if isinstance(value, str) and value:
                 return Path(value).resolve(strict=False)
         return None
@@ -663,7 +786,15 @@ class EnvironmentSynthesisLoop:
         paths: list[Path] = []
         module_dir = Path(__file__).resolve().parent
         paths.extend(sorted(module_dir.glob("*.py")))
-        for relative in self.REQUIRED_PROJECT_SCRIPTS:
+        network_scripts = {
+            "none": (),
+            "controlled": (
+                "scripts/start_network_emulator.py",
+                "scripts/start_transparent_logger.py",
+            ),
+            "replay": ("scripts/start_network_replay.py",),
+        }[self.config.network_mode]
+        for relative in (*self.REQUIRED_PROJECT_SCRIPTS, *network_scripts):
             path = self.config.project_root / relative
             _validate_regular_file(path, f"analysis script {relative}")
             paths.append(path)
@@ -775,6 +906,9 @@ class EnvironmentSynthesisLoop:
             "timeout_seconds",
             "network_mode",
             "network_self_test",
+            "replay_store_path",
+            "replay_store_sha256",
+            "replay_store_entries",
             "allow_internet",
             "qemu_required_supported",
         )
@@ -934,6 +1068,9 @@ class EnvironmentSynthesisLoop:
                 "timeout_seconds": binding.get("timeout_seconds"),
                 "max_iterations": binding.get("max_iterations"),
                 "network_mode": binding.get("network_mode"),
+                "replay_store_path": binding.get("replay_store_path"),
+                "replay_store_sha256": binding.get("replay_store_sha256"),
+                "replay_store_entries": binding.get("replay_store_entries"),
             },
             "iterations": iterations,
         }
@@ -949,6 +1086,8 @@ class EnvironmentSynthesisLoop:
             f"- Loop stop reason: `{binding.get('stop_reason')}`",
             f"- Invocations: `{binding.get('invocations')}`",
             f"- Iterations: `{len(session.iterations)}`",
+            f"- Network mode: `{binding.get('network_mode')}`",
+            f"- Replay store SHA-256: `{binding.get('replay_store_sha256')}`",
             f"- Last error: `{binding.get('last_error')}`",
             "",
             "## Iterations",

@@ -99,6 +99,63 @@ class ReplayStoreTests(unittest.TestCase):
         with self.assertRaises(ReplayStoreValidationError):
             self.store.validate()
 
+    def test_tampered_request_is_detected(self) -> None:
+        entry = self.store.add(
+            transport="tcp",
+            remote_ip="1.1.1.1",
+            remote_port=80,
+            request_bytes=b"request",
+            response_bytes=b"response",
+        )
+        request_path = self.store_path / "requests" / f"{entry.entry_id}.bin"
+        request_path.write_bytes(b"tampered")
+
+        with self.assertRaisesRegex(
+            ReplayStoreValidationError,
+            "request (size|digest) mismatch",
+        ):
+            self.store.validate()
+
+    def test_tcp_prefix_ambiguity_is_rejected(self) -> None:
+        for request in (b"hello", b"hello-world"):
+            self.store.add(
+                transport="tcp",
+                remote_ip="203.0.113.7",
+                remote_port=9000,
+                request_bytes=request,
+                response_bytes=b"ok",
+                protocol_hint="c2",
+            )
+
+        with self.assertRaisesRegex(
+            ReplayStoreValidationError,
+            "prefix ambiguity",
+        ):
+            self.store.validate()
+
+    def test_store_identity_changes_when_response_semantics_change(self) -> None:
+        self.store.add(
+            transport="tcp",
+            remote_ip="203.0.113.8",
+            remote_port=9001,
+            request_bytes=b"hello",
+            response_bytes=b"first",
+        )
+        first = self.store.validate()["store_sha256"]
+
+        self.store.add(
+            transport="tcp",
+            remote_ip="203.0.113.8",
+            remote_port=9001,
+            request_bytes=b"hello",
+            response_bytes=b"second",
+            delay_ms=25,
+            replace=True,
+        )
+        second = self.store.validate()["store_sha256"]
+
+        self.assertNotEqual(first, second)
+
 
 if __name__ == "__main__":
     unittest.main()

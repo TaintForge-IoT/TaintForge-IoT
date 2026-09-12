@@ -33,12 +33,22 @@ def add_execution_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--timeout", type=int, default=60)
     command.add_argument(
         "--network",
-        choices=("none", "controlled"),
+        choices=("none", "controlled", "replay"),
         default="none",
         help=(
             "none creates a disconnected private namespace; controlled adds "
             "known local responders and transparent TCP/UDP capture without "
-            "Internet forwarding."
+            "Internet forwarding; replay serves only exact TCP exchanges from "
+            "--replay-store and drops unknown traffic."
+        ),
+    )
+    command.add_argument(
+        "--replay-store",
+        type=Path,
+        default=None,
+        help=(
+            "ReplayStore directory required by --network replay. Its semantic "
+            "digest is verified and a private per-attempt copy is executed."
         ),
     )
     command.add_argument(
@@ -66,7 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Validate or execute one IterationController-prepared rootfs "
             "without rebuilding the environment. Selects native or static "
             "QEMU user-mode execution from verified ELF metadata and supports "
-            "isolated network-none and controlled local-responder modes."
+            "isolated network-none, controlled local-responder, and exact "
+            "replay modes."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -103,6 +114,7 @@ def make_config(args: argparse.Namespace) -> PrebuiltRunnerConfig:
         target_spec_path=getattr(args, "target_spec", None),
         network_mode=getattr(args, "network", "none"),
         network_self_test=getattr(args, "network_self_test", False),
+        replay_store_path=getattr(args, "replay_store", None),
         goal_reached=getattr(args, "goal_reached", False),
         goal_reason=getattr(args, "goal_reason", None),
     )
@@ -110,8 +122,8 @@ def make_config(args: argparse.Namespace) -> PrebuiltRunnerConfig:
 
 def main() -> int:
     args = build_parser().parse_args()
-    runner = PrebuiltRootfsRunner(make_config(args))
     try:
+        runner = PrebuiltRootfsRunner(make_config(args))
         if args.command == "reset-safe-failure":
             runner.reset_safe_failure()
             print("[+] Retry-safe failed attempt was reset")
