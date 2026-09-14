@@ -33,7 +33,7 @@ struct IrSmt {
     IrSmtInfo info;
     Z3_context ctx;
     Z3_sort bv[65], mem[65];
-    Sym *values, *states;
+    Sym *values, *states, *branches;
     Binding *bindings;
     uint32_t binding_capacity;
     Parameter *parameters;
@@ -611,6 +611,15 @@ static bool lower(IrSmt *s) {
         if (!spend(s, 1))
             return false;
         const IrTerminator *t = &m->blocks[block - 1].terminator;
+        if (t->kind == IR_TERM_CJUMP) {
+            s->info.origin = t->origin;
+            Sym condition =
+                halted ? opaque(s, ir_type_bv(1), s->reach_reasons) : s->values[t->condition - 1];
+            condition.must_reach = s->must_reach;
+            condition.may_reach = s->may_reach;
+            condition.reach_reasons = s->reach_reasons;
+            s->branches[block - 1] = condition;
+        }
         bool valid;
         IrBlockId next = ir_trace_next(t, &valid);
         if (!halted && next && t->kind == IR_TERM_CJUMP) {
@@ -653,11 +662,12 @@ IrSmt *ir_smt_build(const IrModule *m, const IrInputs *inputs, const IrSmtOption
         fail(s, IR_RESOURCE_LIMIT, "INPUT table capacity overflow");
         goto end;
     }
-    uint64_t bytes = sizeof(*s) + ((uint64_t)m->value_count + m->state_count + 2) * sizeof(Sym) +
-                     capacity * sizeof(Binding) +
-                     ((uint64_t)o.parameter_count + 1) * sizeof(Parameter) +
-                     ((uint64_t)ci.count + 1) * (sizeof(bool) + sizeof(Z3_ast)) +
-                     ((uint64_t)m->block_count + 1) * sizeof(*rank);
+    uint64_t bytes =
+        sizeof(*s) +
+        ((uint64_t)m->value_count + m->state_count + m->block_count + 3) * sizeof(Sym) +
+        capacity * sizeof(Binding) + ((uint64_t)o.parameter_count + 1) * sizeof(Parameter) +
+        ((uint64_t)ci.count + 1) * (sizeof(bool) + sizeof(Z3_ast)) +
+        ((uint64_t)m->block_count + 1) * sizeof(*rank);
     if (!allocation(s, bytes))
         goto end;
     result = calloc(1, sizeof(*result));
@@ -674,13 +684,14 @@ IrSmt *ir_smt_build(const IrModule *m, const IrInputs *inputs, const IrSmtOption
     s->binding_capacity = (uint32_t)capacity;
     s->values = calloc((size_t)m->value_count + 1, sizeof(*s->values));
     s->states = calloc((size_t)m->state_count + 1, sizeof(*s->states));
+    s->branches = calloc((size_t)m->block_count + 1, sizeof(*s->branches));
     s->bindings = calloc((size_t)capacity, sizeof(*s->bindings));
     s->parameters = calloc((size_t)o.parameter_count + 1, sizeof(*s->parameters));
     s->selected = calloc((size_t)ci.count + 1, sizeof(*s->selected));
     s->cell_symbols = calloc((size_t)ci.count + 1, sizeof(*s->cell_symbols));
     rank = calloc((size_t)m->block_count + 1, sizeof(*rank));
-    if (!s->values || !s->states || !s->bindings || !s->parameters || !s->selected ||
-        !s->cell_symbols || !rank) {
+    if (!s->values || !s->states || !s->branches || !s->bindings || !s->parameters ||
+        !s->selected || !s->cell_symbols || !rank) {
         fail(s, IR_OUT_OF_MEMORY, "SMT arrays allocation");
         goto end;
     }
@@ -724,6 +735,7 @@ void ir_smt_destroy(IrSmt *s) {
     ir_inputs_release(s->inputs);
     free(s->values);
     free(s->states);
+    free(s->branches);
     free(s->bindings);
     free(s->parameters);
     free(s->selected);
@@ -828,14 +840,15 @@ static bool get_model(IrSmt *s, Z3_model model, const IrValueId *samples, uint32
     return true;
 }
 
-IrSmtAnswer ir_smt_query(IrSmt *s, const IrSmtConstraint *cs, uint32_t nc, const IrValueId *samples,
-                         uint32_t ns, const IrSmtQueryLimits *limits) {
+static IrSmtAnswer query(IrSmt *s, const IrSmtConstraint *cs, const IrSmtBranchConstraint *bs,
+                         bool at_branch, uint32_t nc, const IrValueId *samples, uint32_t ns,
+                         const IrSmtQueryLimits *limits) {
     IrSmtQueryLimits l = limits ? *limits : ir_smt_default_query_limits();
     IrSmtAnswer a = {.status = IR_SMT_INVALID};
     Z3_solver solver = NULL;
     Z3_model model = NULL;
     bool solver_owned = false, model_owned = false;
-    if (!ir_smt_current(s) || (nc && !cs) || (ns && !samples)) {
+    if (!ir_smt_current(s) || (nc && (at_branch ? !bs : !cs)) || (ns && !samples)) {
         answer_error(&a, IR_SMT_INVALID, "missing/stale backend or query array");
         return a;
     }
@@ -859,6 +872,14 @@ IrSmtAnswer ir_smt_query(IrSmt *s, const IrSmtConstraint *cs, uint32_t nc, const
     }
     a.bytes = (size_t)bytes;
     for (uint32_t i = 0; i < nc; ++i) {
+        if (at_branch) {
+            if (!bs[i].block || bs[i].block > s->module->block_count ||
+                !s->branches[bs[i].block - 1].value) {
+                answer_error(&a, IR_SMT_INVALID, "constraint does not name a CJUMP block");
+                return a;
+            }
+            continue;
+        }
         if (!query_value(s, cs[i].value) || !cs[i].mask ||
             ((cs[i].mask | cs[i].expected) &
              ~ir_width_mask(s->values[cs[i].value - 1].type.bits))) {
@@ -875,11 +896,14 @@ IrSmtAnswer ir_smt_query(IrSmt *s, const IrSmtConstraint *cs, uint32_t nc, const
     for (uint32_t i = 0; i < nc; ++i) {
         if (!query_work(&a, &l, 24))
             goto finish;
-        Sym v = s->values[cs[i].value - 1];
+        Sym v = at_branch ? s->branches[bs[i].block - 1] : s->values[cs[i].value - 1];
         a.reasons |= v.reasons | v.reach_reasons;
-        a.origin = s->module->insts[s->module->values[cs[i].value - 1].definition - 1].spec.origin;
-        Z3_ast mask = num(s, v.type.bits, cs[i].mask),
-               expected = num(s, v.type.bits, cs[i].expected);
+        a.origin =
+            at_branch
+                ? s->module->blocks[bs[i].block - 1].terminator.origin
+                : s->module->insts[s->module->values[cs[i].value - 1].definition - 1].spec.origin;
+        Z3_ast mask = num(s, v.type.bits, at_branch ? 1 : cs[i].mask),
+               expected = num(s, v.type.bits, at_branch ? (uint64_t)bs[i].taken : cs[i].expected);
         Z3_ast difference = bv_and(s, bv_xor(s, v.value, expected), mask),
                zero = num(s, v.type.bits, 0);
         Z3_ast defined = eq(s, bv_and(s, v.mask, mask), mask);
@@ -954,7 +978,9 @@ IrSmtAnswer ir_smt_query(IrSmt *s, const IrSmtConstraint *cs, uint32_t nc, const
             goto finish;
         }
         a.reasons = 0;
-        answer_error(&a, IR_SMT_SAT, "defined witness for requested values");
+        answer_error(&a, IR_SMT_SAT,
+                     at_branch ? "defined witness at requested branches"
+                               : "defined witness for requested values");
         goto finish;
     }
 backend_error:
@@ -979,6 +1005,16 @@ finish:
         a.catalogue = NULL;
     }
     return a;
+}
+
+IrSmtAnswer ir_smt_query(IrSmt *s, const IrSmtConstraint *cs, uint32_t nc, const IrValueId *samples,
+                         uint32_t ns, const IrSmtQueryLimits *limits) {
+    return query(s, cs, NULL, false, nc, samples, ns, limits);
+}
+
+IrSmtAnswer ir_smt_query_branches(IrSmt *s, const IrSmtBranchConstraint *cs, uint32_t nc,
+                                  const IrSmtQueryLimits *limits) {
+    return query(s, NULL, cs, true, nc, NULL, 0, limits);
 }
 
 void ir_smt_answer_destroy(IrSmtAnswer *a) {

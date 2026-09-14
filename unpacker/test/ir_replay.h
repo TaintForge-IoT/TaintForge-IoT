@@ -44,6 +44,7 @@ typedef struct {
     uint32_t max_observations;
     uint32_t max_memory_bytes;
     IrInputLimits inputs;
+    bool capture_target; /* Project the exact trigger's pre-transfer destination. */
 } IrReplayOptions;
 
 typedef enum {
@@ -53,7 +54,8 @@ typedef enum {
     IR_REPLAY_READ_VALUE,
     IR_REPLAY_WRITE_ADDRESS,
     IR_REPLAY_WRITE_VALUE,
-    IR_REPLAY_BRANCH_CONDITION
+    IR_REPLAY_BRANCH_CONDITION,
+    IR_REPLAY_TRANSFER_TARGET
 } IrReplayObservationKind;
 
 typedef struct {
@@ -61,13 +63,20 @@ typedef struct {
     IrOrigin origin;
     IrValueId value;
     uint8_t width;
-    uint32_t index; /* GPR/flag index, zero for the single memory access. */
+    uint32_t index; /* GPR/flag index, or index within the read/write observations. */
     bool expected_valid;
     uint64_t expected;
     /* ISA-undefined flag at this boundary: value is zero (no required
      * export). The semantic flag state is still UNKNOWN and can be read. */
     bool architectural_undefined;
+    IrValueId defined_when; /* Optional BV1: false skips ISA-undefined flags. */
 } IrReplayObservation;
+
+typedef struct {
+    IrX86LiftStatus status;
+    IrValueId value;
+    int gpr_index;
+} IrReplayTarget;
 
 typedef enum {
     IR_REPLAY_CHECK_MATCH,
@@ -99,7 +108,8 @@ IrReplayOptions ir_replay_default_options(void);
 /* Builds an owned, bounded fragment from selected steps, ending BEFORE trigger.
  * Only adjacent same-vCPU occurrences with verified semantic successors are
  * connected. Jcc needs an exact BranchEvent in the owned occurrence. Other
- * successors remain ADDRESS exits; following them evaluates to UNKNOWN.
+ * Indirect transfers guard the computed destination before following an
+ * observed adjacent occurrence. Unobserved conditional successors remain ADDRESS exits; following them evaluates to UNKNOWN.
  * Repeated PCs get distinct dynamic blocks, not an invented CFG merge.
  * A sparse slice/unsupported instruction ends in UNKNOWN, never
  * in an invented edge or a NOP. NULL means a fatal request/allocation/builder
@@ -142,5 +152,10 @@ IrReplayCheckResult ir_replay_check(IrReplay *replay, const IrEvalLimits *limits
  * Caller must verify that the actual transfer uses this full register. */
 IrReplayCheckResult ir_replay_check_gpr_candidate(IrReplay *replay, const IrEvalLimits *limits,
                                                   const IrReplayGprCandidate *candidate);
+IrReplayTarget ir_replay_target(const IrReplay *replay);
+/* Requires capture_target. Checks the projected exact trigger destination;
+ * target reads are observations, while CALL/RET state updates are excluded. */
+IrReplayCheckResult ir_replay_check_target(IrReplay *replay, const IrEvalLimits *limits,
+                                           uint64_t trigger_seq, uint32_t expected_target);
 
 #endif

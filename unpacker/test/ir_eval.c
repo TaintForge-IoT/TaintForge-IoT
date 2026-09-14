@@ -55,6 +55,23 @@ size_t ir_eval_allocated_bytes(const IrEval *e) {
            (size_t)e->memory_capacity * sizeof(*e->memory);
 }
 
+bool ir_eval_allocation_bound(const IrModule *m, const IrEvalLimits *limits, size_t *bytes) {
+    if (!m || !bytes)
+        return false;
+    IrEvalLimits l = limits ? *limits : ir_eval_default_limits();
+    if (l.memory_nodes == UINT32_MAX)
+        return false;
+    uint64_t nv = m->value_count ? m->value_count : 1;
+    uint64_t ns = m->state_count ? m->state_count : 1;
+    uint64_t bound = sizeof(IrEval) + nv * (sizeof(IrEvalValue) + sizeof(InputBinding)) +
+                     ns * (sizeof(IrEvalValue) + sizeof(bool)) +
+                     (uint64_t)l.memory_nodes * sizeof(MemoryNode);
+    if (bound > SIZE_MAX)
+        return false;
+    *bytes = (size_t)bound;
+    return true;
+}
+
 IrBits ir_bits_known(uint64_t value, uint32_t width) {
     uint64_t mask = ir_width_mask(width);
     return (IrBits){value & mask, mask, 0};
@@ -504,7 +521,8 @@ static void finish(IrEval *e, IrEvalStatus status) {
     e->result.status = e->result.reasons ? IR_EVAL_UNKNOWN : status;
 }
 
-IrEvalResult ir_eval_run(IrEval *e) {
+static IrEvalResult run(IrEval *e, IrBlockId stop, IrEvalBranch *events, uint32_t capacity,
+                        uint32_t *count) {
     if (!current(e))
         return (IrEvalResult){.status = IR_EVAL_INVALID};
     const IrModule *m = e->module;
@@ -540,8 +558,11 @@ IrEvalResult ir_eval_run(IrEval *e) {
             break;
         if (t->kind == IR_TERM_FRAGMENT_END || t->kind == IR_TERM_PROGRAM_EXIT) {
             e->result.reasons |= t->reasons;
-            finish(e,
-                   t->kind == IR_TERM_FRAGMENT_END ? IR_EVAL_FRAGMENT_END : IR_EVAL_PROGRAM_EXIT);
+            if (stop)
+                fail_eval(e, IR_EVAL_UNKNOWN, IR_REASON_NOT_EXECUTED);
+            else
+                finish(e, t->kind == IR_TERM_FRAGMENT_END ? IR_EVAL_FRAGMENT_END
+                                                          : IR_EVAL_PROGRAM_EXIT);
             break;
         }
         if (t->kind == IR_TERM_UNKNOWN) {
@@ -558,11 +579,32 @@ IrEvalResult ir_eval_run(IrEval *e) {
         unsigned successor = 0;
         if (t->kind == IR_TERM_CJUMP) {
             IrBits cond = e->values[t->condition - 1].bits;
+            if (stop) {
+                if (*count >= capacity) {
+                    fail_eval(e, IR_EVAL_RESOURCE_LIMIT, IR_REASON_BUDGET);
+                    break;
+                }
+                events[(*count)++] = (IrEvalBranch){
+                    .block = block,
+                    .origin = t->origin,
+                    .condition = cond,
+                    .target = ir_bits_complete(cond, 1)
+                                  ? t->successors[cond.value ? 0 : 1]
+                                  : (IrTarget){.kind = IR_TARGET_UNKNOWN, .reasons = cond.reasons}};
+            }
             if (!ir_bits_complete(cond, 1)) {
                 fail_eval(e, IR_EVAL_UNKNOWN, cond.reasons | t->reasons);
                 break;
             }
             successor = cond.value ? 0 : 1;
+            if (stop == block) {
+                IrTarget target = t->successors[successor];
+                e->result.target_known = target.kind == IR_TARGET_ADDRESS;
+                e->result.target_address = target.address;
+                e->result.reasons |= t->reasons;
+                e->result.status = e->result.reasons ? IR_EVAL_UNKNOWN : IR_EVAL_BRANCH;
+                break;
+            }
         }
         IrTarget target = t->successors[successor];
         if (target.kind == IR_TARGET_BLOCK) {
@@ -575,6 +617,25 @@ IrEvalResult ir_eval_run(IrEval *e) {
         }
     }
     return e->result;
+}
+
+IrEvalResult ir_eval_run(IrEval *e) {
+    return run(e, 0, NULL, 0, NULL);
+}
+
+IrEvalResult ir_eval_run_to_branch(IrEval *e, IrBlockId block, IrEvalBranch *events,
+                                   uint32_t capacity, uint32_t *count) {
+    if (count)
+        *count = 0;
+    if (!current(e) || !count || (capacity && !events) || !block ||
+        block > e->module->block_count ||
+        e->module->blocks[block - 1].terminator.kind != IR_TERM_CJUMP) {
+        IrEvalResult r = {.status = IR_EVAL_INVALID};
+        if (current(e))
+            e->result = r;
+        return r;
+    }
+    return run(e, block, events, capacity, count);
 }
 
 IrEvalResult ir_eval_result(const IrEval *e) {

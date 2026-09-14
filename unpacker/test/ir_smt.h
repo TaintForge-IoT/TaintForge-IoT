@@ -42,6 +42,11 @@ typedef struct {
 } IrSmtConstraint;
 
 typedef struct {
+    IrBlockId block; /* CJUMP occurrence, independent of its condition's definition. */
+    bool taken;
+} IrSmtBranchConstraint;
+
+typedef struct {
     uint64_t work;
     size_t bytes; /* New result/scratch arrays, excluding backend/Z3. */
     uint32_t constraints, samples;
@@ -115,6 +120,15 @@ IrSmtInfo ir_smt_info(const IrSmt *smt);
 IrSmtAnswer ir_smt_query(IrSmt *smt, const IrSmtConstraint *constraints, uint32_t constraint_count,
                          const IrValueId *samples, uint32_t sample_count,
                          const IrSmtQueryLimits *limits);
+/* Conjunction at CJUMP terminators, after preceding instructions/effects and
+ * before choosing successors. This includes guards after the condition's
+ * definition. Observed outcomes are not added implicitly: pass every required
+ * prefix outcome explicitly, including branches with identical successors.
+ * Uses the same SAT/UNSAT/UNKNOWN, budgets and ownership contract as value
+ * queries. A known condition can select an external/UNKNOWN successor; SAT
+ * does not establish that successor's behavior or full-program reachability. */
+IrSmtAnswer ir_smt_query_branches(IrSmt *smt, const IrSmtBranchConstraint *constraints,
+                                  uint32_t constraint_count, const IrSmtQueryLimits *limits);
 void ir_smt_answer_destroy(IrSmtAnswer *answer);
 
 #endif

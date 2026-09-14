@@ -888,6 +888,75 @@ void trace_occurrence_archive_note_loss(TraceBuffer *tb) {
     g_mutex_unlock(&archive->lock);
 }
 
+/* Intrusive chains store ring slots, newest first. Append and eviction allocate
+ * nothing; duplicate keys retain the same last-added result as linear search.
+ * Access requires the same external serialization as the event ring itself. */
+struct BranchEventIndex {
+    uint32_t capacity;
+    uint32_t links[]; /* bucket heads, next slots, previous slots */
+};
+
+#define BRANCH_INDEX_EMPTY UINT32_MAX
+
+size_t branch_event_buffer_index_bytes(const BranchEventBuffer *buffer) {
+    return buffer && buffer->index
+               ? sizeof(*buffer->index) + (size_t)buffer->index->capacity * 3U * sizeof(uint32_t)
+               : 0;
+}
+
+static struct BranchEventIndex *branch_index_create(uint32_t capacity) {
+    size_t count = capacity;
+    if (count > (SIZE_MAX - sizeof(struct BranchEventIndex)) / (3U * sizeof(uint32_t)))
+        return NULL;
+    size_t bytes = sizeof(struct BranchEventIndex) + count * 3U * sizeof(uint32_t);
+    struct BranchEventIndex *index = malloc(bytes);
+    if (!index)
+        return NULL;
+    index->capacity = capacity;
+    memset(index->links, 0xff, bytes - sizeof(*index));
+    return index;
+}
+
+static uint32_t branch_index_bucket(const BranchEventBuffer *buffer, uint64_t seq, uint32_t vcpu) {
+    uint64_t h = seq ^ ((uint64_t)vcpu * UINT64_C(0x9e3779b97f4a7c15));
+    h = (h ^ (h >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    h = (h ^ (h >> 27)) * UINT64_C(0x94d049bb133111eb);
+    h ^= h >> 31;
+    return (uint32_t)h & (buffer->capacity - 1U);
+}
+
+static void branch_index_remove(BranchEventBuffer *buffer, uint32_t slot) {
+    struct BranchEventIndex *index = buffer->index;
+    const BranchEvent *event = &buffer->events[slot];
+    if (!index || !event->branch_seq_id)
+        return;
+    uint32_t *next = index->links + buffer->capacity;
+    uint32_t *prev = next + buffer->capacity;
+    if (prev[slot] != BRANCH_INDEX_EMPTY)
+        next[prev[slot]] = next[slot];
+    else
+        index->links[branch_index_bucket(buffer, event->branch_seq_id, event->vcpu_index)] =
+            next[slot];
+    if (next[slot] != BRANCH_INDEX_EMPTY)
+        prev[next[slot]] = prev[slot];
+}
+
+static void branch_index_insert(BranchEventBuffer *buffer, uint32_t slot) {
+    struct BranchEventIndex *index = buffer->index;
+    const BranchEvent *event = &buffer->events[slot];
+    if (!index || !event->branch_seq_id)
+        return;
+    uint32_t bucket = branch_index_bucket(buffer, event->branch_seq_id, event->vcpu_index);
+    uint32_t *next = index->links + buffer->capacity;
+    uint32_t *prev = next + buffer->capacity;
+    uint32_t head = index->links[bucket];
+    next[slot] = head;
+    prev[slot] = BRANCH_INDEX_EMPTY;
+    if (head != BRANCH_INDEX_EMPTY)
+        prev[head] = slot;
+    index->links[bucket] = slot;
+}
+
 BranchEventBuffer *branch_event_buffer_create(uint32_t capacity) {
     if (capacity == 0 || (capacity & (capacity - 1U)) != 0) {
         return NULL;
@@ -902,6 +971,7 @@ BranchEventBuffer *branch_event_buffer_create(uint32_t capacity) {
     }
     buffer->capacity = capacity;
     buffer->next_event_id = 1;
+    buffer->index = branch_index_create(capacity);
     return buffer;
 }
 
@@ -909,6 +979,7 @@ void branch_event_buffer_destroy(BranchEventBuffer *buffer) {
     if (!buffer)
         return;
     free(buffer->events);
+    free(buffer->index);
     free(buffer);
 }
 
@@ -917,8 +988,13 @@ const BranchEvent *branch_event_append(BranchEventBuffer *buffer, const BranchEv
         return NULL;
     }
     uint32_t index = buffer->head_pointer & (buffer->capacity - 1U);
-    buffer->events[index] = *event;
+    /* event may point into this ring, including the slot being overwritten. */
+    BranchEvent incoming = *event;
+    if (buffer->counter == buffer->capacity)
+        branch_index_remove(buffer, index);
+    buffer->events[index] = incoming;
     buffer->events[index].event_id = buffer->next_event_id++;
+    branch_index_insert(buffer, index);
     buffer->head_pointer++;
     if (buffer->counter < buffer->capacity) {
         buffer->counter++;
@@ -937,6 +1013,18 @@ const BranchEvent *branch_event_get_last(const BranchEventBuffer *buffer, uint32
 const BranchEvent *branch_event_find_seq(const BranchEventBuffer *buffer, uint64_t branch_seq_id,
                                          uint32_t vcpu_index) {
     if (!buffer || branch_seq_id == 0) {
+        return NULL;
+    }
+    if (buffer->index) {
+        const uint32_t *next = buffer->index->links + buffer->capacity;
+        uint32_t slot =
+            buffer->index->links[branch_index_bucket(buffer, branch_seq_id, vcpu_index)];
+        while (slot != BRANCH_INDEX_EMPTY) {
+            const BranchEvent *event = &buffer->events[slot];
+            if (event->branch_seq_id == branch_seq_id && event->vcpu_index == vcpu_index)
+                return event;
+            slot = next[slot];
+        }
         return NULL;
     }
     for (uint32_t back_index = 0; back_index < buffer->counter; back_index++) {
@@ -983,4 +1071,6 @@ void branch_event_buffer_reset(BranchEventBuffer *buffer) {
         return;
     buffer->head_pointer = 0;
     buffer->counter = 0;
+    if (buffer->index)
+        memset(buffer->index->links, 0xff, (size_t)buffer->capacity * sizeof(uint32_t));
 }

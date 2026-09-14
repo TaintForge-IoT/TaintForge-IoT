@@ -16,6 +16,12 @@
 #include "dse.h"
 #include "dcfg.h"
 #include "ir_runtime.h"
+#include "runtime_diag.h"
+#include "qemu_flags_contract.h"
+#include "qemu_plugin_compat.h"
+#include "elf_image.h"
+
+static TfRuntimeDiag g_runtime_diag;
 
 /* Opt-in diagnostic consumer. Existing DSE verdict/scoring is independent. */
 static IrRuntime g_ir_runtime;
@@ -316,7 +322,9 @@ static GMutex g_insn_exec_contexts_lock;
 static bool g_insn_exec_contexts_lock_initialized = false;
 static bool g_taint_seen = false;
 static struct qemu_plugin_register *g_reg_handle[REG_COUNT];
+static bool g_reg_handle_valid[REG_COUNT];
 static struct qemu_plugin_register *g_eflags_handle = NULL;
+static bool g_eflags_handle_valid;
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
 static bool g_reg_read_error_reported[REG_COUNT];
@@ -397,8 +405,6 @@ static uint64_t g_ld_base = 0;
 //AT_ENTRY in packed file typically points to packer's stub
 static uint64_t g_stub_entry = 0;
 static bool g_auxv_done = false;
-static uint32_t g_auxv_attempts = 0;
-static uint64_t g_auxv_next_retry = 1;
 static bool g_initial_sp_valid = false;
 static uint64_t g_initial_sp = 0;
 //TODO stub for multiarch
@@ -465,8 +471,8 @@ typedef struct {
     uint8_t dcfg_last_insn_size;
 } PluginVcpuState;
 
-static void ir_plugin_check(PluginVcpuState *state, unsigned int vcpu, uint64_t trigger_seq,
-                            IrRuntimeKind kind, uint64_t address, int reg) {
+static void ir_plugin_check_impl(PluginVcpuState *state, unsigned int vcpu, uint64_t trigger_seq,
+                                 IrRuntimeKind kind, uint64_t address, int reg) {
     if (!g_ir_enabled)
         return;
     IrRuntimeRequest request = {.kind = kind,
@@ -493,6 +499,12 @@ static void ir_plugin_check(PluginVcpuState *state, unsigned int vcpu, uint64_t 
             kind == IR_RUNTIME_CANDIDATE ? "candidate" : "probe", trigger_seq,
             ir_runtime_status_name(report.status), report.build.lifted_steps, report.selected_steps,
             report.build.stopped_seq, report.issues, report.build.issues, report.total_us);
+}
+
+static void ir_plugin_check(PluginVcpuState *state, unsigned int vcpu, uint64_t trigger_seq,
+                            IrRuntimeKind kind, uint64_t address, int reg) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_IR);
+    ir_plugin_check_impl(state, vcpu, trigger_seq, kind, address, reg);
 }
 
 static uint32_t next_code_generation(void) {
@@ -867,6 +879,8 @@ static bool guest_pc_equal(uint64_t left, uint64_t right) {
 }
 
 static void log_branch_root_set(uint64_t event_id, const char *channel, ProvRootSetId set_id) {
+    if (!tf_runtime_log_enabled(&g_runtime_diag, TF_LOG_ROOTS))
+        return;
     ProvRootSetView set;
     if (!prov_root_set_get(g_prov_registry, set_id, &set)) {
         return;
@@ -901,6 +915,8 @@ static void log_branch_root_set(uint64_t event_id, const char *channel, ProvRoot
 
 static void log_dcfg_target_root_set(DcfgEdgeId edge_id, uint64_t sequence_id, const char *channel,
                                      ProvRootSetId set_id) {
+    if (!tf_runtime_log_enabled(&g_runtime_diag, TF_LOG_ROOTS))
+        return;
     if (!g_prov_registry || !channel) {
         return;
     }
@@ -1023,6 +1039,9 @@ static DcfgEdgeKind dcfg_control_transfer_kind(const InsnMeta *meta) {
 }
 
 static void log_dcfg_transfer(const dcfg_pending_transfer_t *pending, DcfgEdgeId edge_id) {
+    if (!tf_runtime_log_enabled(&g_runtime_diag, TF_LOG_EVENTS))
+        return;
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_EVENT_LOG);
     if (!pending || !g_dcfg || edge_id == DCFG_EDGE_ID_INVALID) {
         return;
     }
@@ -1262,6 +1281,9 @@ static void log_dcfg_branch(const BranchEvent *event) {
 }
 
 static void log_branch_event(const BranchEvent *event) {
+    if (!tf_runtime_log_enabled(&g_runtime_diag, TF_LOG_EVENTS))
+        return;
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_EVENT_LOG);
     if (!event || !g_prov_registry) {
         return;
     }
@@ -1709,6 +1731,9 @@ static char *read_guest_string(uint64_t gaddr) {
 
 //dse helpers
 static void dse_init_reg_handles(void) {
+    g_regs_ready = false;
+    memset(g_reg_handle_valid, 0, sizeof(g_reg_handle_valid));
+    g_eflags_handle_valid = false;
     GArray *regs = qemu_plugin_get_registers();
     if (!regs) {
         fprintf(stderr, "[REG] failed to enumerate QEMU registers\n");
@@ -1723,6 +1748,7 @@ static void dse_init_reg_handles(void) {
         if (descriptor->name && (g_ascii_strcasecmp(descriptor->name, "eflags") == 0 ||
                                  g_ascii_strcasecmp(descriptor->name, "rflags") == 0)) {
             g_eflags_handle = descriptor->handle;
+            g_eflags_handle_valid = true;
             fprintf(stderr, "[REG] QEMU reg: %s\n", descriptor->name);
         }
         for (int reg = 0; reg < 8; reg++) {
@@ -1730,9 +1756,10 @@ static void dse_init_reg_handles(void) {
                 g_ascii_strcasecmp(descriptor->name, g_reg_name_i386[reg]) != 0) {
                 continue;
             }
-            if (!g_reg_handle[reg])
+            if (!g_reg_handle_valid[reg])
                 found++;
             g_reg_handle[reg] = descriptor->handle;
+            g_reg_handle_valid[reg] = true;
             fprintf(stderr, "[REG] QEMU reg: %s\n", descriptor->name);
         }
     }
@@ -1741,7 +1768,7 @@ static void dse_init_reg_handles(void) {
     if (!g_regs_ready) {
         fprintf(stderr, "[REG] incomplete i386 register set: found %d/8\n", found);
     }
-    if (!g_eflags_handle) {
+    if (!g_eflags_handle_valid) {
         fprintf(
             stderr,
             "[REG] eflags/rflags register is unavailable; path-sensitive DSE will remain incomplete\n");
@@ -1761,16 +1788,14 @@ static void dse_vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
 }
 
 static bool dse_read_reg(int rid, uint64_t *out) {
-    if (!out || rid < 0 || rid >= REG_COUNT || !g_regs_ready || !g_reg_handle[rid])
+    if (!out || rid < 0 || rid >= REG_COUNT || !g_regs_ready || !g_reg_handle_valid[rid])
         return false;
     static __thread GByteArray *buf = NULL;
     if (!buf)
         buf = g_byte_array_new();
-    g_byte_array_set_size(buf, 0);
-    int rc = qemu_plugin_read_register(g_reg_handle[rid], buf);
-    if (rc <= 0 || buf->len == 0) {
+    if (!tf_qemu_read_register_exact(g_reg_handle[rid], buf, 4)) {
         if (!g_reg_read_error_reported[rid]) {
-            fprintf(stderr, "[REG] read failed for %s: rc=%d len=%u\n", g_reg_name_i386[rid], rc,
+            fprintf(stderr, "[REG] incomplete or failed read for %s: len=%u\n", g_reg_name_i386[rid],
                     buf->len);
             g_reg_read_error_reported[rid] = true;
         }
@@ -1786,17 +1811,15 @@ static bool dse_read_reg(int rid, uint64_t *out) {
 }
 
 static bool dse_read_eflags(uint32_t *out) {
-    if (!out || !g_eflags_handle || !g_x86_flags_verified)
+    if (!out || !g_eflags_handle_valid || !g_x86_flags_verified)
         return false;
     static __thread GByteArray *buf = NULL;
     static bool error_reported = false;
     if (!buf)
         buf = g_byte_array_new();
-    g_byte_array_set_size(buf, 0);
-    int rc = qemu_plugin_read_register(g_eflags_handle, buf);
-    if (rc != 4 || buf->len != 4) {
+    if (!tf_qemu_read_register_exact(g_eflags_handle, buf, 4)) {
         if (!error_reported) {
-            fprintf(stderr, "[REG] read failed for eflags: rc=%d len=%u\n", rc, buf->len);
+            fprintf(stderr, "[REG] incomplete or failed read for eflags: len=%u\n", buf->len);
             error_reported = true;
         }
         return false;
@@ -2145,7 +2168,8 @@ static bool dse_mem_access_value_u64(qemu_plugin_meminfo_t info, uint32_t size,
     }
 }
 
-static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
+static void dse_on_mem_impl(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
+                            void *ud) {
     PluginVcpuState *vcpu_state = plugin_vcpu_state_get(vcpu);
     if (!vcpu_state)
         return;
@@ -2376,6 +2400,11 @@ static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t v
             }
         }
     }
+}
+
+static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_MEMORY);
+    dse_on_mem_impl(vcpu, info, vaddr, ud);
 }
 
 static bool is_valid_path(const char *s) {
@@ -2710,12 +2739,18 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
     }
 }
 
-static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr,
-                         void *userdata) {
+static void on_mem_write_impl(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr,
+                              void *userdata) {
     (void)vcpu_idx;
     (void)userdata;
     uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
     mark_written(vaddr, size);
+}
+
+static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr,
+                         void *userdata) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_CODE_WRITE);
+    on_mem_write_impl(vcpu_idx, info, vaddr, userdata);
 }
 
 static bool bin_dumped = false;
@@ -2899,193 +2934,65 @@ static oep_cand_t *choose_oep_cand(void) {
     return best;
 }
 
-//auxv PT_LOAD union, main logic
-static bool window_from_phdrs(uint64_t phdr_va, uint64_t ent, uint64_t num, uint64_t base_adjust) {
-    if (!phdr_va || !num || num > 512) {
+static bool elf_file_read(void *context, uint64_t offset, uint8_t *bytes, size_t size) {
+    FILE *file = context;
+    if (offset > INT64_MAX || fseeko(file, (off_t)offset, SEEK_SET) != 0)
         return false;
-    }
-    bool w64 = (guest_ptr_bytes() == 8);
-    uint64_t off_vaddr = w64 ? 16 : 8;
-    uint64_t off_memsz = w64 ? 40 : 20;
-    uint64_t min_ent = w64 ? 56 : 32;
-    uint32_t fld = w64 ? 8 : 4;
-    if (ent < min_ent) {
-        return false;
-    }
-
-    uint64_t lo = UINT64_MAX;
-    uint64_t hi = 0;
-    for (uint64_t i = 0; i < num; i++) {
-        if (i > (UINT64_MAX - phdr_va) / ent) {
-            return false;
-        }
-        uint64_t ph = phdr_va + i * ent;
-        uint64_t p_type = 0;
-        uint64_t p_vaddr = 0;
-        uint64_t p_memsz = 0;
-        if (!guest_read_uint(ph, 4, &p_type)) {
-            return false;
-        }
-        if (p_type != 1) { // PT_LOAD
-            continue;
-        }
-        if (ph > UINT64_MAX - off_memsz) {
-            return false;
-        }
-        if (!guest_read_uint(ph + off_vaddr, fld, &p_vaddr) ||
-            !guest_read_uint(ph + off_memsz, fld, &p_memsz)) {
-            return false;
-        }
-        if (p_memsz == 0) {
-            continue;
-        }
-        if (p_vaddr > UINT64_MAX - base_adjust) {
-            return false;
-        }
-        uint64_t start = p_vaddr + base_adjust;
-        if (!w64) {
-            const uint64_t guest_limit = 1ULL << 32;
-            if (start >= guest_limit) {
-                continue;
-            }
-            if (p_memsz > guest_limit - start) {
-                p_memsz = guest_limit - start;
-            }
-        }
-        if (p_memsz > UINT64_MAX - start) {
-            return false;
-        }
-        if (start < lo) {
-            lo = start;
-        }
-        if (start + p_memsz > hi) {
-            hi = start + p_memsz;
-        }
-    }
-    if (hi > lo) {
-        g_main_lo = lo;
-        g_main_hi = hi;
-        g_main_known = true;
-        return true;
-    }
-    return false;
+    return fread(bytes, 1, size, file) == size;
 }
 
-//init taint
-static bool seed_main_file_taint(uint64_t phdr_va, uint64_t ent, uint64_t num,
-                                 uint64_t base_adjust) {
+static bool elf_guest_read(void *context, uint64_t address, uint8_t *bytes, size_t size) {
+    (void)context;
+    return size <= UINT32_MAX && guest_read_bytes(address, bytes, (uint32_t)size);
+}
+
+static bool resolve_main_image(const TfElfAux *aux, TfElfImage *image) {
+    FILE *file = fopen(g_main_image_path, "rb");
+    if (!file) {
+        fprintf(stderr, "[ELF-IMAGE] UNKNOWN: cannot open main executable: %s\n", strerror(errno));
+        return false;
+    }
+    TfElfStatus status = TF_ELF_READ_FAILED;
+    if (fseeko(file, 0, SEEK_END) == 0) {
+        off_t size = ftello(file);
+        if (size >= 0)
+            status = tf_elf_image_resolve(elf_file_read, file, (uint64_t)size, elf_guest_read, NULL,
+                                          aux, MAX_INITIAL_TAINT_BYTES, image);
+    }
+    fclose(file);
+    if (status != TF_ELF_OK) {
+        fprintf(stderr, "[ELF-IMAGE] UNKNOWN: %s\n", tf_elf_status_name(status));
+        return false;
+    }
+    return true;
+}
+
+static bool seed_main_file_taint(const TfElfImage *image) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_SEED);
     if (g_initial_taint_seeded)
         return true;
-    if (!g_shadow || !g_prov_registry || !phdr_va || !num || num > 512) {
+    if (!g_shadow || !g_prov_registry || !main_image_resource_init())
         return false;
-    }
-    if (!main_image_resource_init()) {
-        fprintf(stderr, "[PROV] main image resource is unavailable\n");
-        return false;
-    }
-
-    bool w64 = guest_ptr_bytes() == 8;
-    uint64_t off_offset = w64 ? 8 : 4;
-    uint64_t off_vaddr = w64 ? 16 : 8;
-    uint64_t off_filesz = w64 ? 32 : 16;
-    uint64_t off_memsz = w64 ? 40 : 20;
-    uint64_t min_ent = w64 ? 56 : 32;
-    uint32_t field_size = w64 ? 8 : 4;
-
-    if (ent < min_ent)
-        return false;
-
-    typedef struct {
-        uint64_t runtime_address;
-        uint64_t size;
-        uint64_t file_offset;
-    } MainImageLoadRange;
-
-    MainImageLoadRange ranges[512];
-    uint32_t range_count = 0;
-    uint64_t total = 0;
-
-    for (uint64_t index = 0; index < num; index++) {
-        if (index > (UINT64_MAX - phdr_va) / ent) {
-            return false;
-        }
-        uint64_t phdr = phdr_va + index * ent;
-        uint64_t p_type = 0;
-        uint64_t p_offset = 0;
-        uint64_t p_vaddr = 0;
-        uint64_t p_filesz = 0;
-        uint64_t p_memsz = 0;
-        if (!guest_read_uint(phdr, 4, &p_type)) {
-            return false;
-        }
-        if (p_type != 1)
-            continue;
-        if (phdr > UINT64_MAX - off_memsz ||
-            !guest_read_uint(phdr + off_offset, field_size, &p_offset) ||
-            !guest_read_uint(phdr + off_vaddr, field_size, &p_vaddr) ||
-            !guest_read_uint(phdr + off_filesz, field_size, &p_filesz) ||
-            !guest_read_uint(phdr + off_memsz, field_size, &p_memsz)) {
-            return false;
-        }
-
-        if (p_filesz == 0 || p_memsz == 0) {
-            continue;
-        }
-        if (p_filesz > p_memsz) {
-            p_filesz = p_memsz;
-        }
-        if (p_vaddr > UINT64_MAX - base_adjust) {
-            return false;
-        }
-        uint64_t runtime_address = p_vaddr + base_adjust;
-        if (!w64) {
-            const uint64_t guest_limit = UINT64_C(1) << 32;
-            if (runtime_address >= guest_limit) {
-                continue;
-            }
-            if (p_filesz > (guest_limit - runtime_address)) {
-                p_filesz = guest_limit - runtime_address;
-            }
-        }
-        if (p_filesz == 0)
-            continue;
-        if (p_filesz - 1U > UINT64_MAX - p_offset) {
-            return false;
-        }
-
-        if (p_filesz > MAX_INITIAL_TAINT_BYTES - total) {
+    for (size_t i = 0; i < image->load_count; i++) {
+        const TfElfLoad *load = &image->loads[i];
+        if (!seed_resource_byte_labels(load->address, load->file_size, g_main_image_resource_id,
+                                       load->file_offset)) {
             fprintf(stderr,
-                    "[PROV] initial main-image seed "
-                    "exceeds limit 0x%" PRIx64 "\n",
-                    (uint64_t)MAX_INITIAL_TAINT_BYTES);
+                    "[PROV] failed to seed main PT_LOAD addr=0x%" PRIx64 " size=0x%" PRIx64
+                    " file_offset=0x%" PRIx64 "\n",
+                    load->address, load->file_size, load->file_offset);
             return false;
         }
-
-        ranges[range_count].runtime_address = runtime_address;
-        ranges[range_count].size = p_filesz;
-        ranges[range_count].file_offset = p_offset;
-        range_count++;
-        total += p_filesz;
-    }
-    if (range_count == 0 || total == 0) {
-        return false;
-    }
-    for (uint32_t index = 0; index < range_count; index++) {
-        if (!seed_resource_byte_labels(ranges[index].runtime_address, ranges[index].size,
-                                       g_main_image_resource_id, ranges[index].file_offset)) {
-            fprintf(stderr,
-                    "[PROV] failed to seed main PT_LOAD "
-                    "addr=0x%" PRIx64 " size=0x%" PRIx64 " file_offset=0x%" PRIx64 "\n",
-                    ranges[index].runtime_address, ranges[index].size, ranges[index].file_offset);
-            return false;
-        }
+        fprintf(stderr,
+                "[ELF-LOAD] addr=0x%" PRIx64 " memsz=0x%" PRIx64 " filesz=0x%" PRIx64
+                " offset=0x%" PRIx64 "\n",
+                load->address, load->memory_size, load->file_size, load->file_offset);
     }
     g_initial_taint_seeded = true;
-    g_taint_seen = true;
+    g_taint_seen = image->file_bytes != 0 || g_taint_seen;
     fprintf(stderr,
-            "[PROV] seeded %" PRIu64 " source-aware bytes from main ELF "
-            "resource=%u path=%s\n",
-            total, g_main_image_resource_id, g_main_image_path);
+            "[PROV] seeded %" PRIu64 " source-aware bytes from main ELF resource=%u path=%s\n",
+            image->file_bytes, g_main_image_resource_id, g_main_image_path);
     return true;
 }
 
@@ -3161,6 +3068,7 @@ static bool read_auxv_from_stack(void) {
     uint64_t at_entry = 0;
     uint64_t at_pagesz = 0;
     bool aux_end_found = false;
+    unsigned aux_seen = 0;
     uint64_t scan = p;
     for (int guard = 0; guard < 128; guard++) {
         uint64_t type = 0;
@@ -3181,6 +3089,18 @@ static bool read_auxv_from_stack(void) {
             aux_end_found = true;
             break;
         }
+        unsigned bit = type == AT_PHDR     ? 1U
+                       : type == AT_PHENT  ? 2U
+                       : type == AT_PHNUM  ? 4U
+                       : type == AT_ENTRY  ? 8U
+                       : type == AT_PAGESZ ? 16U
+                       : type == AT_BASE   ? 32U
+                                           : 0U;
+        if (aux_seen & bit) {
+            fprintf(stderr, "[AUXV] fail: duplicate addressing key=%" PRIu64 "\n", type);
+            return false;
+        }
+        aux_seen |= bit;
         switch (type) {
         case AT_PHDR:
             at_phdr = val;
@@ -3202,76 +3122,33 @@ static bool read_auxv_from_stack(void) {
             break;
         }
     }
-    if (!aux_end_found) {
-        fprintf(stderr, "[AUXV] fail: AT_NULL not found\n");
+    if (!aux_end_found || (aux_seen & 15U) != 15U) {
+        fprintf(stderr, "[AUXV] fail: missing AT_NULL or addressing keys\n");
         return false;
-    }
-    bool w64 = (guest_ptr_bytes() == 8);
-    uint64_t min_phent = w64 ? 56 : 32;
-
-    if (!at_phdr || !at_phnum || at_phnum > 512 || at_phent < min_phent) {
-        fprintf(stderr, "[AUXV] fail: invalid PHDR data (phdr=0x%lx phnum=%lu phent=%lu)\n",
-                (unsigned long)at_phdr, (unsigned long)at_phnum, (unsigned long)at_phent);
-        return false;
-    }
-    uint64_t off_vaddr = w64 ? 16 : 8;
-    uint32_t fld = w64 ? 8 : 4;
-    uint64_t ptphdr_vaddr = 0;
-    uint64_t min_load_vaddr = UINT64_MAX;
-    bool have_ptphdr = false;
-    for (uint64_t i = 0; i < at_phnum; i++) {
-        if (i > (UINT64_MAX - at_phdr) / at_phent) {
-            return false;
-        }
-        uint64_t ph = at_phdr + i * at_phent;
-        uint64_t p_type = 0;
-        uint64_t p_vaddr = 0;
-        if (!guest_read_uint(ph, 4, &p_type) || ph > UINT64_MAX - off_vaddr ||
-            !guest_read_uint(ph + off_vaddr, fld, &p_vaddr)) {
-            return false;
-        }
-        if (p_type == 6) { // PT_PHDR
-            if (p_vaddr <= at_phdr) {
-                ptphdr_vaddr = p_vaddr;
-                have_ptphdr = true;
-            }
-        } else if (p_type == 1) { // PT_LOAD
-            if (p_vaddr < min_load_vaddr) {
-                min_load_vaddr = p_vaddr;
-            }
-        }
     }
     uint64_t effective_page_size = at_pagesz ? at_pagesz : page_size;
-
-    if (effective_page_size == 0 || (effective_page_size & (effective_page_size - 1)) != 0) {
-        fprintf(stderr, "[AUXV] fail: invalid AT_PAGESZ=0x%lx\n",
-                (unsigned long)effective_page_size);
+    TfElfAux aux = {.phdr = at_phdr,
+                    .phent = at_phent,
+                    .phnum = at_phnum,
+                    .entry = at_entry,
+                    .page_size = effective_page_size,
+                    .pointer_bytes = pb,
+                    .big_endian = g_plugin_arch->big_endian};
+    TfElfImage image;
+    if (!resolve_main_image(&aux, &image))
         return false;
-    }
-    uint64_t bias = 0;
-    if (have_ptphdr) {
-        if (at_phdr < ptphdr_vaddr) {
-            return false;
-        }
-        bias = at_phdr - ptphdr_vaddr;
-    } else if (min_load_vaddr != UINT64_MAX) {
-        uint64_t page_mask = ~(effective_page_size - 1);
-        uint64_t runtime_page = at_phdr & page_mask;
-        uint64_t load_page = min_load_vaddr & page_mask;
-
-        if (runtime_page < load_page) {
-            return false;
-        }
-        bias = runtime_page - load_page;
-    } else {
-        fprintf(stderr, "[AUXV] fail: no PT_LOAD program header\n");
+    /* Publish validated addresses independently of label allocation. A failed
+     * seed invalidates shadow knowledge in the caller, but cannot shift the dump. */
+    g_main_lo = image.lo;
+    g_main_hi = image.hi;
+    g_main_known = true;
+    if (!seed_main_file_taint(&image))
         return false;
-    }
-    //seeding + window = success
-    if (!window_from_phdrs(at_phdr, at_phent, at_phnum, bias) ||
-        !seed_main_file_taint(at_phdr, at_phent, at_phnum, bias)) {
-        return false;
-    }
+    uint64_t bias = image.bias;
+    fprintf(stderr,
+            "[ELF-IMAGE] verified entry=0x%" PRIx64 " phdr=0x%" PRIx64 " bias=0x%" PRIx64
+            " loads=%zu\n",
+            image.entry, at_phdr, bias, image.load_count);
     if (at_pagesz && at_pagesz != page_size) {
         fprintf(stderr, "[AUXV] AT_PAGESZ=0x%lx differs from default page_size=0x%lx\n",
                 (unsigned long)at_pagesz, (unsigned long)page_size);
@@ -3285,101 +3162,25 @@ static bool read_auxv_from_stack(void) {
     return true;
 }
 
-//bases form ELF phdrs, fallback if no auxv read
-static bool window_from_elf_header(uint64_t base) {
-    if (!base)
-        return false;
-    uint8_t ident[16];
-    if (!guest_read_bytes(base, ident, 16))
-        return false;
-    if (!(ident[0] == 0x7f && ident[1] == 'E' && ident[2] == 'L' && ident[3] == 'F'))
-        return false;
-    bool w64 = (ident[4] == 2);
-    uint64_t e_type = 0, e_phoff = 0, e_phnum = 0, e_phentsize = 0;
-    uint64_t off_type = 16;
-    uint64_t off_phoff = w64 ? 32 : 28;
-    uint64_t off_phent = w64 ? 54 : 42;
-    uint64_t off_phnum = w64 ? 56 : 44;
-    if (!guest_read_uint(base + off_type, 2, &e_type))
-        return false;
-    if (!guest_read_uint(base + off_phoff, w64 ? 8 : 4, &e_phoff))
-        return false;
-    if (!guest_read_uint(base + off_phent, 2, &e_phentsize))
-        return false;
-    if (!guest_read_uint(base + off_phnum, 2, &e_phnum))
-        return false;
-    uint64_t bias = (e_type == 3) ? base : 0;
-    bool ok = window_from_phdrs(base + e_phoff, e_phentsize, e_phnum, bias);
-    if (ok)
-        fprintf(stderr, "[WINDOW] elf-header@0x%lx: main [0x%lx,0x%lx)\n", (unsigned long)base,
-                (unsigned long)g_main_lo, (unsigned long)g_main_hi);
-    return ok;
-}
-
-//get boundaries from contiguity, fallback if not both previous
-static void window_from_pagetable(GList *keys) {
-    const uint64_t GAP_MAX = 64 * page_size;
-    uint64_t lo = 0, hi = 0;
-    bool have = false;
-    for (GList *k = keys; k; k = k->next) {
-        uint64_t addr = (uint64_t)(uintptr_t)k->data;
-        if (addr_in_lib(addr) || addr == 0)
-            continue;
-        if (!have) {
-            lo = addr;
-            hi = addr + page_size;
-            have = true;
-            continue;
-        }
-        if (addr <= hi + GAP_MAX)
-            hi = addr + page_size;
-        else
-            break;
-    }
-    if (have) {
-        g_main_lo = lo;
-        g_main_hi = hi;
-        g_main_known = true;
-        fprintf(stderr, "[WINDOW] page-table heuristic: main [0x%lx,0x%lx)\n",
-                (unsigned long)g_main_lo, (unsigned long)g_main_hi);
-    }
-}
-
-//helper for determine which prefer
-static void establish_main_window_fallback(GList *keys) {
-    if (g_main_known)
-        return;
-    uint64_t base = 0;
-    for (GList *k = keys; k; k = k->next) {
-        uint64_t addr = (uint64_t)(uintptr_t)k->data;
-        if (!addr_in_lib(addr)) {
-            base = addr;
-            break;
-        }
-    }
-    if (window_from_elf_header(base))
-        return;
-    window_from_pagetable(keys);
-}
-
 //is page in boundaries
 static bool page_is_program(uint64_t addr, const page_t *p) {
     if (addr_in_lib(addr))
         return false;
     if (!g_main_known)
         return true;
-    if (addr >= g_main_lo && addr < g_main_hi)
+    if (addr < g_main_hi && (addr >= g_main_lo || g_main_lo - addr < page_size))
         return true;
     if (p && (p->exec_seen || p->exec_after_write || p->dyn_exec))
         return true;
     return false;
 }
 
-static void do_dump(uint64_t oep) {
+static void do_dump_impl(uint64_t oep) {
     GList *keys = g_hash_table_get_keys(pages);
     keys = g_list_sort(keys, compare_keys);
 
-    establish_main_window_fallback(keys);
+    if (!g_main_known)
+        fprintf(stderr, "[WINDOW] UNKNOWN: dump retains observed non-library pages\n");
 
     g_static_binary = (lib_deps == NULL);
 
@@ -3503,6 +3304,11 @@ static void do_dump(uint64_t oep) {
     g_list_free(keys);
     image_captured = true;
     fprintf(stderr, "[DUMP] unpacked.bin captured (oep=0x%lx)\n", (unsigned long)oep);
+}
+
+static void do_dump(uint64_t oep) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_DUMP);
+    do_dump_impl(oep);
 }
 
 static void write_report(void) {
@@ -3670,7 +3476,8 @@ static void build_oep_scoring(oep_cand_t *chosen) {
             "\"relevance_unknown\": %u, "
             "\"relevance_irrelevant\": %u, "
             "\"relevance_iterations\": %u, "
-            "\"generation\": %u}%s\n",
+            "\"generation\": %u, \"replay_checks\": %u, \"replay_failures\": %u, "
+            "\"replay_missing_bindings\": %u, \"first_replay_mismatch\": ",
             (unsigned long)candidate->addr, cand_score(candidate), cand_confidence(candidate),
             dse_verdict_name(candidate->dse.verdict), dse_evidence_name(candidate->dse.evidence),
             dse_verify_reason_name(candidate->dse.reason),
@@ -3687,7 +3494,10 @@ static void build_oep_scoring(oep_cand_t *chosen) {
             candidate->dse.relevance_events_considered, candidate->dse.relevance_events_relevant,
             candidate->dse.relevance_events_unknown, candidate->dse.relevance_events_irrelevant,
             candidate->dse.relevance_iterations, candidate->generation,
-            i + 1 < top_count ? "," : "");
+            candidate->dse.replay_checks, candidate->dse.replay_failures,
+            candidate->dse.replay_missing_bindings);
+        dse_replay_diagnostic_append_json(g_oep_scoring, &candidate->dse.first_replay_mismatch);
+        g_string_append_printf(g_oep_scoring, "}%s\n", (i + 1 < top_count) ? "," : "");
     }
 
     g_string_append(g_oep_scoring, "  ],\n");
@@ -3703,7 +3513,7 @@ static oep_cand_t *find_oep_cand(uint64_t addr) {
     return NULL;
 }
 
-static void archive_pending_trace_occurrences(void) {
+static void archive_pending_trace_occurrences_impl(void) {
     if (!g_trace || !g_aux || !g_vcpu_states_lock_initialized || !g_vcpu_states) {
         g_cur_aux = NULL;
         return;
@@ -3723,9 +3533,15 @@ static void archive_pending_trace_occurrences(void) {
     g_cur_aux = NULL;
 }
 
+static void archive_pending_trace_occurrences(void) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_ARCHIVE);
+    archive_pending_trace_occurrences_impl();
+}
+
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     (void)id;
     (void)udata;
+    TfRuntimeScope shutdown_scope = tf_runtime_scope_begin(&g_runtime_diag, TF_PHASE_SHUTDOWN);
     archive_pending_trace_occurrences();
     dta_shadow_report(g_shadow);
     if (g_ir_report) {
@@ -3850,6 +3666,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     }
     provenance_runtime_destroy();
     g_clear_pointer(&g_main_image_path, g_free);
+    tf_runtime_scope_end(&shutdown_scope);
+    if (g_runtime_diag.options.profile) {
+        fputs("[RUNTIME-PROFILE] ", stderr);
+        if (!tf_runtime_profile_json(stderr, &g_runtime_diag))
+            fprintf(stderr, "[RUNTIME] profile write failed\n");
+    }
 }
 
 static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
@@ -3873,7 +3695,7 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
     return false;
 }
 
-static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
+static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     const InsnExecCtx *exec_ctx = (const InsnExecCtx *)udata;
     if (!exec_ctx)
         return;
@@ -3886,10 +3708,13 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
     dta_mem_transfer_t *transfer = &vcpu_state->mem_transfer;
     uint64_t vaddr = exec_ctx->pc;
     const InsnMeta *meta = exec_ctx->meta;
-    finalize_missing_memory_flag_transfer(vcpu_state);
-    finalize_pending_branch(vcpu_state, vaddr);
-    finalize_pending_transfer(vcpu_state, vaddr);
-    dcfg_track_instruction(vcpu_state, vaddr, exec_ctx->size);
+    {
+        TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_CONTROL_FLOW);
+        finalize_missing_memory_flag_transfer(vcpu_state);
+        finalize_pending_branch(vcpu_state, vaddr);
+        finalize_pending_transfer(vcpu_state, vaddr);
+        dcfg_track_instruction(vcpu_state, vaddr, exec_ctx->size);
+    }
     uint64_t current_reg_vals[REG_COUNT] = {0};
     uint32_t current_reg_value_valid_mask = 0;
     uint32_t current_eflags = 0;
@@ -3898,6 +3723,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
     uint64_t previous_aux_seq_id = vcpu_state->current_aux_seq_id;
     bool need_dse_snapshot = previous_aux != NULL || (g_trace != NULL && g_aux != NULL);
     if (need_dse_snapshot) {
+        TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_REG_SNAPSHOT);
         current_reg_value_valid_mask = dse_read_register_snapshot(current_reg_vals);
         if (dse_read_eflags(&current_eflags)) {
             current_eflags_valid = true;
@@ -3905,6 +3731,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
     }
     if (previous_aux && previous_aux_seq_id != 0 && previous_aux->valid &&
         previous_aux->seq_id == previous_aux_seq_id) {
+        TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_ARCHIVE);
         dse_aux_finalize(previous_aux, vaddr, current_reg_vals, current_reg_value_valid_mask);
         (void)dse_aux_archive_occurrence(g_aux, g_trace, g_branch_events, previous_aux_seq_id);
     } else if (previous_aux || previous_aux_seq_id != 0) {
@@ -3941,20 +3768,28 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
         transfer->last_read_labels[byte] = PROV_LABEL_CLEAN;
     }
     g_icount++;
-    if (!g_auxv_done && g_icount >= g_auxv_next_retry) {
-        if (!g_regs_ready) {
+    if (tf_runtime_progress_due(&g_runtime_diag, g_icount)) {
+        uint64_t now = (uint64_t)g_get_monotonic_time();
+        fprintf(stderr,
+                "[RUNTIME-PROGRESS] instructions=%" PRIu64 " pc=0x%" PRIx64 " wall_us=%" PRIu64
+                " archive_records=%" PRIu64 " archive_bytes=%" PRIu64 "\n",
+                g_icount, vaddr, now >= g_runtime_diag.start_us ? now - g_runtime_diag.start_us : 0,
+                trace_occurrence_archive_count(g_trace), trace_occurrence_archive_bytes(g_trace));
+    }
+    if (!g_auxv_done) {
+        if (!g_regs_ready)
             dse_init_reg_handles();
-        }
-        g_auxv_attempts++;
-        g_auxv_done = read_auxv_from_stack();
-        if (!g_auxv_done) {
-            uint32_t shift = g_auxv_attempts < 16 ? g_auxv_attempts : 16;
-            uint64_t delay = 1ULL << shift;
-            g_auxv_next_retry = g_icount > UINT64_MAX - delay ? UINT64_MAX : g_icount + delay;
+        g_auxv_done = true;
+        if (!read_auxv_from_stack()) {
+            /* Retrying after guest execution could seed overwritten bytes as
+             * original file data. Keep this run incomplete instead. */
+            shadow_mark_incomplete(g_shadow);
+            fprintf(stderr, "[PROV] initial main-image seed UNKNOWN; no late reseeding\n");
         }
     }
     uint64_t current_trace_seq_id = 0;
     if (g_trace) {
+        TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_TRACE_CAPTURE);
         TraceEntry entry = {0};
         entry.vcpu_index = cpu_index;
         entry.pc = vaddr;
@@ -4061,6 +3896,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
         candidate->dse.alternative_query = DSE_SOLVER_NOT_RUN;
 
         if (prev_jump_matches) {
+            TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_DSE);
             DseRelevanceContext relevance_context = {
                 .registry = g_prov_registry, .dcfg = g_dcfg, .branch_events = g_branch_events};
             if (prev_target_reg >= 0 && prev_target_reg < REG_COUNT) {
@@ -4104,6 +3940,13 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
                 candidate->dse.expr_nodes_created, DSE_MAX_EXPR_NODES,
                 candidate->dse.z3_cache_nodes, DSE_MAX_Z3_CACHE_NODES,
                 candidate->dse.resource_limit_hit ? "yes" : "no");
+        if (candidate->dse.first_replay_mismatch.present) {
+            GString *diagnostic = g_string_new(NULL);
+            dse_replay_diagnostic_append_json(diagnostic, &candidate->dse.first_replay_mismatch);
+            fprintf(stderr, "[DSE-FIRST-MISMATCH] candidate=0x%lx trigger_seq=%" PRIu64 " %s\n",
+                    (unsigned long)candidate->addr, prev_jump_seq_id, diagnostic->str);
+            g_string_free(diagnostic, TRUE);
+        }
         oep_cands = g_list_append(oep_cands, candidate);
         g_layer_has_cand = true;
         g_last_cand_icount = g_icount;
@@ -4128,13 +3971,16 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
             do_dump(oep_addr);
         }
     }
-    if (meta->flags_write_mask != 0 && !meta->has_mem_read) {
-        (void)dta_apply_flag_transfer(&vcpu_state->dta, &transfer->pre_regs, meta, NULL, 0);
-        if (dta_flag_mask_is_tainted(&vcpu_state->dta, meta->flags_write_mask)) {
-            g_taint_seen = true;
+    {
+        TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_REGISTER_DTA);
+        if (meta->flags_write_mask != 0 && !meta->has_mem_read) {
+            (void)dta_apply_flag_transfer(&vcpu_state->dta, &transfer->pre_regs, meta, NULL, 0);
+            if (dta_flag_mask_is_tainted(&vcpu_state->dta, meta->flags_write_mask)) {
+                g_taint_seen = true;
+            }
         }
+        (void)dta_apply_reg_transfer(regs, meta);
     }
-    (void)dta_apply_reg_transfer(regs, meta);
     bool track_indirect = meta->is_indirect_branch && !oep_found;
     if (track_indirect) { //indirect check
         bool target_resolved = false;
@@ -4188,6 +4034,11 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
     }
     begin_pending_branch(vcpu_state, meta, current_trace_seq_id);
     begin_pending_transfer(vcpu_state, meta, current_trace_seq_id);
+}
+
+static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_INSTRUCTION);
+    vcpu_insn_exec_impl(cpu_index, udata);
 }
 
 //for network
@@ -4274,9 +4125,9 @@ static void apply_pending_fd_success(int64_t syscall_num, int64_t syscall_ret) {
     }
 }
 
-static void vcpu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1,
-                         uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
-                         uint64_t a7, uint64_t a8) {
+static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1,
+                              uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
+                              uint64_t a7, uint64_t a8) {
     (void)id;
     (void)vcpu_idx;
     (void)a7;
@@ -4660,7 +4511,14 @@ static void vcpu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
     }
 }
 
-static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+static void vcpu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1,
+                         uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
+                         uint64_t a7, uint64_t a8) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_SYSCALL);
+    vcpu_syscall_impl(id, vcpu_idx, num, a1, a2, a3, a4, a5, a6, a7, a8);
+}
+
+static void vcpu_tb_trans_impl(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
     (void)id;
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
     for (size_t i = 0; i < n_insns; i++) {
@@ -4701,7 +4559,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
     }
 }
 
-static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, int64_t ret) {
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_TRANSLATION);
+    vcpu_tb_trans_impl(id, tb);
+}
+
+static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num,
+                                  int64_t ret) {
     (void)id;
     (void)vcpu_idx;
     const bool syscall_failed = syscall_ret_is_error(ret);
@@ -4797,6 +4661,11 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
     }
 }
 
+static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, int64_t ret) {
+    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_SYSCALL_RETURN);
+    vcpu_syscall_ret_impl(id, vcpu_idx, num, ret);
+}
+
 static void plugin_install_cleanup(bool capstone_initialized, bool metadata_initialized) {
     dse_lift_attach(NULL, NULL, NULL);
     g_cur_aux = NULL;
@@ -4851,6 +4720,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
                                            char **argv) {
     bool capstone_initialized = false;
     bool metadata_initialized = false;
+    tf_runtime_diag_init(&g_runtime_diag);
+    if (!tf_runtime_diag_options(&g_runtime_diag, argc, argv, stderr))
+        return -1;
+    dse_set_verbose_diagnostics(tf_runtime_log_enabled(&g_runtime_diag, TF_LOG_EVENTS));
+    fprintf(stderr, "[RUNTIME] log=%s profile=%s progress=%" PRIu64 "\n",
+            tf_runtime_log_name(g_runtime_diag.options.log),
+            g_runtime_diag.options.profile ? "on" : "off",
+            g_runtime_diag.options.progress_interval);
     if (!info || !info->target_name) {
         fprintf(stderr, "[PLUGIN] missing target information\n");
         return -1;
@@ -4888,9 +4765,19 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         fprintf(stderr, "[IR] diagnostics require i386 linux-user and a serialized collector\n");
         goto fail;
     }
+    const char *flags_receipt = NULL;
+    if (!tf_qemu_flags_options(argc, argv, &flags_receipt, stderr))
+        goto fail;
+    if (flags_receipt && (!is_i386 || info->system_emulation ||
+                          !tf_qemu_flags_receipt_check(flags_receipt, "/proc/self/exe", stderr)))
+        goto fail;
     g_x86_flags_verified = is_i386 && !info->system_emulation &&
-                           qemu_plugin_taintforge_x86_flags_v1 &&
-                           qemu_plugin_taintforge_x86_flags_v1();
+                           (flags_receipt || (qemu_plugin_taintforge_x86_flags_v1 &&
+                                              qemu_plugin_taintforge_x86_flags_v1()));
+    if (flags_receipt)
+        fprintf(
+            stderr,
+            "[REG] EFLAGS verified by PUSHF boundary probe; running executable SHA-256 matched\n");
     if (is_i386) {
         fprintf(stderr, "[REG] x86 flag observation contract: %s\n",
                 g_x86_flags_verified ? "verified" : "unverified; EFLAGS unavailable to DSE/REP/IR");
@@ -4941,6 +4828,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         fprintf(stderr, "[PLUGIN] branch event buffer init failed\n");
         goto fail;
     }
+    size_t branch_index_bytes = branch_event_buffer_index_bytes(g_branch_events);
+    fprintf(stderr, "[BRANCH-INDEX] enabled=%s bytes=%zu\n", branch_index_bytes ? "yes" : "no",
+            branch_index_bytes);
     g_aux = dse_aux_create(g_trace_capacity);
     if (g_aux)
         (void)dse_aux_set_source_limit(g_aux, g_ir_enabled ? g_ir_source_history_bytes : 0);
@@ -4950,11 +4840,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     }
     dse_lift_attach(g_trace, g_aux, &dse_arch_x86);
 
-    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
-    qemu_plugin_register_vcpu_init_cb(id, dse_vcpu_init);
-    qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
-    qemu_plugin_register_vcpu_syscall_cb(id, vcpu_syscall);
-    qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
+    const TfQemuPluginCallbacks callbacks = {
+        .vcpu_init = dse_vcpu_init,
+        .translate = vcpu_tb_trans,
+        .syscall = vcpu_syscall,
+        .syscall_ret = vcpu_syscall_ret,
+        .finish = plugin_exit,
+    };
+    tf_qemu_register_callbacks(id, &callbacks);
 
     return 0;
 

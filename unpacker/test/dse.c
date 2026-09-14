@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -18,6 +19,75 @@
 #define DSE_PATH_MODEL_IMPLEMENTED 1
 #define DSE_MAX_REPLAY_DEPTH 4096U
 #define DSE_MAX_REPLAY_EVAL_NODES DSE_MAX_EXPR_NODES
+
+static bool g_dse_verbose_diagnostics = true;
+#define DSE_DIAGNOSTIC(...)                                                                        \
+    do {                                                                                           \
+        if (g_dse_verbose_diagnostics)                                                             \
+            fprintf(__VA_ARGS__);                                                                  \
+    } while (0)
+
+void dse_set_verbose_diagnostics(bool enabled) {
+    g_dse_verbose_diagnostics = enabled;
+}
+
+static void dse_diagnostic_origin(DSECtx *ctx, const TraceEntry *entry) {
+    if (!ctx)
+        return;
+    ctx->replay_origin_valid =
+        entry && entry->seq_id && entry->size && entry->size <= MAX_INSN_BYTES;
+    if (ctx->replay_origin_valid)
+        ctx->replay_origin = *entry;
+    else
+        memset(&ctx->replay_origin, 0, sizeof(ctx->replay_origin));
+}
+
+static void dse_capture_replay_mismatch(DSECtx *ctx, DseReplaySite site, uint64_t location,
+                                        uint32_t byte_index, const SymExpr *expr, uint64_t expected,
+                                        uint64_t actual, bool root_rebind) {
+    if (!ctx || ctx->first_replay_mismatch.present || !expr)
+        return;
+    ctx->first_replay_mismatch =
+        (DseReplayDiagnostic){.present = true,
+                              .root_rebind = root_rebind,
+                              .origin_valid = ctx->replay_origin_valid,
+                              .origin = ctx->replay_origin,
+                              .site = site,
+                              .location = location,
+                              .byte_index = byte_index,
+                              .variable_id = expr->type == SYM_VAR ? expr->var.id : 0,
+                              .width = expr->width,
+                              .expected = expected,
+                              .actual = actual};
+}
+
+void dse_replay_diagnostic_append_json(GString *out, const DseReplayDiagnostic *d) {
+    if (!out)
+        return;
+    if (!d || !d->present) {
+        g_string_append(out, "null");
+        return;
+    }
+    static const char *const sites[] = {"root",     "address_read", "address_write", "branch",
+                                        "register", "memory_read",  "memory_write",  "target"};
+    const char *site = (unsigned)d->site < G_N_ELEMENTS(sites) ? sites[d->site] : "unknown";
+    g_string_append_printf(out,
+                           "{\"kind\":\"%s\",\"site\":\"%s\",\"origin_valid\":%s,"
+                           "\"seq\":%" PRIu64 ",\"pc\":%" PRIu64 ",\"vcpu\":%u,"
+                           "\"generation\":%u,\"descriptor\":%" PRIu64 ",\"location\":%" PRIu64
+                           ",\"byte_index\":%u,\"variable_id\":%u,\"width\":%u,"
+                           "\"expected\":%" PRIu64 ",\"actual\":%" PRIu64 ",\"bytes\":\"",
+                           d->root_rebind ? "root_rebind" : "value_mismatch", site,
+                           d->origin_valid ? "true" : "false", d->origin.seq_id, d->origin.pc,
+                           d->origin.vcpu_index, d->origin.code_generation, d->origin.insn_desc_id,
+                           d->location, d->byte_index, d->variable_id, d->width, d->expected,
+                           d->actual);
+    if (d->origin_valid) {
+        for (unsigned i = 0; i < d->origin.size && i < MAX_INSN_BYTES; ++i)
+            g_string_append_printf(out, "%02x", d->origin.instr_bytes[i]);
+    }
+    g_string_append(out, "\"}");
+}
 
 static _Thread_local DSECtx *g_active_expr_ctx = NULL;
 
@@ -1190,11 +1260,13 @@ static DseReplayEvalStatus dse_bind_observed_var(DSECtx *ctx, const SymExpr *var
             return DSE_REPLAY_EVAL_INVALID_EXPR;
         }
         if (existing->value != observed_value) {
+            dse_capture_replay_mismatch(ctx, DSE_REPLAY_SITE_ROOT, var->var.src_addr, 0, var,
+                                        observed_value, existing->value, true);
             if (!ctx->replay_mismatch) {
-                fprintf(stderr,
-                        "[DSE-ROOT-REBIND] var=%u source=0x%lx width=%u old=0x%lx new=0x%lx\n",
-                        var->var.id, (unsigned long)var->var.src_addr, (unsigned int)var->width,
-                        (unsigned long)existing->value, (unsigned long)observed_value);
+                DSE_DIAGNOSTIC(
+                    stderr, "[DSE-ROOT-REBIND] var=%u source=0x%lx width=%u old=0x%lx new=0x%lx\n",
+                    var->var.id, (unsigned long)var->var.src_addr, (unsigned int)var->width,
+                    (unsigned long)existing->value, (unsigned long)observed_value);
             }
             dse_record_replay_mismatch(ctx);
             return DSE_REPLAY_EVAL_INVALID_EXPR;
@@ -1535,7 +1607,8 @@ static void dse_mark_address_failure(DSECtx *ctx) {
 }
 
 static DseReplayCheckStatus dse_replay_expect(DSECtx *ctx, const SymExpr *expr,
-                                              uint64_t expected_value) {
+                                              uint64_t expected_value, DseReplaySite site,
+                                              uint64_t location, uint32_t byte_index) {
     if (!ctx || !expr || expr->width == 0 || expr->width > 64) {
         if (ctx)
             dse_record_replay_missing(ctx);
@@ -1559,6 +1632,8 @@ static DseReplayCheckStatus dse_replay_expect(DSECtx *ctx, const SymExpr *expr,
     replayed_value = mask_w(replayed_value, expr->width);
     expected_value = mask_w(expected_value, expr->width);
     if (replayed_value != expected_value) {
+        dse_capture_replay_mismatch(ctx, site, location, byte_index, expr, expected_value,
+                                    replayed_value, false);
         dse_record_replay_mismatch(ctx);
         return DSE_REPLAY_CHECK_MISMATCH;
     }
@@ -1797,7 +1872,10 @@ bool dse_constrain_observed_address(DSECtx *ctx, SymExpr *address, uint64_t obse
         return false;
     }
     observed_address = mask_w(observed_address, address->width);
-    DseReplayCheckStatus replay_status = dse_replay_expect(ctx, address, observed_address);
+    DseReplayCheckStatus replay_status = dse_replay_expect(
+        ctx, address, observed_address,
+        access == DSE_ADDRESS_READ ? DSE_REPLAY_SITE_ADDRESS_READ : DSE_REPLAY_SITE_ADDRESS_WRITE,
+        observed_address, 0);
     if (replay_status != DSE_REPLAY_CHECK_OK) {
         sym_expr_free(address);
         dse_mark_address_failure(ctx);
@@ -1876,7 +1954,8 @@ bool dse_path_assert(DSECtx *ctx, SymExpr *cond, bool expected) {
         sym_expr_free(cond);
         return false;
     }
-    DseReplayCheckStatus replay_status = dse_replay_expect(ctx, cond, expected ? 1U : 0U);
+    DseReplayCheckStatus replay_status =
+        dse_replay_expect(ctx, cond, expected ? 1U : 0U, DSE_REPLAY_SITE_BRANCH, 0, 0);
     if (replay_status != DSE_REPLAY_CHECK_OK) {
         ctx->path_model_complete = false;
         if (ctx->path_failures != UINT32_MAX) {
@@ -2173,17 +2252,19 @@ static bool dse_lift_observed_insn(DSECtx *ctx, const TraceEntry *entry, const I
     bool address_check_failed = ctx->address_failures != address_failures_before;
     bool replay_check_failed = ctx->replay_failures != replay_failures_before;
     if (address_check_failed || replay_check_failed) {
-        fprintf(stderr, "[DSE-LIFT-CHECK-FAILED] pc=0x%lx replay=%s address=%s insn=\"%s %s\"\n",
-                (unsigned long)entry->pc, replay_check_failed ? "yes" : "no",
-                address_check_failed ? "yes" : "no", insn->mnemonic, insn->op_str);
+        DSE_DIAGNOSTIC(stderr,
+                       "[DSE-LIFT-CHECK-FAILED] pc=0x%lx replay=%s address=%s insn=\"%s %s\"\n",
+                       (unsigned long)entry->pc, replay_check_failed ? "yes" : "no",
+                       address_check_failed ? "yes" : "no", insn->mnemonic, insn->op_str);
         dse_invalidate_lift_outputs(ctx, meta, aux);
         g_concretized++;
         cs_free(insn, count);
         return false;
     }
     if (!ok) {
-        fprintf(stderr, "[DSE-UNSUPPORTED] pc=0x%lx id=%u insn=\"%s %s\"\n",
-                (unsigned long)entry->pc, (unsigned int)insn->id, insn->mnemonic, insn->op_str);
+        DSE_DIAGNOSTIC(stderr, "[DSE-UNSUPPORTED] pc=0x%lx id=%u insn=\"%s %s\"\n",
+                       (unsigned long)entry->pc, (unsigned int)insn->id, insn->mnemonic,
+                       insn->op_str);
         dse_invalidate_lift_outputs(ctx, meta, aux);
         g_unsupported++;
         g_concretized++;
@@ -2199,9 +2280,10 @@ static bool dse_lift_observed_insn(DSECtx *ctx, const TraceEntry *entry, const I
                               (tainted_write_address && modeled_writes < required_writes);
     if (address_incomplete) {
         dse_mark_address_failure(ctx);
-        fprintf(stderr, "[DSE-ADDR-UNMODELED] pc=0x%lx read=%u/%u write=%u/%u insn=\"%s %s\"\n",
-                (unsigned long)entry->pc, modeled_reads, required_reads, modeled_writes,
-                required_writes, insn->mnemonic, insn->op_str);
+        DSE_DIAGNOSTIC(stderr,
+                       "[DSE-ADDR-UNMODELED] pc=0x%lx read=%u/%u write=%u/%u insn=\"%s %s\"\n",
+                       (unsigned long)entry->pc, modeled_reads, required_reads, modeled_writes,
+                       required_writes, insn->mnemonic, insn->op_str);
         dse_invalidate_lift_outputs(ctx, meta, aux);
         g_concretized++;
         cs_free(insn, count);
@@ -2214,7 +2296,10 @@ static bool dse_lift_observed_insn(DSECtx *ctx, const TraceEntry *entry, const I
 bool dse_lift_insn(DSECtx *ctx, const TraceEntry *entry, const InsnMeta *meta, csh cs_handle) {
     const InsnAux *aux = dse_aux_for(g_ring, g_tb, entry);
     const InsnDesc *desc = entry ? trace_insn_desc_get(g_tb, entry->insn_desc_id) : NULL;
-    return dse_lift_observed_insn(ctx, entry, meta, aux, desc, cs_handle);
+    dse_diagnostic_origin(ctx, entry);
+    bool ok = dse_lift_observed_insn(ctx, entry, meta, aux, desc, cs_handle);
+    dse_diagnostic_origin(ctx, NULL);
+    return ok;
 }
 
 bool dse_lift_replay_step(DSECtx *ctx, const ReplayInput *input, uint32_t index, csh cs_handle) {
@@ -2230,8 +2315,11 @@ bool dse_lift_replay_step(DSECtx *ctx, const ReplayInput *input, uint32_t index,
         dse_record_replay_missing(ctx);
         return false;
     }
-    return dse_lift_observed_insn(ctx, &step->entry, meta, aux,
-                                  step->descriptor_valid ? &step->descriptor : NULL, cs_handle);
+    dse_diagnostic_origin(ctx, &step->entry);
+    bool ok = dse_lift_observed_insn(ctx, &step->entry, meta, aux,
+                                     step->descriptor_valid ? &step->descriptor : NULL, cs_handle);
+    dse_diagnostic_origin(ctx, NULL);
+    return ok;
 }
 
 void dse_lift_attach(const TraceBuffer *tb, const DseAuxRing *ring, const struct DseArch *arch) {
@@ -2268,6 +2356,8 @@ void dse_lift_begin(DSECtx *ctx) {
         ctx->resource_limit_hit = false;
         ctx->replay_model_complete = ctx->observed_values != NULL;
         ctx->replay_mismatch = false;
+        memset(&ctx->first_replay_mismatch, 0, sizeof(ctx->first_replay_mismatch));
+        dse_diagnostic_origin(ctx, NULL);
         ctx->replay_checks = 0;
         ctx->replay_failures = 0;
         ctx->replay_missing_bindings = 0;
@@ -2577,16 +2667,13 @@ static void dse_collect_register_byte_alias(DSECtx *ctx, const InsnAux *aux, int
         }
     }
     uint64_t source_id = REG_VAR_BASE | ((uint64_t)(uint32_t)rid << 8U) | (uint64_t)byte_index;
-    uint64_t root_epoch = ctx->register_root_epoch[rid];
-    if (root_epoch == 0)
-        root_epoch = 1;
-    SymExpr *fallback = dse_new_observed_epoch_var(ctx, source_id, root_epoch, root_epoch,
-                                                   aux->seq_id, (uint16_t)byte_index, 8,
-                                                   DSE_VAR_REGISTER_ROOT, observed_byte, NULL);
-    if (fallback) {
-        (void)dse_expr_collect_root_lineage(ctx, fallback, out);
-        sym_expr_free(fallback);
-    }
+    /* A sparse slice can omit pointer updates. Without matching modeled data,
+     * this is only the identity of an address observation, not a register root
+     * binding or evidence of independence from any other input. */
+    uint64_t lineage_id = 0;
+    if (dse_root_origin_lineage_id(ctx, DSE_VAR_ADDRESS_ROOT, source_id, aux->seq_id, 8,
+                                   (uint16_t)byte_index, &lineage_id))
+        dse_root_set_add(out, lineage_id);
     out->complete = false;
 }
 
@@ -2692,10 +2779,11 @@ static SymExpr *dse_normalize_reg_value(DSECtx *ctx, const InsnAux *aux, int rid
     }
     SymExpr *current = ctx->state.reg[rid];
     if (current && current->width != natural_width) {
-        fprintf(stderr,
-                "[DSE-REG-WIDTH-FAIL] pc=0x%lx seq=%lu rid=%d state_width=%u expected_width=%u\n",
-                (unsigned long)aux->pc, (unsigned long)aux->seq_id, rid,
-                (unsigned int)current->width, (unsigned int)natural_width);
+        DSE_DIAGNOSTIC(
+            stderr,
+            "[DSE-REG-WIDTH-FAIL] pc=0x%lx seq=%lu rid=%d state_width=%u expected_width=%u\n",
+            (unsigned long)aux->pc, (unsigned long)aux->seq_id, rid, (unsigned int)current->width,
+            (unsigned int)natural_width);
         ctx->register_model_complete = false;
         dse_record_replay_missing(ctx);
         sym_state_set_reg(&ctx->state, (RegId)rid, NULL);
@@ -2730,12 +2818,13 @@ static SymExpr *dse_normalize_reg_value(DSECtx *ctx, const InsnAux *aux, int rid
                 sym_expr_free(normalized);
                 return NULL;
             }
-            DseReplayCheckStatus replay_status = dse_replay_expect(ctx, byte, observed_byte);
+            DseReplayCheckStatus replay_status = dse_replay_expect(
+                ctx, byte, observed_byte, DSE_REPLAY_SITE_REGISTER, (uint64_t)rid, byte_index);
             if (replay_status != DSE_REPLAY_CHECK_OK) {
                 uint64_t replayed_value = 0;
                 DseReplayEvalStatus eval_status =
                     dse_eval_expr_observed(ctx, byte, &replayed_value);
-                fprintf(
+                DSE_DIAGNOSTIC(
                     stderr,
                     "[DSE-REG-REPLAY-FAIL] pc=0x%lx seq=%lu rid=%d byte=%u tainted=yes expected=0x%02x replayed=0x%02lx eval_status=%u check_status=%u\n",
                     (unsigned long)aux->pc, (unsigned long)aux->seq_id, rid,
@@ -2957,8 +3046,10 @@ static bool dse_audit_exact_string_write(const InsnAux *aux, uint64_t address, u
 
 static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_writer_seq,
                                          uint64_t read_seq) {
+    if (!g_dse_verbose_diagnostics)
+        return;
     if (!g_tb || !g_ring || read_seq == 0 || symbolic_writer_seq >= read_seq) {
-        fprintf(
+        DSE_DIAGNOSTIC(
             stderr,
             "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=unavailable\n",
             (unsigned long)address, (unsigned long)read_seq, (unsigned long)symbolic_writer_seq);
@@ -2976,7 +3067,7 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
         const InsnAux *aux = dse_aux_for(g_ring, g_tb, entry);
         if (!aux || !aux->execution_complete) {
             if (meta && meta->has_mem_write) {
-                fprintf(
+                DSE_DIAGNOSTIC(
                     stderr,
                     "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=aux-unavailable candidate_pc=0x%lx candidate_seq=%lu\n",
                     (unsigned long)address, (unsigned long)read_seq,
@@ -2994,7 +3085,7 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
             uint8_t byte = 0;
             uint8_t value = 0;
             if (dse_audit_exact_string_write(aux, address, &event, &byte, &value)) {
-                fprintf(
+                DSE_DIAGNOSTIC(
                     stderr,
                     "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=later-writer writer_pc=0x%lx writer_seq=%lu kind=exact-string event=%u byte=%u value=0x%02x\n",
                     (unsigned long)address, (unsigned long)read_seq,
@@ -3011,7 +3102,7 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
         if (!range_may_overlap)
             continue;
         if (aux->mem_write_overflow) {
-            fprintf(
+            DSE_DIAGNOSTIC(
                 stderr,
                 "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=overflow-unresolved writer_pc=0x%lx writer_seq=%lu\n",
                 (unsigned long)address, (unsigned long)read_seq, (unsigned long)symbolic_writer_seq,
@@ -3025,7 +3116,7 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
             }
             uint32_t offset = (uint32_t)(address - write->addr);
             if (!write->value_valid) {
-                fprintf(
+                DSE_DIAGNOSTIC(
                     stderr,
                     "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=later-writer-value-unavailable writer_pc=0x%lx writer_seq=%lu access_addr=0x%lx size=%u\n",
                     (unsigned long)address, (unsigned long)read_seq,
@@ -3037,7 +3128,7 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
             uint32_t source_byte =
                 g_arch && g_arch->big_endian ? (uint32_t)write->size - 1U - offset : offset;
             uint8_t value = (uint8_t)((write->value >> (8U * source_byte)) & UINT64_C(0xff));
-            fprintf(
+            DSE_DIAGNOSTIC(
                 stderr,
                 "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=later-writer writer_pc=0x%lx writer_seq=%lu kind=ordinary access_addr=0x%lx size=%u byte=%u value=0x%02x\n",
                 (unsigned long)address, (unsigned long)read_seq, (unsigned long)symbolic_writer_seq,
@@ -3046,7 +3137,7 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
             return;
         }
     }
-    fprintf(
+    DSE_DIAGNOSTIC(
         stderr,
         "[DSE-LAST-WRITER-AUDIT] addr=0x%lx read_seq=%lu symbolic_writer_seq=%lu status=no-later-tracked-writer\n",
         (unsigned long)address, (unsigned long)read_seq, (unsigned long)symbolic_writer_seq);
@@ -3072,12 +3163,13 @@ bool dse_load_tracked_byte_at(DSECtx *ctx, uint64_t address, uint64_t epoch, uin
             SymExpr *value = sym_expr_clone(cell->expr);
             if (!value)
                 return false;
-            DseReplayCheckStatus replay_status = dse_replay_expect(ctx, value, observed_value);
+            DseReplayCheckStatus replay_status = dse_replay_expect(
+                ctx, value, observed_value, DSE_REPLAY_SITE_MEMORY_READ, address, 0);
             if (replay_status != DSE_REPLAY_CHECK_OK) {
                 uint64_t replayed_value = 0;
                 DseReplayEvalStatus eval_status =
                     dse_eval_expr_observed(ctx, value, &replayed_value);
-                fprintf(
+                DSE_DIAGNOSTIC(
                     stderr,
                     "[DSE-MEM-REPLAY-FAIL] addr=0x%lx read_seq=%lu writer_pc=0x%lx writer_seq=%lu tainted=yes expected=0x%02x replayed=0x%02lx eval_status=%u check_status=%u\n",
                     (unsigned long)address, (unsigned long)epoch, (unsigned long)cell->writer_pc,
@@ -3111,12 +3203,13 @@ bool dse_store_tracked_byte_at(DSECtx *ctx, uint64_t address, SymExpr *symbolic_
         ctx->memory_model_complete = false;
         return false;
     }
-    DseReplayCheckStatus replay_status = dse_replay_expect(ctx, symbolic_value, observed_value);
+    DseReplayCheckStatus replay_status = dse_replay_expect(
+        ctx, symbolic_value, observed_value, DSE_REPLAY_SITE_MEMORY_WRITE, address, 0);
     if (replay_status != DSE_REPLAY_CHECK_OK) {
         uint64_t replayed_value = 0;
         DseReplayEvalStatus eval_status =
             dse_eval_expr_observed(ctx, symbolic_value, &replayed_value);
-        fprintf(
+        DSE_DIAGNOSTIC(
             stderr,
             "[DSE-MEM-WRITE-REPLAY-FAIL] pc=0x%lx seq=%lu addr=0x%lx expected=0x%02x replayed=0x%02lx eval_status=%u check_status=%u\n",
             (unsigned long)(writer_aux ? writer_aux->pc : 0),
@@ -3215,7 +3308,7 @@ bool dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val, bool big_endia
     const DseMemWrite *write = &aux->mem_writes[0];
     if (!write->value_valid || write->addr != aux->mem_write_addr || write->size != nbytes ||
         aux->mem_write_size != nbytes) {
-        fprintf(
+        DSE_DIAGNOSTIC(
             stderr,
             "[DSE-MEM-WRITE-META-FAIL] pc=0x%lx seq=%lu value_valid=%s recorded_addr=0x%lx primary_addr=0x%lx recorded_size=%u expected_size=%u\n",
             (unsigned long)aux->pc, (unsigned long)aux->seq_id, write->value_valid ? "yes" : "no",
@@ -3383,6 +3476,10 @@ static void dse_capture_verify_metrics(DseVerifyResult *result, const DSECtx *ct
     result->unsupported = dse_lift_unsupported_count();
     result->meta_missing = meta_missing;
     if (ctx) {
+        result->first_replay_mismatch = ctx->first_replay_mismatch;
+        result->replay_checks = ctx->replay_checks;
+        result->replay_failures = ctx->replay_failures;
+        result->replay_missing_bindings = ctx->replay_missing_bindings;
         result->address_constraints = ctx->address_constraints;
         result->address_failures = ctx->address_failures;
         result->path_constraints = ctx->path_constraints;
@@ -3493,7 +3590,8 @@ static bool dse_replay_target(DSECtx *ctx, const SymExpr *target, uint64_t oep_c
         return false;
     }
     result->target_symbolic = dse_expr_has_var(target);
-    DseReplayCheckStatus status = dse_replay_expect(ctx, target, oep_candidate);
+    DseReplayCheckStatus status =
+        dse_replay_expect(ctx, target, oep_candidate, DSE_REPLAY_SITE_TARGET, oep_candidate, 0);
     result->replay_valid =
         status == DSE_REPLAY_CHECK_OK && ctx->replay_model_complete && !ctx->replay_mismatch;
     if (!result->replay_valid) {
@@ -4241,49 +4339,51 @@ static uint8_t dse_mem_need_mask_for_range(const GHashTable *needed_memory, uint
 static void dse_log_mem_access_failure(const char *where, const TraceEntry *entry,
                                        const InsnAux *aux, uint8_t needed_memory,
                                        bool memory_relevant) {
+    if (!g_dse_verbose_diagnostics)
+        return;
     const InsnMeta *meta = entry ? meta_lookup_id(entry->meta_id) : NULL;
 
-    fprintf(stderr,
-            "[DSE-SLICE-MEM] "
-            "where=%s pc=0x%lx seq=%lu insn_id=%u "
-            "reads=%u/%u read_overflow=%s "
-            "writes=%u/%u write_overflow=%s "
-            "needed=0x%02x relevant=%s complete=%s "
-            "write_range_valid=%s "
-            "write_range_unknown=%s "
-            "write_range=[0x%lx,0x%lx] ",
-            where ? where : "unknown", (unsigned long)(entry ? entry->pc : 0),
-            (unsigned long)(entry ? entry->seq_id : 0), (unsigned int)(meta ? meta->insn_id : 0),
-            aux ? aux->mem_read_count : 0, aux ? aux->mem_read_total : 0,
-            aux && aux->mem_read_overflow ? "yes" : "no", aux ? aux->mem_write_count : 0,
-            aux ? aux->mem_write_total : 0, aux && aux->mem_write_overflow ? "yes" : "no",
-            (unsigned int)needed_memory, memory_relevant ? "yes" : "no",
-            aux && aux->execution_complete ? "yes" : "no",
-            aux && aux->mem_write_range_valid ? "yes" : "no",
-            aux && aux->mem_write_range_unknown ? "yes" : "no",
-            (unsigned long)(aux ? aux->mem_write_min_addr : 0),
-            (unsigned long)(aux ? aux->mem_write_max_addr : 0));
+    DSE_DIAGNOSTIC(stderr,
+                   "[DSE-SLICE-MEM] "
+                   "where=%s pc=0x%lx seq=%lu insn_id=%u "
+                   "reads=%u/%u read_overflow=%s "
+                   "writes=%u/%u write_overflow=%s "
+                   "needed=0x%02x relevant=%s complete=%s "
+                   "write_range_valid=%s "
+                   "write_range_unknown=%s "
+                   "write_range=[0x%lx,0x%lx] ",
+                   where ? where : "unknown", (unsigned long)(entry ? entry->pc : 0),
+                   (unsigned long)(entry ? entry->seq_id : 0),
+                   (unsigned int)(meta ? meta->insn_id : 0), aux ? aux->mem_read_count : 0,
+                   aux ? aux->mem_read_total : 0, aux && aux->mem_read_overflow ? "yes" : "no",
+                   aux ? aux->mem_write_count : 0, aux ? aux->mem_write_total : 0,
+                   aux && aux->mem_write_overflow ? "yes" : "no", (unsigned int)needed_memory,
+                   memory_relevant ? "yes" : "no", aux && aux->execution_complete ? "yes" : "no",
+                   aux && aux->mem_write_range_valid ? "yes" : "no",
+                   aux && aux->mem_write_range_unknown ? "yes" : "no",
+                   (unsigned long)(aux ? aux->mem_write_min_addr : 0),
+                   (unsigned long)(aux ? aux->mem_write_max_addr : 0));
 
     if (aux && aux->string_summary.active) {
         const DseStringSummary *summary = &aux->string_summary;
 
-        fprintf(stderr,
-                "string={kind=%u exact=%s "
-                "overflow=%s mismatch=%s "
-                "elem=%u dir=%d expected=%u "
-                "reads=%u writes=%u bytes=%u} ",
-                (unsigned int)summary->kind, summary->exact ? "yes" : "no",
-                summary->overflow ? "yes" : "no", summary->pattern_mismatch ? "yes" : "no",
-                (unsigned int)summary->element_size, (int)summary->direction,
-                summary->expected_iterations, summary->read_events, summary->write_events,
-                summary->bytes_captured);
+        DSE_DIAGNOSTIC(stderr,
+                       "string={kind=%u exact=%s "
+                       "overflow=%s mismatch=%s "
+                       "elem=%u dir=%d expected=%u "
+                       "reads=%u writes=%u bytes=%u} ",
+                       (unsigned int)summary->kind, summary->exact ? "yes" : "no",
+                       summary->overflow ? "yes" : "no", summary->pattern_mismatch ? "yes" : "no",
+                       (unsigned int)summary->element_size, (int)summary->direction,
+                       summary->expected_iterations, summary->read_events, summary->write_events,
+                       summary->bytes_captured);
     }
 
-    fprintf(stderr, "bytes=");
+    DSE_DIAGNOSTIC(stderr, "bytes=");
 
     if (entry) {
         for (uint8_t i = 0; i < entry->size && i < MAX_INSN_BYTES; i++) {
-            fprintf(stderr, "%02x", entry->instr_bytes[i]);
+            DSE_DIAGNOSTIC(stderr, "%02x", entry->instr_bytes[i]);
         }
     }
     fputc('\n', stderr);
@@ -4296,8 +4396,10 @@ static void dse_log_mem_slice_truncation(const TraceEntry *entry, uint64_t targe
                                          uint32_t memory_dependencies,
                                          bool current_register_relevant,
                                          bool current_memory_relevant) {
+    if (!g_dse_verbose_diagnostics)
+        return;
     const InsnMeta *meta = entry ? meta_lookup_id(entry->meta_id) : NULL;
-    fprintf(
+    DSE_DIAGNOSTIC(
         stderr,
         "[DSE-SLICE-TRUNC] kind=mem pc=0x%lx seq=%lu insn_id=%u slice=%u scanned=%u reg_deps=%u mem_deps=%u current_reg=%s current_mem=%s target=0x%lx/%u needed_mem=0x%02x needed_regs=",
         (unsigned long)(entry ? entry->pc : 0), (unsigned long)(entry ? entry->seq_id : 0),
@@ -4310,17 +4412,17 @@ static void dse_log_mem_slice_truncation(const TraceEntry *entry, uint64_t targe
         if (needed_regs[reg] == 0) {
             continue;
         }
-        fprintf(stderr, "%sr%d:0x%02x", any_register ? "," : "", reg,
-                (unsigned int)needed_regs[reg]);
+        DSE_DIAGNOSTIC(stderr, "%sr%d:0x%02x", any_register ? "," : "", reg,
+                       (unsigned int)needed_regs[reg]);
         any_register = true;
     }
     if (!any_register) {
-        fprintf(stderr, "none");
+        DSE_DIAGNOSTIC(stderr, "none");
     }
-    fprintf(stderr, " bytes=");
+    DSE_DIAGNOSTIC(stderr, " bytes=");
     if (entry) {
         for (uint8_t i = 0; i < entry->size && i < MAX_INSN_BYTES; i++) {
-            fprintf(stderr, "%02x", entry->instr_bytes[i]);
+            DSE_DIAGNOSTIC(stderr, "%02x", entry->instr_bytes[i]);
         }
     }
     fputc('\n', stderr);
@@ -4944,7 +5046,7 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
                 path_budget_exhausted = true;
                 path_tracking_active = false;
                 if (!path_budget_reported) {
-                    fprintf(
+                    DSE_DIAGNOSTIC(
                         stderr,
                         "[DSE-PATH-BUDGET] trigger_seq=%lu limit=%u first_omitted_pc=0x%lx seq=%lu\n",
                         (unsigned long)trigger_seq_id, (unsigned int)DSE_MAX_PATH_CONSTRAINTS,
@@ -4957,7 +5059,7 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
                     result.status = DSE_SLICE_INVALID_INPUT;
                     goto cleanup;
                 }
-                fprintf(
+                DSE_DIAGNOSTIC(
                     stderr,
                     "[DSE-PATH-FALLBACK] reason=constraint-budget trigger_seq=%lu kept=%u dropped=%u\n",
                     (unsigned long)trigger_seq_id, result.len, (old_slice_len - result.len));
@@ -4981,7 +5083,7 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
                 result.status = DSE_SLICE_INVALID_INPUT;
                 goto cleanup;
             }
-            fprintf(
+            DSE_DIAGNOSTIC(
                 stderr,
                 "[DSE-PATH-FALLBACK] reason=slice-capacity trigger_seq=%lu kept=%u dropped=%u\n",
                 (unsigned long)trigger_seq_id, result.len, (old_slice_len - result.len));
@@ -5224,8 +5326,8 @@ static ReplayInput *dse_capture_slice_input(const TraceBuffer *tb, const DseAuxR
         result->reason = DSE_REASON_META_MISSING;
     else if (issues & (REPLAY_INPUT_AUX_MISSING | REPLAY_INPUT_EXECUTION_PENDING))
         result->reason = DSE_REASON_AUX_MISSING;
-    fprintf(stderr, "[DSE-REPLAY-INPUT] trigger_seq=%lu status=%u issues=0x%x\n",
-            (unsigned long)trigger_seq_id, (unsigned int)status, issues);
+    DSE_DIAGNOSTIC(stderr, "[DSE-REPLAY-INPUT] trigger_seq=%lu status=%u issues=0x%x\n",
+                   (unsigned long)trigger_seq_id, (unsigned int)status, issues);
     replay_input_destroy(input);
     return NULL;
 }
@@ -5316,6 +5418,8 @@ DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const D
         ctx.memory_model_complete = false;
     }
     dse_capture_verify_metrics(&result, &ctx, slice_result.len, meta_missing);
+    const ReplayStep *diagnostic_trigger = replay_input_trigger(input);
+    dse_diagnostic_origin(&ctx, diagnostic_trigger ? &diagnostic_trigger->entry : NULL);
     const InsnAux *trigger_aux = replay_input_aux(input, trigger_seq_id);
     SymExpr *target = trigger_aux ? dse_read_rid_fit(&ctx, trigger_aux, target_reg,
                                                      g_arch->natural_width, g_arch->natural_width)
@@ -5444,6 +5548,8 @@ DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, con
         ctx.memory_model_complete = false;
     }
     dse_capture_verify_metrics(&result, &ctx, slice_result.len, meta_missing);
+    const ReplayStep *diagnostic_trigger = replay_input_trigger(input);
+    dse_diagnostic_origin(&ctx, diagnostic_trigger ? &diagnostic_trigger->entry : NULL);
     const InsnAux *trigger_aux = replay_input_aux(input, trigger_seq_id);
     DseMemRead target_read;
     InsnAux selected_aux;

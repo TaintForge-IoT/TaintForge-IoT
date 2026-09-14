@@ -61,6 +61,31 @@ typedef enum {
     DSE_REASON_RESOURCE_LIMIT
 } DseVerifyReason;
 
+typedef enum {
+    DSE_REPLAY_SITE_ROOT,
+    DSE_REPLAY_SITE_ADDRESS_READ,
+    DSE_REPLAY_SITE_ADDRESS_WRITE,
+    DSE_REPLAY_SITE_BRANCH,
+    DSE_REPLAY_SITE_REGISTER,
+    DSE_REPLAY_SITE_MEMORY_READ,
+    DSE_REPLAY_SITE_MEMORY_WRITE,
+    DSE_REPLAY_SITE_TARGET
+} DseReplaySite;
+
+typedef struct {
+    bool present;
+    bool root_rebind;
+    bool origin_valid;
+    TraceEntry origin;
+    DseReplaySite site;
+    uint64_t location; /* Register ID, memory address, root source or target, according to site. */
+    uint32_t byte_index;
+    uint32_t variable_id;
+    uint32_t width;
+    uint64_t expected; /* Current observation, masked to width. */
+    uint64_t actual;   /* Replayed value, or the previous binding for root_rebind. */
+} DseReplayDiagnostic;
+
 typedef struct {
     DseVerdict verdict;
     DseEvidence evidence;
@@ -106,6 +131,10 @@ typedef struct {
     bool resource_limit_hit;
     bool relevance_applied;
     bool relevance_complete;
+    uint32_t replay_checks;
+    uint32_t replay_failures;
+    uint32_t replay_missing_bindings;
+    DseReplayDiagnostic first_replay_mismatch;
 } DseVerifyResult;
 
 typedef struct {
@@ -318,6 +347,9 @@ typedef struct {
     uint32_t replay_checks;
     uint32_t replay_failures;
     uint32_t replay_missing_bindings;
+    DseReplayDiagnostic first_replay_mismatch;
+    TraceEntry replay_origin;
+    bool replay_origin_valid;
 
     bool has_solver;
     bool resource_limit_hit;
@@ -344,6 +376,10 @@ typedef struct {
     bool demand_all_memory_writes;
     const GHashTable *demand_memory_writes;
 } DSECtx;
+
+/* Configure before running DSE; changes only text diagnostics. */
+void dse_set_verbose_diagnostics(bool enabled);
+void dse_replay_diagnostic_append_json(GString *out, const DseReplayDiagnostic *diagnostic);
 
 //multiarch support
 typedef struct DseArch {

@@ -23,6 +23,9 @@ struct IrReplay {
     uint32_t observation_count, observation_capacity;
     ReplayByte *memory;
     uint32_t memory_count, memory_capacity;
+    IrValueId flag_defined[IR_X86_FLAG_COUNT];
+    IrStateId flag_defined_state[IR_X86_FLAG_COUNT];
+    IrReplayTarget target;
     uint32_t undefined_flags; /* Architectural status along the unrolled path. */
     bool allocation_failed;
     uint64_t trigger_seq;
@@ -211,6 +214,8 @@ static bool add_observation(IrReplay *r, IrReplayObservation o) {
         r->observations = p;
         r->observation_capacity = cap;
     }
+    if (o.defined_when && !ir_module_add_output(r->module, o.defined_when))
+        return false;
     if (!o.architectural_undefined && !ir_module_add_output(r->module, o.value))
         return false;
     o.expected &= ir_width_mask(o.width);
@@ -230,12 +235,26 @@ static bool checkpoint(IrReplay *r, IrBlockId b, IrOrigin origin, const InsnAux 
                                  .width = flag ? 1 : 32};
         IrStateId state = flag ? r->state.flags[index] : r->state.gpr[index];
         o.architectural_undefined = flag && (r->undefined_flags & (UINT32_C(1) << index));
+        o.defined_when = flag ? r->flag_defined[index] : 0;
         if (!o.architectural_undefined)
             o.value = ir_emit_value(r->module, b,
                                     (IrInstSpec){.op = IR_OP_READ_STATE,
                                                  .type = ir_type_bv(o.width),
                                                  .state = state,
                                                  .origin = origin});
+        if (o.defined_when && !o.architectural_undefined) {
+            /* The observation is conditional; architectural state is not.
+             * Keep undefined flags available to later branch semantics, while
+             * not requiring an undefined checkpoint value as an output. */
+            IrValueId zero = ir_emit_value(
+                r->module, b,
+                (IrInstSpec){.op = IR_OP_CONST, .type = ir_type_bv(1), .origin = origin});
+            o.value = ir_emit_value(r->module, b,
+                                    (IrInstSpec){.op = IR_OP_ITE,
+                                                 .type = ir_type_bv(1),
+                                                 .args = {o.defined_when, o.value, zero},
+                                                 .origin = origin});
+        }
         if (aux) {
             o.expected_valid = flag ? aux->eflags_valid
                                     : (aux->reg_value_valid_mask & (UINT32_C(1) << index)) != 0;
@@ -292,28 +311,30 @@ static ReplayByte *byte_insert(IrReplay *r, uint32_t address) {
 
 static bool observe_memory(IrReplay *r, IrOrigin origin, IrX86LiftResult lift,
                            const InsnOccurrence *o, const InsnAux *aux) {
-    /* RMW reads seed immutable initial bytes BEFORE its write is recorded. */
-    for (unsigned pass = 0; pass < 2; ++pass) {
-        bool write = pass != 0;
-        if (write ? !lift.writes_memory : !lift.reads_memory)
-            continue;
-        const TraceMemoryEffect *event = write ? &o->mem_writes[0] : &o->mem_reads[0];
+    unsigned reads = 0, writes = 0;
+    for (unsigned pass = 0; pass < lift.memory_count; ++pass) {
+        const IrX86MemoryEffect *effect = &lift.memory[pass];
+        bool write = effect->write;
+        unsigned index = write ? writes++ : reads++;
+        const TraceMemoryEffect *event = write ? &o->mem_writes[index] : &o->mem_reads[index];
         IrReplayObservation address = {.origin = origin,
-                                       .value = lift.address,
+                                       .index = index,
+                                       .value = effect->address,
                                        .width = 32,
                                        .kind =
                                            write ? IR_REPLAY_WRITE_ADDRESS : IR_REPLAY_READ_ADDRESS,
                                        .expected_valid = true,
                                        .expected = event->address};
         IrReplayObservation data = {.origin = origin,
-                                    .value = write ? lift.write_data : lift.read_data,
-                                    .width = (uint8_t)(lift.memory_bytes * 8U),
+                                    .index = index,
+                                    .value = effect->data,
+                                    .width = (uint8_t)(effect->bytes * 8U),
                                     .kind = write ? IR_REPLAY_WRITE_VALUE : IR_REPLAY_READ_VALUE,
                                     .expected_valid = event->value_valid,
                                     .expected = event->value};
         if (!add_observation(r, address) || !add_observation(r, data))
             return false;
-        for (unsigned i = 0; i < lift.memory_bytes; ++i) {
+        for (unsigned i = 0; i < effect->bytes; ++i) {
             ReplayByte *byte = byte_insert(r, (uint32_t)(event->address + i));
             if (!byte)
                 return false;
@@ -321,12 +342,13 @@ static bool observe_memory(IrReplay *r, IrOrigin origin, IrX86LiftResult lift,
                 byte->written = true;
             else if (!byte->written) {
                 const DseMemRead *read =
-                    aux && aux->mem_read_count == 1 ? &aux->mem_reads[0] : NULL;
+                    aux && index < aux->mem_read_count ? &aux->mem_reads[index] : NULL;
                 const DseSourceObservation *sources = dse_aux_sources(aux);
                 bool source_valid = read && read->addr == event->address &&
-                                    read->size == lift.memory_bytes && sources &&
-                                    (sources->read_valid[0] & (1U << i));
-                ProvLabelId label = source_valid ? sources->read_labels[0][i] : PROV_LABEL_UNKNOWN;
+                                    read->size == effect->bytes && sources &&
+                                    (sources->read_valid[index] & (1U << i));
+                ProvLabelId label =
+                    source_valid ? sources->read_labels[index][i] : PROV_LABEL_UNKNOWN;
                 if (!byte->read_before_write) {
                     byte->read_before_write = true;
                     byte->read_origin = origin;
@@ -347,22 +369,85 @@ static bool observe_memory(IrReplay *r, IrOrigin origin, IrX86LiftResult lift,
 }
 
 static uint32_t memory_shape(IrX86LiftResult lift, const InsnOccurrence *o) {
-    unsigned reads = lift.reads_memory ? 1 : 0, writes = lift.writes_memory ? 1 : 0;
-    if (!o->dynamic_effects_available ||
+    unsigned reads = 0, writes = 0;
+    if (lift.memory_count > 2 || !o->dynamic_effects_available ||
         (o->incomplete_reasons & (TRACE_OCCURRENCE_READ_OVERFLOW | TRACE_OCCURRENCE_WRITE_OVERFLOW |
-                                  TRACE_OCCURRENCE_RANGE_UNKNOWN)) ||
-        o->mem_read_count != reads || o->mem_write_count != writes || o->mem_read_total != reads ||
-        o->mem_write_total != writes)
+                                  TRACE_OCCURRENCE_RANGE_UNKNOWN)))
         return IR_REPLAY_OBSERVATION_SHAPE;
-    if (reads &&
-        (o->mem_reads[0].kind != TRACE_MEM_READ || o->mem_reads[0].size != lift.memory_bytes ||
-         o->mem_reads[0].address > UINT32_MAX))
-        return IR_REPLAY_OBSERVATION_SHAPE;
-    if (writes &&
-        (o->mem_writes[0].kind != TRACE_MEM_WRITE || o->mem_writes[0].size != lift.memory_bytes ||
-         o->mem_writes[0].address > UINT32_MAX))
-        return IR_REPLAY_OBSERVATION_SHAPE;
-    return 0;
+    for (unsigned i = 0; i < lift.memory_count; ++i) {
+        const IrX86MemoryEffect *effect = &lift.memory[i];
+        unsigned index = effect->write ? writes++ : reads++;
+        const TraceMemoryEffect *event =
+            effect->write ? &o->mem_writes[index] : &o->mem_reads[index];
+        if (event->kind != (effect->write ? TRACE_MEM_WRITE : TRACE_MEM_READ) ||
+            event->size != effect->bytes || event->address > UINT32_MAX)
+            return IR_REPLAY_OBSERVATION_SHAPE;
+    }
+    return o->mem_read_count == reads && o->mem_write_count == writes &&
+                   o->mem_read_total == reads && o->mem_write_total == writes
+               ? 0
+               : IR_REPLAY_OBSERVATION_SHAPE;
+}
+
+static IrValueId flag_constant(IrReplay *r, IrBlockId b, IrOrigin origin, bool value) {
+    return ir_emit_value(
+        r->module, b,
+        (IrInstSpec){
+            .op = IR_OP_CONST, .type = ir_type_bv(1), .immediate = value, .origin = origin});
+}
+
+static void flag_definedness(IrReplay *r, IrBlockId b, IrOrigin origin, IrX86LiftResult lift) {
+    for (unsigned i = 0; i < IR_X86_FLAG_COUNT; ++i) {
+        uint32_t mask = 1U << i;
+        if (!(lift.flags_written & mask))
+            continue;
+        if (lift.flags_preserved_when) {
+            IrValueId old = r->flag_defined[i];
+            if (!old)
+                old = flag_constant(r, b, origin, !(r->undefined_flags & mask));
+            IrValueId defined = lift.flags_defined[i];
+            if (!defined)
+                defined = flag_constant(r, b, origin, !(lift.flags_undefined & mask));
+            r->flag_defined[i] =
+                ir_emit_value(r->module, b,
+                              (IrInstSpec){.op = IR_OP_ITE,
+                                           .type = ir_type_bv(1),
+                                           .args = {lift.flags_preserved_when, old, defined},
+                                           .origin = origin});
+            r->undefined_flags &= ~mask;
+        } else {
+            r->flag_defined[i] = lift.flags_defined[i];
+            r->undefined_flags = (r->undefined_flags & ~mask) | (lift.flags_undefined & mask);
+        }
+    }
+}
+
+/* Stateful IR values are local to a block until trace SSA. Carry conditional
+ * definedness as internal BV1 state, assigned before its first read. These are
+ * derived facts, not externally bindable inputs or architectural flag values. */
+static bool carry_flag_definedness(IrReplay *r, IrBlockId from, IrBlockId to, IrOrigin origin) {
+    for (unsigned i = 0; i < IR_X86_FLAG_COUNT; ++i) {
+        if (!r->flag_defined[i])
+            continue;
+        if (!r->flag_defined_state[i])
+            r->flag_defined_state[i] =
+                ir_state_add(r->module, ir_type_bv(1), UINT64_C(0x400) + i, false);
+        IrStateId state = r->flag_defined_state[i];
+        if (!state || !ir_emit_effect(r->module, from,
+                                      (IrInstSpec){.op = IR_OP_WRITE_STATE,
+                                                   .type = ir_type_void(),
+                                                   .args = {r->flag_defined[i]},
+                                                   .state = state,
+                                                   .origin = origin}))
+            return false;
+        r->flag_defined[i] = ir_emit_value(
+            r->module, to,
+            (IrInstSpec){
+                .op = IR_OP_READ_STATE, .type = ir_type_bv(1), .state = state, .origin = origin});
+        if (!r->flag_defined[i])
+            return false;
+    }
+    return true;
 }
 
 static uint32_t lift_issues(IrX86LiftStatus status) {
@@ -507,6 +592,7 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             info->status = IR_REPLAY_OUT_OF_MEMORY;
         return NULL;
     }
+    r->target = (IrReplayTarget){.status = IR_X86_LIFT_UNSUPPORTED, .gpr_index = -1};
     r->options = opts;
     r->info.selected_steps = replay_input_count(input);
     r->trigger_seq = trigger->entry.seq_id;
@@ -535,6 +621,12 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
     if (issues) {
         stop(r, block, issues, origin_of(first));
         goto complete;
+    }
+    if (opts.capture_target) {
+        IrX86LiftResult target =
+            ir_x86_describe_target(frontend, block, &trigger->descriptor, origin_of(trigger));
+        r->target.status = target.status;
+        r->target.gpr_index = target.target_gpr;
     }
     const InsnAux *initial = saved_aux(input, first);
     if (initial) {
@@ -578,7 +670,7 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             goto complete;
         }
         ++r->info.lifted_steps;
-        r->undefined_flags = (r->undefined_flags & ~lift.flags_written) | lift.flags_undefined;
+        flag_definedness(r, block, origin, lift);
         issues = memory_shape(lift, &step->occurrence);
         if (issues) {
             stop(r, block, issues, origin);
@@ -634,6 +726,8 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             }
             if (lift.control == IR_X86_DIRECT_JUMP)
                 successor = lift.direct_target;
+            else if (lift.control == IR_X86_INDIRECT)
+                successor = occ->next_pc;
         }
         if (occ->next_pc != successor || next->entry.pc != successor ||
             (aux && aux->next_pc_valid && aux->next_pc != occ->next_pc)) {
@@ -652,6 +746,38 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
                     goto fatal;
                 stop(r, block, IR_REPLAY_BUDGET, origin);
                 goto complete;
+            }
+            if (lift.control == IR_X86_INDIRECT) {
+                if (!add_observation(r, (IrReplayObservation){.kind = IR_REPLAY_TRANSFER_TARGET,
+                                                              .origin = origin,
+                                                              .value = lift.target,
+                                                              .width = 32,
+                                                              .expected_valid = true,
+                                                              .expected = successor})) {
+                    if (r->allocation_failed || ir_module_status(r->module) != IR_OK)
+                        goto fatal;
+                    stop(r, block, IR_REPLAY_BUDGET, origin);
+                    goto complete;
+                }
+                IrValueId expected = ir_emit_value(r->module, block,
+                                                   (IrInstSpec){.op = IR_OP_CONST,
+                                                                .type = ir_type_bv(32),
+                                                                .immediate = successor,
+                                                                .origin = origin});
+                IrValueId equal = ir_emit_value(r->module, block,
+                                                (IrInstSpec){.op = IR_OP_EQ,
+                                                             .type = ir_type_bv(1),
+                                                             .args = {lift.target, expected},
+                                                             .origin = origin});
+                /* A recorded edge is usable only while the computed target agrees.
+                 * Changed/unknown targets stop; no successor body is invented. */
+                if (!ir_emit_effect(r->module, block,
+                                    (IrInstSpec){.op = IR_OP_GUARD,
+                                                 .type = ir_type_void(),
+                                                 .args = {equal},
+                                                 .immediate = IR_REASON_TARGET,
+                                                 .origin = origin}))
+                    goto fatal;
             }
             IrBlockId following = ir_block_add(r->module);
             if (!following)
@@ -676,7 +802,8 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
                 if (lift.direct_target == fallthrough)
                     term.successors[0] = term.successors[1] = local;
             }
-            if (!ir_block_terminate(r->module, block, term))
+            if (!carry_flag_definedness(r, block, following, origin_of(next)) ||
+                !ir_block_terminate(r->module, block, term))
                 goto fatal;
             block = following;
         }
@@ -686,6 +813,33 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             goto fatal;
         stop(r, block, IR_REPLAY_BUDGET, origin_of(trigger));
         goto complete;
+    }
+    if (opts.capture_target) {
+        IrX86LiftResult target =
+            ir_x86_lift_target(frontend, block, &trigger->descriptor, origin_of(trigger));
+        r->target.status = target.status;
+        if (target.status == IR_X86_LIFT_ERROR)
+            goto fatal;
+        if (target.status == IR_X86_LIFT_OK) {
+            r->target.value = target.target;
+            r->target.gpr_index = target.target_gpr;
+            if (!ir_module_add_output(r->module, target.target))
+                goto fatal;
+            /* Only target reads belong to the boundary projection. The CALL's
+             * stack write and the RET's stack update occur after this boundary. */
+            InsnOccurrence observation = trigger->occurrence;
+            observation.mem_write_count = 0;
+            observation.mem_write_total = 0;
+            if (memory_shape(target, &observation)) {
+                note(r, IR_REPLAY_OBSERVATION_SHAPE);
+            } else if (!observe_memory(r, origin_of(trigger), target, &observation,
+                                       saved_aux(input, trigger))) {
+                if (r->allocation_failed || ir_module_status(r->module) != IR_OK)
+                    goto fatal;
+                stop(r, block, IR_REPLAY_BUDGET, origin_of(trigger));
+                goto complete;
+            }
+        }
     }
     (void)ir_block_terminate(
         r->module, block,
@@ -737,16 +891,16 @@ IrBindings ir_replay_observed_bindings(IrReplay *r) {
              : (IrBindings){0};
 }
 
-IrReplayCheckResult ir_replay_check_gpr_candidate(IrReplay *r, const IrEvalLimits *limits,
-                                                  const IrReplayGprCandidate *candidate) {
+static IrReplayCheckResult check_candidate(IrReplay *r, const IrEvalLimits *limits,
+                                           const IrReplayGprCandidate *candidate, bool projected) {
     IrReplayCheckResult check = {.status = IR_REPLAY_CHECK_ERROR,
                                  .candidate_requested = candidate != NULL,
                                  .candidate_status = IR_REPLAY_CHECK_UNKNOWN,
                                  .candidate_actual = ir_bits_unknown(IR_REASON_NOT_EXECUTED)};
     if (!r)
         return check;
-    if (candidate &&
-        (candidate->trigger_seq != r->trigger_seq || candidate->gpr_index >= IR_X86_GPR_COUNT))
+    if (candidate && (candidate->trigger_seq != r->trigger_seq ||
+                      (!projected && candidate->gpr_index >= IR_X86_GPR_COUNT)))
         return check;
     IrBindings bindings = ir_replay_observed_bindings(r);
     IrEval *eval = ir_eval_create(r->module, &bindings, limits);
@@ -764,6 +918,17 @@ IrReplayCheckResult ir_replay_check_gpr_candidate(IrReplay *r, const IrEvalLimit
         if (o->architectural_undefined) {
             ++check.skipped_undefined;
             continue;
+        }
+        if (o->defined_when) {
+            IrBits defined = ir_eval_value(eval, o->defined_when).bits;
+            if (!ir_bits_complete(defined, 1)) {
+                ++check.unknown;
+                continue;
+            }
+            if (!defined.value) {
+                ++check.skipped_undefined;
+                continue;
+            }
         }
         IrEvalValue actual = ir_eval_value(eval, o->value);
         if (!o->expected_valid || actual.type.kind != IR_TYPE_BV || actual.type.bits != o->width) {
@@ -785,7 +950,8 @@ IrReplayCheckResult ir_replay_check_gpr_candidate(IrReplay *r, const IrEvalLimit
     }
     if (candidate && r->info.status == IR_REPLAY_READY && r->info.selected_steps &&
         check.execution.status == IR_EVAL_FRAGMENT_END) {
-        IrEvalValue value = ir_eval_state(eval, r->state.gpr[candidate->gpr_index]);
+        IrEvalValue value = projected ? ir_eval_value(eval, r->target.value)
+                                      : ir_eval_state(eval, r->state.gpr[candidate->gpr_index]);
         if (value.type.kind == IR_TYPE_BV && value.type.bits == 32) {
             check.candidate_actual = value.bits;
             if ((value.bits.value ^ candidate->expected_target) & value.bits.known_mask &
@@ -806,6 +972,25 @@ IrReplayCheckResult ir_replay_check_gpr_candidate(IrReplay *r, const IrEvalLimit
         check.status = IR_REPLAY_CHECK_MATCH;
     ir_eval_destroy(eval);
     return check;
+}
+
+IrReplayTarget ir_replay_target(const IrReplay *r) {
+    return r ? r->target : (IrReplayTarget){.status = IR_X86_LIFT_ERROR, .gpr_index = -1};
+}
+
+IrReplayCheckResult ir_replay_check_gpr_candidate(IrReplay *r, const IrEvalLimits *limits,
+                                                  const IrReplayGprCandidate *candidate) {
+    return check_candidate(r, limits, candidate, false);
+}
+
+IrReplayCheckResult ir_replay_check_target(IrReplay *r, const IrEvalLimits *limits, uint64_t seq,
+                                           uint32_t expected) {
+    if (!r || r->target.status != IR_X86_LIFT_OK)
+        return (IrReplayCheckResult){.status = IR_REPLAY_CHECK_UNKNOWN,
+                                     .candidate_requested = true,
+                                     .candidate_status = IR_REPLAY_CHECK_UNKNOWN};
+    IrReplayGprCandidate request = {.trigger_seq = seq, .expected_target = expected};
+    return check_candidate(r, limits, &request, true);
 }
 
 IrReplayCheckResult ir_replay_check(IrReplay *r, const IrEvalLimits *limits) {

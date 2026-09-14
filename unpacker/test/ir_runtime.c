@@ -74,13 +74,6 @@ static void account(IrRuntime *r, IrRuntimeReport *p, gint64 start) {
         r->peak_evaluator_bytes = p->check.evaluator_bytes;
 }
 
-static bool target_supported(const ReplayStep *t, int reg) {
-    return t && t->descriptor_valid && reg >= 0 && reg < (int)IR_X86_GPR_COUNT &&
-           t->descriptor.arch == TRACE_ARCH_X86 && t->descriptor.mode == TRACE_MODE_32 &&
-           t->entry.size == 2 && t->entry.instr_bytes[0] == 0xff &&
-           t->entry.instr_bytes[1] == (uint8_t)(0xe0 + reg);
-}
-
 bool ir_runtime_check_sources(IrRuntime *r, const TraceBuffer *trace, const DseAuxRing *aux,
                               ProvRegistry *registry, const IrRuntimeRequest *request,
                               IrRuntimeReport *p) {
@@ -159,18 +152,13 @@ bool ir_runtime_check_sources(IrRuntime *r, const TraceBuffer *trace, const DseA
         p->initial_eflags_valid = first_aux->eflags_valid;
     }
     const ReplayStep *trigger = replay_input_trigger(input);
+    p->trigger = trigger->entry;
+    p->trigger_identity_valid = trigger->descriptor_valid;
     if (trigger->entry.vcpu_index != request->vcpu_index) {
         p->issues |= IR_RUNTIME_BAD_REQUEST;
         goto done;
     }
-    IrReplayGprCandidate target = {.trigger_seq = request->trigger_seq,
-                                   .gpr_index = (uint32_t)request->target_gpr,
-                                   .expected_target = (uint32_t)request->candidate_address};
     bool candidate_ok = request->kind == IR_RUNTIME_CANDIDATE;
-    if (candidate_ok && !target_supported(trigger, request->target_gpr)) {
-        p->issues |= IR_RUNTIME_TARGET_UNSUPPORTED;
-        candidate_ok = false;
-    }
     if (request->kind == IR_RUNTIME_CANDIDATE &&
         (request->candidate_address > UINT32_MAX || !trigger->occurrence.execution_complete ||
          !trigger->occurrence.next_pc_valid ||
@@ -180,7 +168,9 @@ bool ir_runtime_check_sources(IrRuntime *r, const TraceBuffer *trace, const DseA
     }
     phase = g_get_monotonic_time();
     p->build_attempted = true;
-    replay = ir_replay_x86_build(input, &r->options.replay, &p->build);
+    IrReplayOptions replay_options = r->options.replay;
+    replay_options.capture_target = request->kind == IR_RUNTIME_CANDIDATE;
+    replay = ir_replay_x86_build(input, &replay_options, &p->build);
     p->build_us = elapsed(phase);
     if (p->build.stopped_seq) {
         const ReplayStep *stop = replay_input_find(input, p->build.stopped_seq);
@@ -195,6 +185,12 @@ bool ir_runtime_check_sources(IrRuntime *r, const TraceBuffer *trace, const DseA
         if (p->build.status == IR_REPLAY_INVALID || p->build.status == IR_REPLAY_OUT_OF_MEMORY)
             p->status = IR_REPLAY_CHECK_ERROR;
         goto done;
+    }
+    IrReplayTarget target = ir_replay_target(replay);
+    if (candidate_ok && (target.status != IR_X86_LIFT_OK ||
+                         (request->target_gpr >= 0 && request->target_gpr != target.gpr_index))) {
+        p->issues |= IR_RUNTIME_TARGET_UNSUPPORTED;
+        candidate_ok = false;
     }
     p->replay_bytes = ir_replay_allocated_bytes(replay);
     p->inputs = ir_replay_input_info(replay);
@@ -231,8 +227,9 @@ bool ir_runtime_check_sources(IrRuntime *r, const TraceBuffer *trace, const DseA
     /* No collector object is accessed by the evaluator. */
     phase = g_get_monotonic_time();
     p->check_attempted = true;
-    p->check =
-        ir_replay_check_gpr_candidate(replay, &r->options.eval, candidate_ok ? &target : NULL);
+    p->check = candidate_ok ? ir_replay_check_target(replay, &r->options.eval, request->trigger_seq,
+                                                     (uint32_t)request->candidate_address)
+                            : ir_replay_check(replay, &r->options.eval);
     p->check_us = elapsed(phase);
     p->status = p->check.status;
     if (p->status == IR_REPLAY_CHECK_MATCH &&
@@ -366,6 +363,16 @@ bool ir_runtime_report_json(FILE *f, const IrRuntimeReport *p) {
             p->first_seq, p->request.first_seq, p->request.candidate_address, p->selected_steps,
             p->build.lifted_steps);
     names_json(f, p->issues, runtime_names, G_N_ELEMENTS(runtime_names));
+    fprintf(f,
+            ",\"trigger\":{\"identity_valid\":%s,\"seq\":%" PRIu64 ",\"pc\":%" PRIu64
+            ",\"generation\":%u,\"descriptor\":%" PRIu64
+            ",\"target_gpr\":%d,\"flags_trusted\":%s,\"bytes\":\"",
+            p->trigger_identity_valid ? "true" : "false", p->trigger.seq_id, p->trigger.pc,
+            p->trigger.code_generation, p->trigger.insn_desc_id, p->request.target_gpr,
+            p->request.flag_observations_trusted ? "true" : "false");
+    for (unsigned i = 0; i < p->trigger.size && i < MAX_INSN_BYTES; ++i)
+        fprintf(f, "%02x", p->trigger.instr_bytes[i]);
+    fputs("\"}", f);
     fprintf(
         f,
         ",\"capture_status\":%u,\"capture_issues\":%u,\"build_attempted\":%s,\"build_status\":%u,\"build_status_name\":\"%s\",\"build_issues\":",

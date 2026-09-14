@@ -45,8 +45,16 @@ typedef enum {
     IR_EVAL_UNKNOWN,
     IR_EVAL_RESOURCE_LIMIT,
     IR_EVAL_INVALID,
-    IR_EVAL_OUT_OF_MEMORY
+    IR_EVAL_OUT_OF_MEMORY,
+    IR_EVAL_BRANCH /* Only run_to_branch: known condition at the requested terminator. */
 } IrEvalStatus;
+
+typedef struct {
+    IrBlockId block;
+    IrOrigin origin;
+    IrBits condition;
+    IrTarget target; /* Meaningful only for a complete condition. */
+} IrEvalBranch;
 
 typedef struct {
     IrEvalStatus status;
@@ -77,10 +85,22 @@ void ir_eval_destroy(IrEval *eval);
  * A MEM handle describes a persistent map; inspect bytes explicitly. A base
  * callback's presence alone does not certify completeness of its entire map. */
 IrEvalResult ir_eval_run(IrEval *eval);
+/* Reset and execute up to a CJUMP occurrence. Record each encountered CJUMP
+ * in caller-owned storage, including an unknown condition. On IR_EVAL_BRANCH
+ * the selected successor has not executed; no future exports/live-outs are
+ * checked. An external or unknown successor does not prevent reaching this
+ * boundary. Earlier exits/effects and resource limits still stop execution.
+ * Target block must be a CJUMP; count is required and reset on entry. Capacity
+ * exhaustion is RESOURCE_LIMIT, never a truncated successful prefix. */
+IrEvalResult ir_eval_run_to_branch(IrEval *eval, IrBlockId block, IrEvalBranch *events,
+                                   uint32_t capacity, uint32_t *count);
 IrEvalResult ir_eval_result(const IrEval *eval);
 /* Owned allocations including capacities, excluding the borrowed module and
  * bindings. After a run this is its allocation high-water mark. */
 size_t ir_eval_allocated_bytes(const IrEval *eval);
+/* Conservative owned-allocation bound for create + a run with these limits.
+ * Excludes module/bindings/allocator overhead; rejects size overflow. */
+bool ir_eval_allocation_bound(const IrModule *module, const IrEvalLimits *limits, size_t *bytes);
 IrEvalValue ir_eval_value(const IrEval *eval, IrValueId id);
 IrEvalValue ir_eval_state(const IrEval *eval, IrStateId id);
 /* Inspection shares the memory query budget, reports UNKNOWN/BUDGET rather

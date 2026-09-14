@@ -31,7 +31,8 @@ typedef struct {
     bool require_first_seq;
     uint32_t vcpu_index;
     uint64_t candidate_address;
-    /* Accepts only an executed, unprefixed FF /4 JMP r32 target. */
+    /* Optional full-GPR hint, checked against the decoded operand. Use -1 for
+     * memory/RET targets or to select the target solely from the instruction. */
     int target_gpr;
     bool collector_serialized;
     bool flag_observations_trusted;
@@ -75,6 +76,8 @@ typedef struct {
     bool stopped_identity_valid;
     TraceEntry stopped;
     uint16_t stopped_native_id;
+    bool trigger_identity_valid;
+    TraceEntry trigger;
     size_t capture_bytes, replay_bytes;
     uint32_t ir_instructions, ir_values, ir_blocks, observations;
     uint64_t capture_us, build_us, check_us, total_us;

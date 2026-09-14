@@ -2,6 +2,7 @@
 #define TRACE_COLLECTOR_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "dcfg.h"
@@ -255,6 +256,7 @@ typedef struct {
     uint32_t head_pointer;
     uint32_t counter;
     uint64_t next_event_id;
+    struct BranchEventIndex *index;
 } BranchEventBuffer;
 
 BranchEventBuffer *branch_event_buffer_create(uint32_t capacity);
@@ -265,4 +267,6 @@ const BranchEvent *branch_event_find_seq(const BranchEventBuffer *buffer, uint64
                                          uint32_t vcpu_index);
 bool trace_occurrence_apply_branch_event(InsnOccurrence *occurrence, const BranchEvent *event);
 void branch_event_buffer_reset(BranchEventBuffer *buffer);
+/* Optional acceleration only. Zero means the exact linear fallback is active. */
+size_t branch_event_buffer_index_bytes(const BranchEventBuffer *buffer);
 #endif
