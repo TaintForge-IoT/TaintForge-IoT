@@ -4,7 +4,7 @@
 #include "ir.h"
 #include "trace.h"
 
-/* IA-32 data movement, arithmetic, shifts, stack, flags, SETcc and near transfers.
+/* IA-32 data movement, arithmetic, shifts, stack, flags, SETcc/CMOVcc and near transfers.
  * These keys belong to the x86 frontend, not the generic IR.
  * GPR order is the existing RegId order 0..7;
  * flag order is CF/PF/AF/ZF/SF/OF/DF (X86SpecialStateId). */
@@ -87,6 +87,8 @@ typedef struct IrX86Frontend IrX86Frontend;
  * unsupported. PUSH/POP accept 16/32-bit operands; LEAVE requires 32 bits.
  * SCAS accepts 8/16/32-bit operands and 16/32-bit addresses, without REP.
  * SETcc writes one byte (0 or 1), preserves flags and is not a control transfer.
+ * CMOVcc selects a 16/32-bit register value, preserves flags and creates no control edge.
+ * Its register/memory source is read unconditionally, even when the condition is false.
  * Exact F3 0F 1E FB ENDBR32 is a no-op under flat32_ram's CET-disabled contract;
  * other ENDBR encodings remain unsupported. Replay checkpoints retain its origin.
  * Lifting never consults an observed branch outcome. */

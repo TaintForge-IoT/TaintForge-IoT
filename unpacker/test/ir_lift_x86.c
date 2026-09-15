@@ -200,6 +200,45 @@ static int set_condition_code(unsigned id) {
     }
 }
 
+static int move_condition_code(unsigned id) {
+    switch (id) {
+    case X86_INS_CMOVO:
+        return 0;
+    case X86_INS_CMOVNO:
+        return 1;
+    case X86_INS_CMOVB:
+        return 2;
+    case X86_INS_CMOVAE:
+        return 3;
+    case X86_INS_CMOVE:
+        return 4;
+    case X86_INS_CMOVNE:
+        return 5;
+    case X86_INS_CMOVBE:
+        return 6;
+    case X86_INS_CMOVA:
+        return 7;
+    case X86_INS_CMOVS:
+        return 8;
+    case X86_INS_CMOVNS:
+        return 9;
+    case X86_INS_CMOVP:
+        return 10;
+    case X86_INS_CMOVNP:
+        return 11;
+    case X86_INS_CMOVL:
+        return 12;
+    case X86_INS_CMOVGE:
+        return 13;
+    case X86_INS_CMOVLE:
+        return 14;
+    case X86_INS_CMOVG:
+        return 15;
+    default:
+        return -1;
+    }
+}
+
 static bool arithmetic(unsigned id) {
     return id == X86_INS_ADD || id == X86_INS_SUB || id == X86_INS_CMP || id == X86_INS_AND ||
            id == X86_INS_OR || id == X86_INS_XOR || id == X86_INS_TEST;
@@ -237,6 +276,14 @@ static IrX86LiftStatus preflight(const IrX86Frontend *f, const cs_insn *insn) {
         if (x->op_count != 1 || x->operands[0].size != 1)
             return IR_X86_LIFT_UNSUPPORTED;
         return operand_status(f, x, &x->operands[0], false);
+    }
+    if (move_condition_code(insn->id) >= 0) {
+        if (x->op_count != 2)
+            return IR_X86_LIFT_UNSUPPORTED;
+        const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
+        if (!register_ok(dst) || (dst->size != 2 && dst->size != 4) || dst->size != src->size)
+            return IR_X86_LIFT_UNSUPPORTED;
+        return operand_status(f, x, src, false);
     }
     if (condition_code(insn->id) >= 0) {
         return x->prefix[2] != 0x66 && x->op_count == 1 && x->operands[0].type == X86_OP_IMM
@@ -641,7 +688,17 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
     const cs_x86 *x = &insn->detail->x86;
     int cc = condition_code(insn->id);
     int set_cc = set_condition_code(insn->id);
-    if (set_cc >= 0) {
+    int move_cc = move_condition_code(insn->id);
+    if (move_cc >= 0) {
+        const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
+        /* The source load is unconditional, including a false condition.
+         * Read both operands before writing an aliased destination/address. */
+        IrValueId source = read_operand(&l, x, src, &r);
+        IrValueId old =
+            src->type == X86_OP_REG && src->reg == dst->reg ? source : read_register(&l, dst->reg);
+        IrValueId condition = branch_condition(&l, (unsigned)move_cc);
+        write_operand(&l, x, dst, choose(&l, dst->size * 8U, condition, source, old), &r);
+    } else if (set_cc >= 0) {
         IrValueId condition = branch_condition(&l, (unsigned)set_cc);
         write_operand(&l, x, &x->operands[0], unary(&l, IR_OP_ZEXT, 8, condition, 0), &r);
     } else if (cc >= 0 || insn->id == X86_INS_JMP || insn->id == X86_INS_CALL ||

@@ -38,13 +38,16 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import uuid
+
+from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1RuntimeError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-SCRIPT_VERSION = "0.4.0"
+SCRIPT_VERSION = "0.5.0"
 SUPPORTED_MACHINE = "Intel 80386"
 
 
@@ -228,38 +231,9 @@ def validate_sample(sample: Path, elf: ElfInfo) -> None:
         )
 
 
-def plugin_candidates(
-    project_root: Path,
-    explicit: str | None,
-) -> list[Path]:
-    candidates: list[Path] = []
-
-    if explicit:
-        candidates.append(Path(explicit).expanduser().resolve())
-
-    from_env = os.environ.get("TAINTFORGE_QEMU_PLUGIN")
-    if from_env:
-        candidates.append(Path(from_env).expanduser().resolve())
-
-    candidates.extend(
-        [
-            project_root / "build" / "qemu_unpacker.so",
-            project_root / "qemu_unpacker.so",
-            project_root / "test_plugin.so",
-            project_root / "unpacker" / "qemu_unpacker.so",
-            project_root / "unpacker" / "test_plugin.so",
-            project_root / "unpacker" / "build" / "qemu_unpacker.so",
-        ]
-    )
-
-    unique: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in candidates:
-        normalized = candidate.resolve()
-        if normalized not in seen:
-            seen.add(normalized)
-            unique.append(normalized)
-    return unique
+def plugin_candidates(project_root: Path, explicit: str | None) -> list[Path]:
+    selected = explicit or os.environ.get("TAINTFORGE_QEMU_PLUGIN")
+    return [Path(selected).expanduser().resolve()] if selected else [project_root / "build" / "libtaintforge_ir.so"]
 
 
 def find_system_qemu_plugin_header() -> Path | None:
@@ -313,12 +287,13 @@ def resolve_qemu_source(
 
     for candidate in qemu_source_candidates(project_root, explicit):
         checked.append(candidate)
+        plugins_header = candidate / "include" / "plugins" / "qemu-plugin.h"
         source_header = candidate / "include" / "qemu" / "qemu-plugin.h"
         installed_style_header = candidate / "include" / "qemu-plugin.h"
         build_dir = candidate / "build"
 
         if (
-            (source_header.is_file() or installed_style_header.is_file())
+            (plugins_header.is_file() or source_header.is_file() or installed_style_header.is_file())
             and build_dir.is_dir()
         ):
             return candidate
@@ -333,115 +308,37 @@ def resolve_qemu_source(
     )
 
 
-def pkg_config_tokens(*packages: str) -> list[str]:
-    pkg_config = require_program("pkg-config")
-    result = subprocess.run(
-        [pkg_config, "--cflags", "--libs", *packages],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise PipelineError(
-            "pkg-config could not resolve the Phase 1 build dependencies "
-            f"{', '.join(packages)}:\n{result.stderr.strip()}"
-        )
-    return result.stdout.split()
-
-
-def build_phase1_plugin(
-    *,
-    project_root: Path,
-    qemu_source: Path | None,
-) -> Path:
-    gcc = require_program("gcc")
-
-    source_paths = [
-        project_root / "unpacker" / "qemu_unpacker.c",
-        project_root / "unpacker" / "dta.c",
-        project_root / "unpacker" / "trace.c",
-    ]
-
-    missing_sources = [path for path in source_paths if not path.is_file()]
-    if missing_sources:
-        rendered = "\n".join(f"  - {path}" for path in missing_sources)
-        raise PipelineError(
-            "Cannot build the Phase 1 plugin because source files are missing:\n"
-            f"{rendered}"
-        )
-
-    output = project_root / "build" / "qemu_unpacker.so"
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    include_args = [
-        "-I",
-        str(project_root / "unpacker"),
-    ]
-    if qemu_source is not None:
-        include_args = [
-            "-I",
-            str(qemu_source / "include"),
-            "-I",
-            str(qemu_source / "build"),
-            *include_args,
-        ]
-
-    command = [
-        gcc,
-        "-std=gnu11",
-        "-fPIC",
-        "-shared",
-        "-O2",
-        "-g",
-        "-Wall",
-        "-Wextra",
-        *include_args,
-        *[str(path) for path in source_paths],
-        "-o",
-        str(output),
-        *pkg_config_tokens("glib-2.0", "capstone"),
-    ]
-
-    print("[+] Phase 1 plugin was not found; building it now")
-    if qemu_source is None:
-        header = find_system_qemu_plugin_header()
-        print(f"[+] QEMU plugin header: {header}")
+def build_phase1_plugin(*, project_root: Path, qemu_source: Path | None) -> Path:
+    source = project_root / "unpacker" / "test"
+    recipe = source / "build_group7_4c1_plugin.sh"
+    if not recipe.is_file():
+        raise PipelineError("Missing canonical Phase 1 build recipe")
+    header = None
+    explicit_header = os.environ.get("TF_QEMU_INCLUDE")
+    if explicit_header:
+        header = Path(explicit_header) / "qemu-plugin.h"
+    elif qemu_source is not None:
+        for candidate in (qemu_source / "include" / "plugins" / "qemu-plugin.h",
+                          qemu_source / "include" / "qemu" / "qemu-plugin.h",
+                          qemu_source / "include" / "qemu-plugin.h"):
+            if candidate.is_file():
+                header = candidate
+                break
     else:
-        print(f"[+] QEMU source/build tree: {qemu_source}")
-    print("[cmd]", " ".join(command))
-
-    result = subprocess.run(
-        command,
-        cwd=project_root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-
-    build_log = project_root / "build" / "qemu_unpacker.build.log"
-    build_log.write_text(
-        "COMMAND:\n"
-        + " ".join(command)
-        + "\n\nSTDOUT:\n"
-        + result.stdout
-        + "\nSTDERR:\n"
-        + result.stderr,
-        encoding="utf-8",
-    )
-
-    if result.returncode != 0 or not output.is_file():
-        raise PipelineError(
-            "Automatic Phase 1 plugin build failed.\n"
-            f"Build log: {build_log}\n"
-            f"Compiler exit code: {result.returncode}\n"
-            f"Last stderr lines:\n"
-            + "\n".join(result.stderr.splitlines()[-30:])
-        )
-
-    print(f"[+] Built Phase 1 plugin: {output}")
-    return output.resolve()
+        header = find_system_qemu_plugin_header()
+    if header is None or not header.is_file():
+        raise PipelineError("Select the exact QEMU header with TF_QEMU_INCLUDE or --qemu-source")
+    output = project_root / "build" / "libtaintforge_ir.so"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["TF_QEMU_INCLUDE"] = str(header.parent)
+    command = ["bash", str(recipe), str(source), str(output)]
+    result = subprocess.run(command, cwd=project_root, env=env, text=True, capture_output=True, check=False)
+    (output.parent / "qemu_unpacker.build.log").write_text(result.stdout + result.stderr)
+    if result.returncode:
+        raise PipelineError("Canonical Phase 1 build failed; see build/qemu_unpacker.build.log")
+    Phase1Runtime.load(output)
+    return output
 
 
 def resolve_or_build_plugin(
@@ -455,10 +352,13 @@ def resolve_or_build_plugin(
 
     for candidate in candidates:
         if candidate.is_file():
+            Phase1Runtime.load(candidate)
             return candidate.resolve()
+    if explicit or os.environ.get("TAINTFORGE_QEMU_PLUGIN"):
+        raise PipelineError("Explicitly selected Phase 1 plugin does not exist; no fallback is permitted")
 
     if auto_build:
-        if find_system_qemu_plugin_header() is not None:
+        if not qemu_source_explicit and (os.environ.get("TF_QEMU_INCLUDE") or find_system_qemu_plugin_header() is not None):
             return build_phase1_plugin(
                 project_root=project_root,
                 qemu_source=None,
@@ -492,7 +392,7 @@ def resolve_qemu(explicit: str | None) -> str:
             return resolved
         raise PipelineError(f"QEMU executable not found: {explicit}")
 
-    for name in ("qemu-i386", "qemu-i386-static"):
+    for name in ("qemu-i386",):
         resolved = shutil.which(name)
         if resolved:
             return resolved
@@ -548,8 +448,23 @@ def run_phase1(
     output_root: Path,
     timeout_seconds: int,
     isolation: str,
+    flags_receipt: Path | None = None,
 ) -> CommandResult:
-    phase1_dir = output_root / "phase1"
+    phase1_dir = (output_root / "phase1").resolve()
+    runtime = Phase1Runtime.load(plugin)
+    qemu_identity = runtime.validate_qemu(Path(qemu))
+    identity = uuid.uuid4().hex
+    phase1_run = Phase1Run(runtime, f"pipeline-{identity}", f"attempt-000-{identity[:12]}",
+                           f"analysis-{identity}", phase1_dir,
+                           require_flags=flags_receipt is not None, flags_receipt=flags_receipt)
+    plugin_argument = phase1_run.plugin_argument()
+    atomic_write_json(phase1_dir / "run_binding.json", {
+        "schema_version": 1, "session_id": phase1_run.session_id, "attempt_id": phase1_run.attempt_id,
+        "analysis_instance_id": phase1_run.analysis_instance_id, "sample_sha256": sha256_file(sample),
+        "qemu": qemu_identity, "build_id": runtime.build_id, "plugin_sha256": runtime.plugin_sha256,
+        "runtime_manifest_sha256": runtime.manifest_sha256,
+        "x86_flags_receipt_sha256": sha256_file(flags_receipt) if flags_receipt is not None else None,
+    })
     timeout_program = require_program("timeout")
 
     qemu_command = [
@@ -559,7 +474,7 @@ def run_phase1(
         f"{timeout_seconds}s",
         qemu,
         "-plugin",
-        str(plugin),
+        plugin_argument,
         str(sample),
     ]
 
@@ -605,6 +520,17 @@ def run_phase1(
         stderr_path=output_root / "logs" / "phase1_stderr.log",
     )
 
+    try:
+        evidence = phase1_run.verify()
+    except Phase1RuntimeError as exc:
+        raise PipelineError(f"Phase 1 evidence rejected (QEMU exit {result.returncode}): {exc}") from exc
+    if sha256_file(Path(qemu)) != qemu_identity["sha256"]:
+        raise PipelineError("QEMU executable changed during Phase 1")
+    atomic_write_json(phase1_dir / "runtime_evidence.json", evidence)
+    if not evidence["runtime_observed"] or evidence["analysis_status"] == "unsupported":
+        raise PipelineError("Phase 1 did not complete a supported instrumented attempt")
+    if evidence["stream_status"] == "error":
+        raise PipelineError("Phase 1 reported an analysis or output error")
     raw_json = phase1_dir / "unpacked.json"
     raw_dump = phase1_dir / "unpacked.bin"
 
@@ -1324,7 +1250,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Compiled Phase 1 plugin (.so). If omitted or missing, the wrapper "
-            "tries to build build/qemu_unpacker.so automatically."
+            "builds build/libtaintforge_ir.so using the canonical recipe."
         ),
     )
     parser.add_argument(
@@ -1341,8 +1267,11 @@ def parse_args() -> argparse.Namespace:
         help="Do not build the Phase 1 plugin when no .so is found.",
     )
     parser.add_argument("--qemu", default=None, help="qemu-i386 executable or path")
+    parser.add_argument("--x86-flags-receipt", type=Path,
+                        help="EFLAGS probe receipt for this QEMU executable; checked by the plugin")
     parser.add_argument("--out", default=None, help="Pipeline output directory")
     parser.add_argument("--phase1-timeout", type=int, default=20)
+    parser.add_argument("--phase1-only", action="store_true", help="Validate Phase 1 and its artifacts, then finish before Phase 2")
     parser.add_argument("--phase2-timeout", type=int, default=60)
     parser.add_argument(
         "--network",
@@ -1422,6 +1351,7 @@ def main() -> int:
             auto_build=not args.no_auto_build_plugin,
         )
         qemu = resolve_qemu(args.qemu)
+        Phase1Runtime.load(plugin).validate_qemu(Path(qemu))
 
         output_root = (
             Path(args.out).expanduser().resolve()
@@ -1460,6 +1390,7 @@ def main() -> int:
             output_root=output_root,
             timeout_seconds=args.phase1_timeout,
             isolation=args.phase1_isolation,
+            flags_receipt=args.x86_flags_receipt.expanduser().resolve() if args.x86_flags_receipt else None,
         )
 
         raw_json_path = output_root / "phase1" / "unpacked.json"
@@ -1468,6 +1399,7 @@ def main() -> int:
 
         report["phase1"] = {
             "status": "completed",
+            "runtime_evidence": load_json_object(output_root / "phase1" / "runtime_evidence.json"),
             "returncode": phase1_result.returncode,
             "command": list(phase1_result.command),
             "stdout_log": relative_or_absolute(phase1_result.stdout_path, output_root),
@@ -1488,6 +1420,11 @@ def main() -> int:
             if isinstance(raw_phase1.get("network_dependencies"), list)
             else 0,
         }
+
+        if args.phase1_only:
+            report["status"] = "completed"
+            report["phase2"]["status"] = "not_requested"
+            return 0
 
         print("[+] Bridge: adapting Phase 1 JSON for current Phase 2")
         phase2_payload, adapter_audit = build_phase2_input(
@@ -1601,7 +1538,7 @@ def main() -> int:
         print(f"[+] Pipeline report: {output_root / 'pipeline_report.json'}")
         print(f"[+] Phase 2 report:   {phase2_report_json}")
 
-    except (PipelineError, OSError) as exc:
+    except (PipelineError, Phase1RuntimeError, OSError) as exc:
         report["status"] = "failed"
         report["error"] = str(exc)
         print(f"[-] Unified pipeline failed: {exc}", file=sys.stderr)

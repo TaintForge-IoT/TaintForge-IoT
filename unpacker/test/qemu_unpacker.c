@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "dta.h"
 #include "trace.h"
@@ -20,8 +21,11 @@
 #include "qemu_flags_contract.h"
 #include "qemu_plugin_compat.h"
 #include "elf_image.h"
+#include "phase1_io.h"
 
 static TfRuntimeDiag g_runtime_diag;
+static TfPhase1Io g_phase1;
+static void phase1_invalidate(uint64_t address, uint32_t generation, const char *reason);
 
 /* Opt-in diagnostic consumer. Existing DSE verdict/scoring is independent. */
 static IrRuntime g_ir_runtime;
@@ -113,7 +117,7 @@ static bool ir_plugin_u64(const char *text, uint64_t maximum, uint64_t *out) {
 
 static bool ir_plugin_options(int argc, char **argv) {
     IrRuntimeOptions options = ir_runtime_default_options();
-    const char *path = "ir_runtime.jsonl";
+    const char *path = g_phase1.enabled ? g_phase1.ir_path : "ir_runtime.jsonl";
     for (int i = 0; i < argc; ++i) {
         const char *arg = argv[i];
         if (strncmp(arg, "ir-", 3))
@@ -209,7 +213,7 @@ static bool ir_plugin_options(int argc, char **argv) {
                 goto invalid;
             g_trace_capacity = (uint32_t)n;
         } else if (IR_OPTION("ir-report")) {
-            if (!*value)
+            if (g_phase1.enabled || !*value)
                 goto invalid;
             path = value;
         } else
@@ -223,7 +227,7 @@ static bool ir_plugin_options(int argc, char **argv) {
     if (!ir_runtime_init(&g_ir_runtime, &options))
         return false;
     if (g_ir_enabled) {
-        g_ir_report = fopen(path, "w");
+        g_ir_report = fopen(path, g_phase1.enabled ? "wx" : "w");
         if (!g_ir_report) {
             fprintf(stderr, "[IR] cannot open report: %s\n", strerror(errno));
             return false;
@@ -279,7 +283,13 @@ typedef struct {
     bool target_tainted;
     bool has_prologue;
     bool jump_from_unmapped;
+    uint64_t observed_seq, candidate_id, epoch;
+    uint32_t code_generation;
+    bool stale;
 } oep_cand_t;
+
+static oep_cand_t *g_selected_candidate;
+static uint64_t g_candidate_count;
 
 typedef struct {
     uint64_t pc;
@@ -492,6 +502,8 @@ static void ir_plugin_check_impl(PluginVcpuState *state, unsigned int vcpu, uint
     if (!ir_runtime_report_json(g_ir_report, &report) || fflush(g_ir_report)) {
         fprintf(stderr, "[IR] report write failed; diagnostics disabled\n");
         g_ir_enabled = false;
+        g_phase1.storage_failed = true;
+        tf_phase1_event(&g_phase1, "error", "error", "ir_report_write_failed", NULL);
     }
     fprintf(stderr,
             "[IR-CHECK] %s seq=%" PRIu64 " %s lifted=%u/%u stop=%" PRIu64
@@ -1634,13 +1646,6 @@ static uint64_t addr_lib_base(uint64_t addr) {
     return 0;
 }
 
-static const char *base_name(const char *path) {
-    if (!path)
-        return NULL;
-    const char *s = strrchr(path, '/');
-    return s ? s + 1 : path;
-}
-
 static bool syscall_ret_is_error(int64_t ret) {
     if (is_i386) {
         const uint32_t raw_ret = (uint32_t)ret;
@@ -1777,7 +1782,11 @@ static void dse_init_reg_handles(void) {
 
 static void dse_vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
     (void)id;
-    __atomic_fetch_add(&g_ir_vcpus, 1U, __ATOMIC_RELEASE);
+    unsigned previous_vcpus = __atomic_fetch_add(&g_ir_vcpus, 1U, __ATOMIC_RELEASE);
+    if (g_phase1.enabled && (previous_vcpus != 0 || vcpu_index != 0)) {
+        tf_phase1_profile_lost(&g_phase1, "multiple_guest_threads");
+        return;
+    }
     if (!plugin_vcpu_state_get(vcpu_index)) {
         fprintf(stderr, "[DTA] failed to initialize vCPU state: vcpu=%u\n", vcpu_index);
         return;
@@ -1785,6 +1794,9 @@ static void dse_vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
     if (!g_regs_ready) {
         dse_init_reg_handles();
     }
+    tf_phase1_event(&g_phase1, "runtime_observation", g_regs_ready ? "observed" : "partial",
+                    g_regs_ready ? NULL : "register_set_unavailable",
+                    "{\"kind\":\"vcpu_initialized\"}");
 }
 
 static bool dse_read_reg(int rid, uint64_t *out) {
@@ -2170,6 +2182,8 @@ static bool dse_mem_access_value_u64(qemu_plugin_meminfo_t info, uint32_t size,
 
 static void dse_on_mem_impl(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
                             void *ud) {
+    if (!tf_phase1_active(&g_phase1))
+        return;
     PluginVcpuState *vcpu_state = plugin_vcpu_state_get(vcpu);
     if (!vcpu_state)
         return;
@@ -2511,6 +2525,9 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         gpointer key = (gpointer)(uintptr_t)addr;
         page_t *page = g_hash_table_lookup(pages, key);
         if (page) {
+            if (page->exec_seen || page->exec_after_write)
+                phase1_invalidate(addr, next_code_generation(), "executed_mapping_replaced");
+            page->exec_seen = false;
             page->prot = pending->prot;
         } else {
             page = g_new0(page_t, 1);
@@ -2615,6 +2632,8 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
 
         page_t *p = g_hash_table_lookup(pages, key);
         if (p) {
+            if (p->exec_seen || p->exec_after_write)
+                phase1_invalidate(page_addr, next_code_generation(), "executed_mapping_unmapped");
             g_hash_table_remove(pages, key);
             g_free(p->wbitmap);
             g_free(p);
@@ -2726,6 +2745,8 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
             uint32_t bit = offset + i;
             page->wbitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
         }
+        if (page->exec_seen || page->exec_after_write)
+            phase1_invalidate(page_addr, write_generation, "write_to_executed_code");
         page->written = true;
         page->write_count++;
         page->last_write = g_icount;
@@ -2741,6 +2762,8 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
 
 static void on_mem_write_impl(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr,
                               void *userdata) {
+    if (!tf_phase1_active(&g_phase1))
+        return;
     (void)vcpu_idx;
     (void)userdata;
     uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
@@ -2753,7 +2776,6 @@ static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint
     on_mem_write_impl(vcpu_idx, info, vaddr, userdata);
 }
 
-static bool bin_dumped = false;
 static GString *saved_reg = NULL;
 static uint64_t saved_base = 0;
 static bool saved_base_set = false;
@@ -2761,6 +2783,11 @@ static uint64_t saved_oep = 0;
 static double g_oep_confidence = 0.0;
 static GString *g_oep_scoring = NULL;
 static bool image_captured = false;
+static const char *g_capture_status = "not_attempted";
+static GString *g_capture_gaps;
+static uint64_t g_capture_bytes, g_capture_seq, g_capture_epoch, g_capture_pc;
+static uint32_t g_capture_generation;
+static bool g_report_written;
 static bool g_static_binary = false;
 
 //enhanced logic of choosing oep
@@ -2927,6 +2954,8 @@ static oep_cand_t *choose_oep_cand(void) {
     oep_cand_t *best = NULL;
     for (GList *l = oep_cands; l; l = l->next) {
         oep_cand_t *c = (oep_cand_t *)l->data;
+        if (c->stale)
+            continue;
         if (!best || cand_rank_better(c, best)) {
             best = c;
         }
@@ -3176,134 +3205,102 @@ static bool page_is_program(uint64_t addr, const page_t *p) {
 }
 
 static void do_dump_impl(uint64_t oep) {
-    GList *keys = g_hash_table_get_keys(pages);
-    keys = g_list_sort(keys, compare_keys);
-
+    (void)oep;
+    if (image_captured || g_phase1.profile_lost) {
+        if (g_phase1.profile_lost)
+            g_capture_status = "unsupported";
+        return;
+    }
+    TfAtomicFile output;
+    g_capture_status = "error";
+    if (!tf_atomic_open(&output, g_phase1.dump_path)) {
+        g_phase1.storage_failed = true;
+        tf_phase1_event(&g_phase1, "error", "error", "dump_open_failed", NULL);
+        return;
+    }
+    GList *keys = g_list_sort(g_hash_table_get_keys(pages), compare_keys);
     if (!g_main_known)
         fprintf(stderr, "[WINDOW] UNKNOWN: dump retains observed non-library pages\n");
-
     g_static_binary = (lib_deps == NULL);
-
-    if (!bin_dumped) {
-        FILE *f_bin = fopen("unpacked.bin", "wb");
-        if (f_bin) {
-            for (GList *k = keys; k; k = k->next) {
-                uint64_t addr = (uint64_t)(uintptr_t)k->data;
-                page_t *p = g_hash_table_lookup(pages, k->data);
-                if (!p)
-                    continue;
-                if (!page_is_program(addr, p))
-                    continue;
-                GByteArray *data = g_byte_array_new();
-                if (qemu_plugin_read_memory_vaddr(addr, data, page_size) && data->len > 0) {
-                    fwrite(data->data, 1, data->len, f_bin);
-                }
+    if (saved_reg)
+        g_string_free(saved_reg, TRUE);
+    if (g_capture_gaps)
+        g_string_free(g_capture_gaps, TRUE);
+    saved_reg = g_string_new("  \"regions\": [");
+    g_capture_gaps = g_string_new("[");
+    g_capture_bytes = 0;
+    saved_base_set = false;
+    bool first = true, first_gap = true, ok = true, partial = false;
+    g_capture_seq = g_phase1.trace_seq;
+    g_capture_epoch = g_phase1.epoch;
+    g_capture_pc = g_phase1.pc;
+    g_capture_generation = g_phase1.generation;
+    for (GList *k = keys; k; k = k->next) {
+        uint64_t address = (uint64_t)(uintptr_t)k->data;
+        page_t *page = g_hash_table_lookup(pages, k->data);
+        if (!page || !page_is_program(address, page))
+            continue;
+        GByteArray *data = g_byte_array_new();
+        const char *gap = NULL;
+        if (page_size > g_phase1.max_dump_bytes - g_capture_bytes) {
+            gap = "capture_budget_exhausted";
+        } else if (!qemu_plugin_read_memory_vaddr(address, data, page_size) || data->len == 0 ||
+                   data->len > page_size) {
+            gap = "memory_unavailable";
+        } else {
+            if (!tf_write_all(output.stream, data->data, data->len)) {
+                ok = false;
                 g_byte_array_free(data, TRUE);
+                break;
             }
-            fclose(f_bin);
-            bin_dumped = true;
-        }
-    }
-
-    if (!saved_reg) {
-        saved_reg = g_string_new(NULL);
-        g_string_append(saved_reg, "  \"regions\": [\n");
-        bool in_region = false;
-        bool first_region = true;
-        uint64_t main_off = 0;
-        uint64_t region_start = 0;
-        uint64_t region_size = 0;
-        int region_prot = 0;
-        const char *region_mod = NULL;
-        bool region_is_lib = false;
-        uint64_t region_off = 0;
-        char modbuf[512];
-
-        for (GList *k = keys; k; k = k->next) {
-            uint64_t addr = (uint64_t)(uintptr_t)k->data;
-            page_t *p = g_hash_table_lookup(pages, k->data);
-            if (!p)
-                continue;
-            if (!addr_in_lib(addr) && !page_is_program(addr, p))
-                continue;
-
-            GByteArray *data = g_byte_array_new();
-            size_t written = 0;
-            bool ok = qemu_plugin_read_memory_vaddr(addr, data, page_size);
-            if (ok && data->len > 0) {
-                written = data->len;
-            } else {
-                written = 0;
+            gchar *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, data->data, data->len);
+            g_string_append_printf(saved_reg,
+                                   "%s{\"addr\":\"0x%" PRIx64 "\",\"size\":%u,\"prot\":%d,"
+                                   "\"offset\":%" PRIu64
+                                   ",\"sha256\":\"%s\",\"code_generation\":%u,"
+                                   "\"lib\":false,\"module\":\"tracked_program\"}",
+                                   first ? "" : ",", address, data->len, page->prot,
+                                   g_capture_bytes, digest, page->gen_written);
+            g_free(digest);
+            first = false;
+            if (!saved_base_set) {
+                saved_base = address;
+                saved_base_set = true;
             }
-            g_byte_array_free(data, TRUE);
-            if (written == 0)
-                continue;
-
-            const char *mod = addr_lib_path(addr);
-            bool is_lib = (mod != NULL);
-            if (in_region && addr == region_start + region_size && p->prot == region_prot &&
-                mod == region_mod) {
-                region_size += written;
-            } else {
-                if (in_region) {
-                    if (!first_region)
-                        g_string_append(saved_reg, ",\n");
-                    first_region = false;
-                    if (region_mod) {
-                        snprintf(modbuf, sizeof modbuf, "\"%s\"", base_name(region_mod));
-                    } else if (g_static_binary) {
-                        snprintf(modbuf, sizeof modbuf, "\"static\"");
-                    } else if (g_main_known && region_start >= g_main_lo &&
-                               region_start < g_main_hi) {
-                        snprintf(modbuf, sizeof modbuf, "\"main\"");
-                    } else {
-                        snprintf(modbuf, sizeof modbuf, "null");
-                    }
-                    g_string_append_printf(
-                        saved_reg,
-                        "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu, \"lib\": %s, \"module\": %s}",
-                        region_start, region_size, region_prot, region_off,
-                        region_is_lib ? "true" : "false", modbuf);
-                }
-                region_start = addr;
-                region_size = written;
-                region_prot = p->prot;
-                region_mod = mod;
-                region_is_lib = is_lib;
-                region_off = main_off;
-                if (!is_lib && !saved_base_set) {
-                    saved_base = region_start;
-                    saved_base_set = true;
-                }
-                in_region = true;
-            }
-            if (!is_lib) {
-                main_off += written;
+            g_capture_bytes += data->len;
+            if (data->len < page_size) {
+                address += data->len;
+                gap = "short_memory_read";
             }
         }
-        if (in_region) {
-            if (!first_region)
-                g_string_append(saved_reg, ",\n");
-            if (region_mod) {
-                snprintf(modbuf, sizeof modbuf, "\"%s\"", base_name(region_mod));
-            } else if (g_static_binary) {
-                snprintf(modbuf, sizeof modbuf, "\"static\"");
-            } else if (g_main_known && region_start >= g_main_lo && region_start < g_main_hi) {
-                snprintf(modbuf, sizeof modbuf, "\"main\"");
-            } else {
-                snprintf(modbuf, sizeof modbuf, "null");
-            }
+        if (gap) {
+            partial = true;
             g_string_append_printf(
-                saved_reg,
-                "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu, \"lib\": %s, \"module\": %s}\n",
-                region_start, region_size, region_prot, region_off,
-                region_is_lib ? "true" : "false", modbuf);
+                g_capture_gaps, "%s{\"addr\":\"0x%" PRIx64 "\",\"size\":%zu,\"reason\":\"%s\"}",
+                first_gap ? "" : ",", address,
+                !strcmp(gap, "short_memory_read") ? page_size - data->len : page_size, gap);
+            first_gap = false;
         }
-        g_string_append(saved_reg, "  ],\n");
+        g_byte_array_free(data, TRUE);
     }
     g_list_free(keys);
+    g_string_append(saved_reg, "],\n");
+    g_string_append(g_capture_gaps, "]");
+    if (!ok || !g_capture_bytes) {
+        tf_atomic_abort(&output);
+        if (!ok)
+            g_phase1.storage_failed = true;
+        tf_phase1_event(&g_phase1, "error", "error", ok ? "empty_capture" : "dump_write_failed",
+                        NULL);
+        return;
+    }
+    if (!tf_atomic_commit(&output)) {
+        g_phase1.storage_failed = true;
+        tf_phase1_event(&g_phase1, "error", "error", "dump_commit_failed", NULL);
+        return;
+    }
     image_captured = true;
-    fprintf(stderr, "[DUMP] unpacked.bin captured (oep=0x%lx)\n", (unsigned long)oep);
+    g_capture_status = partial ? "partial" : "success";
 }
 
 static void do_dump(uint64_t oep) {
@@ -3315,18 +3312,39 @@ static void write_report(void) {
     if (!image_captured)
         do_dump(saved_oep);
 
-    FILE *f_json = fopen("unpacked.json", "w");
-    if (!f_json)
+    TfAtomicFile output;
+    if (!tf_atomic_open(&output, g_phase1.report_path)) {
+        g_phase1.storage_failed = true;
+        tf_phase1_event(&g_phase1, "error", "error", "report_open_failed", NULL);
         return;
+    }
+    FILE *f_json = output.stream;
 
-    fprintf(f_json, "{\n");
+    fprintf(f_json,
+            "{\n  \"schema_version\":1,\n  \"byte_order\":\"little\",\n"
+            "  \"string_policy\":\"utf8_or_null_with_bytes_base64\",\n"
+            "  \"capture_status\":\"%s\",\n"
+            "  \"capture_scope\":\"tracked_program_pages\",\n"
+            "  \"checkpoint_id\":null,\n  \"process_snapshot\":false,\n"
+            "  \"capture_consistency\":\"best_effort_no_backend_safepoint\",\n"
+            "  \"capture_trace_seq\":%" PRIu64 ",\n  \"capture_pc\":%" PRIu64 ",\n"
+            "  \"capture_epoch\":%" PRIu64 ",\n  \"capture_generation\":%u,\n"
+            "  \"capture_gaps\":%s,\n",
+            g_capture_status, g_capture_seq, g_capture_pc, g_capture_epoch, g_capture_generation,
+            g_capture_gaps ? g_capture_gaps->str : "[]");
+    if (g_phase1.enabled)
+        fprintf(f_json,
+                "  \"session_id\":\"%s\",\n  \"attempt_id\":\"%s\",\n"
+                "  \"analysis_instance_id\":\"%s\",\n"
+                "  \"capture_id\":\"%s:capture-1\",\n",
+                g_phase1.session, g_phase1.attempt, g_phase1.instance, g_phase1.instance);
     fprintf(f_json, "  \"oep\": \"0x%lx\",\n", saved_oep);
     fprintf(f_json, "  \"arch\": \"x86\",\n");
     fprintf(f_json, "  \"oep_confidence\": %.4f,\n", g_oep_confidence);
     if (g_oep_scoring)
         fprintf(f_json, "%s", g_oep_scoring->str);
     fprintf(f_json, "  \"base\": \"0x%lx\",\n", saved_base);
-    fprintf(f_json, "%s", saved_reg ? saved_reg->str : "  \"regions\": [],\n");
+    fprintf(f_json, "%s", image_captured && saved_reg ? saved_reg->str : "  \"regions\": [],\n");
 
     // files
     fprintf(f_json, "  \"file_dependencies\": [");
@@ -3337,8 +3355,9 @@ static void write_report(void) {
             continue;
         if (!first)
             fprintf(f_json, ",\n");
-        fprintf(f_json, "    {\"path\": \"%s\", \"write\": %s}", f->path,
-                f->write ? "true" : "false");
+        char *path_field = tf_json_bytes_field("path", f->path);
+        fprintf(f_json, "    {%s, \"write\": %s}", path_field, f->write ? "true" : "false");
+        g_free(path_field);
         first = false;
     }
     fprintf(f_json, "],\n");
@@ -3358,8 +3377,9 @@ static void write_report(void) {
         }
         if (!first)
             fprintf(f_json, ", ");
-        fprintf(f_json, "{\"path\": \"%s\", \"base\": \"0x%lx\", \"size\": %lu}", lm->path,
-                lm->base, span);
+        char *path_field = tf_json_bytes_field("path", lm->path);
+        fprintf(f_json, "{%s, \"base\": \"0x%lx\", \"size\": %lu}", path_field, lm->base, span);
+        g_free(path_field);
         first = false;
     }
     fprintf(f_json, "],\n");
@@ -3375,11 +3395,12 @@ static void write_report(void) {
             continue;
         if (!first)
             fprintf(f_json, ", ");
-        fprintf(
-            f_json,
-            "{\"got_slot\": \"0x%lx\", \"resolved_addr\": \"0x%lx\", \"module\": \"%s\", \"offset\": \"0x%lx\"}",
-            (unsigned long)ri->got_slot, (unsigned long)ri->resolved_addr, ri->module,
-            (unsigned long)(ri->resolved_addr - ri->lib_base));
+        char *module_field = tf_json_bytes_field("module", ri->module);
+        fprintf(f_json,
+                "{\"got_slot\":\"0x%lx\",\"resolved_addr\":\"0x%lx\",%s,\"offset\":\"0x%lx\"}",
+                (unsigned long)ri->got_slot, (unsigned long)ri->resolved_addr, module_field,
+                (unsigned long)(ri->resolved_addr - ri->lib_base));
+        g_free(module_field);
         first = false;
     }
     fprintf(f_json, "],\n");
@@ -3417,8 +3438,11 @@ static void write_report(void) {
     }
     fprintf(f_json, "\n  ]\n}\n");
 
-    fclose(f_json);
-    fprintf(stderr, "[DUMP] unpacked.json complete\n");
+    g_report_written = tf_atomic_commit(&output);
+    if (!g_report_written) {
+        g_phase1.storage_failed = true;
+        tf_phase1_event(&g_phase1, "error", "error", "report_commit_failed", NULL);
+    }
 }
 
 //collect top-3 candidates by weighted score
@@ -3497,20 +3521,116 @@ static void build_oep_scoring(oep_cand_t *chosen) {
             candidate->dse.replay_checks, candidate->dse.replay_failures,
             candidate->dse.replay_missing_bindings);
         dse_replay_diagnostic_append_json(g_oep_scoring, &candidate->dse.first_replay_mismatch);
-        g_string_append_printf(g_oep_scoring, "}%s\n", (i + 1 < top_count) ? "," : "");
+        g_string_append_printf(
+            g_oep_scoring,
+            ",\"candidate_id\":%" PRIu64 ",\"observed_trace_seq\":%" PRIu64 ","
+            "\"code_generation\":%u,\"analysis_epoch\":%" PRIu64 ","
+            "\"stale\":%s,\"selected\":%s}%s\n",
+            candidate->candidate_id, candidate->observed_seq, candidate->code_generation,
+            candidate->epoch, candidate->stale ? "true" : "false",
+            candidate == chosen ? "true" : "false", i + 1 < top_count ? "," : "");
     }
 
     g_string_append(g_oep_scoring, "  ],\n");
     g_free(candidates);
 }
 
-static oep_cand_t *find_oep_cand(uint64_t addr) {
-    for (GList *l = oep_cands; l; l = l->next) {
-        oep_cand_t *candidate = (oep_cand_t *)l->data;
-        if (candidate->addr == addr)
-            return candidate;
+static void phase1_candidate_event(const char *event, oep_cand_t *candidate, bool retrospective) {
+    char *payload = g_strdup_printf(
+        "{\"candidate_id\":%" PRIu64 ",\"address\":%" PRIu64 ","
+        "\"observed_trace_seq\":%" PRIu64 ",\"observed_icount\":%" PRIu64 ","
+        "\"observed_code_generation\":%u,\"observed_epoch\":%" PRIu64 ","
+        "\"decision_trace_seq\":%" PRIu64 ",\"retrospective\":%s,"
+        "\"checkpoint_id\":null,\"confidence\":%.6f,\"confidence_kind\":\"heuristic\","
+        "\"dse_verdict\":\"%s\",\"dse_reason\":\"%s\",\"oep_proven\":false}",
+        candidate->candidate_id, candidate->addr, candidate->observed_seq, candidate->icount,
+        candidate->code_generation, candidate->epoch, g_phase1.trace_seq,
+        retrospective ? "true" : "false", cand_confidence(candidate),
+        dse_verdict_name(candidate->dse.verdict), dse_verify_reason_name(candidate->dse.reason));
+    tf_phase1_event(&g_phase1, event, candidate->stale ? "stale" : "candidate",
+                    candidate->dse.verdict == DSE_VERDICT_UNKNOWN ? "dse_incomplete" : NULL,
+                    payload);
+    g_free(payload);
+}
+
+static void phase1_invalidate(uint64_t address, uint32_t generation, const char *reason) {
+    bool changed = false;
+    for (GList *entry = oep_cands; entry; entry = entry->next) {
+        oep_cand_t *candidate = entry->data;
+        /* A write to already executed code starts a new analysis epoch. Old
+         * candidates stay in evidence but cannot be selected as current. */
+        if (!candidate->stale) {
+            candidate->stale = true;
+            changed = true;
+            phase1_candidate_event("oep_candidate_invalidated", candidate, false);
+        }
     }
-    return NULL;
+    if (!changed)
+        return;
+    ++g_phase1.epoch;
+    g_selected_candidate = NULL;
+    oep_found = false;
+    oep_addr = 0;
+    char *payload =
+        g_strdup_printf("{\"address\":%" PRIu64 ",\"new_generation\":%u}", address, generation);
+    tf_phase1_event(&g_phase1, "code_generation_changed", "observed", reason, payload);
+    g_free(payload);
+}
+
+static void phase1_publish_manifest(void) {
+    if (!g_phase1.enabled)
+        return;
+    if (image_captured && g_report_written && !g_phase1.storage_failed)
+        tf_phase1_event(&g_phase1, "export_ready", g_capture_status, "not_a_process_checkpoint",
+                        "{\"scope\":\"tracked_program_pages\",\"checkpoint_id\":null}");
+    tf_phase1_finish(&g_phase1, g_capture_status);
+    if (g_phase1.storage_failed || !g_report_written)
+        return;
+    TfAtomicFile manifest;
+    if (!tf_atomic_open(&manifest, g_phase1.manifest_path)) {
+        g_phase1.storage_failed = true;
+        return;
+    }
+    FILE *f = manifest.stream;
+    fprintf(f,
+            "{\"schema_version\":1,\"session_id\":\"%s\",\"attempt_id\":\"%s\","
+            "\"analysis_instance_id\":\"%s\",\"capture_id\":\"%s:capture-1\","
+            "\"checkpoint_id\":null,\"capture_status\":\"%s\",\"storage_status\":\"ok\","
+            "\"analysis_status\":\"%s\",\"event_count\":%" PRIu64 ","
+            "\"control_channel_protection\":\"unverified\",\"artifacts\":{",
+            g_phase1.session, g_phase1.attempt, g_phase1.instance, g_phase1.instance,
+            g_capture_status,
+            g_phase1.profile_lost                                     ? "unsupported"
+            : g_phase1.dropped_events || g_phase1.analysis_incomplete ? "partial"
+                                                                      : "observed",
+            g_phase1.event_seq);
+    const char *names[] = {"dump", "report", "events", "ir"};
+    const char *paths[] = {image_captured ? g_phase1.dump_path : NULL, g_phase1.report_path,
+                           g_phase1.events_path, g_phase1.ir_path};
+    bool ok = true;
+    for (unsigned i = 0; i < 4; ++i) {
+        fprintf(f, "%s\"%s\":", i ? "," : "", names[i]);
+        if (!paths[i] || (i == 3 && access(paths[i], F_OK))) {
+            fputs("null", f);
+            continue;
+        }
+        char digest[65];
+        uint64_t size;
+        if (!tf_file_digest(paths[i], digest, &size)) {
+            ok = false;
+            break;
+        }
+        char *path = tf_json_string(paths[i]);
+        fprintf(f, "{\"path\":%s,\"size\":%" PRIu64 ",\"sha256\":\"%s\"}", path, size, digest);
+        g_free(path);
+    }
+    fputs("}}\n", f);
+    if (ok)
+        ok = tf_atomic_commit(&manifest);
+    else
+        tf_atomic_abort(&manifest);
+    if (!ok)
+        g_phase1.storage_failed = true;
 }
 
 static void archive_pending_trace_occurrences_impl(void) {
@@ -3539,6 +3659,8 @@ static void archive_pending_trace_occurrences(void) {
 }
 
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
+    if (g_phase1.enabled && getpid() != g_phase1.owner)
+        return;
     (void)id;
     (void)udata;
     TfRuntimeScope shutdown_scope = tf_runtime_scope_begin(&g_runtime_diag, TF_PHASE_SHUTDOWN);
@@ -3546,9 +3668,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     dta_shadow_report(g_shadow);
     if (g_ir_report) {
         if (!ir_runtime_summary_json(g_ir_report, &g_ir_runtime))
-            fprintf(stderr, "[IR] summary write failed\n");
+            g_phase1.storage_failed = true;
+        if (fflush(g_ir_report) || fsync(fileno(g_ir_report)))
+            g_phase1.storage_failed = true;
         if (fclose(g_ir_report))
-            fprintf(stderr, "[IR] report close failed\n");
+            g_phase1.storage_failed = true;
         g_ir_report = NULL;
     }
     if (g_trace) {
@@ -3560,17 +3684,40 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
                 trace_occurrence_archive_dropped(g_trace),
                 trace_occurrence_archive_is_complete(g_trace) ? "yes" : "no");
     }
+    if (g_phase1.enabled) {
+        ShadowStats shadow_stats = {0};
+        bool shadow_known =
+            shadow_get_stats(g_shadow, &shadow_stats) && shadow_stats.knowledge_valid;
+        uint64_t dropped = g_trace ? trace_occurrence_archive_dropped(g_trace) : 0;
+        uint64_t incomplete = g_trace ? trace_occurrence_archive_incomplete(g_trace) : 0;
+        if (dropped || incomplete || !shadow_known || !g_x86_flags_verified)
+            g_phase1.analysis_incomplete = true;
+        char *summary = g_strdup_printf(
+            "{\"trace_dropped\":%" PRIu64 ",\"trace_incomplete\":%" PRIu64 ","
+            "\"shadow_knowledge_valid\":%s,\"flags_verified\":%s,"
+            "\"ir_matches\":%u,\"ir_mismatches\":%u,\"ir_unknown\":%u,"
+            "\"ir_errors\":%u,\"ir_skipped_budget\":%" PRIu64 "}",
+            dropped, incomplete, shadow_known ? "true" : "false",
+            g_x86_flags_verified ? "true" : "false", g_ir_runtime.matches, g_ir_runtime.mismatches,
+            g_ir_runtime.unknown, g_ir_runtime.errors, g_ir_runtime.skipped_budget);
+        tf_phase1_event(&g_phase1, "analysis_summary",
+                        g_phase1.analysis_incomplete ? "partial" : "observed",
+                        g_phase1.analysis_incomplete ? "analysis_incomplete" : NULL, summary);
+        g_free(summary);
+    }
     //oep choose
     oep_cand_t *chosen = NULL;
     if (oep_found) {
-        chosen = find_oep_cand(oep_addr);
+        chosen = g_selected_candidate;
     }
 
-    if (!oep_found && oep_cands) {
+    if (!g_phase1.profile_lost && !oep_found && oep_cands) {
         chosen = choose_oep_cand();
         if (chosen) {
             oep_addr = chosen->addr;
             oep_found = true;
+            g_selected_candidate = chosen;
+            phase1_candidate_event("oep_candidate_selected", chosen, true);
         }
     }
     if (oep_cands) {
@@ -3580,6 +3727,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     //write json-report
     saved_oep = oep_addr;
     write_report();
+    phase1_publish_manifest();
     //memory free
     for (GList *l = file_deps; l; l = l->next) {
         file_dep_t *f = (file_dep_t *)l->data;
@@ -3672,6 +3820,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
         if (!tf_runtime_profile_json(stderr, &g_runtime_diag))
             fprintf(stderr, "[RUNTIME] profile write failed\n");
     }
+    if (g_capture_gaps) {
+        g_string_free(g_capture_gaps, TRUE);
+        g_capture_gaps = NULL;
+    }
+    tf_phase1_destroy(&g_phase1);
 }
 
 static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
@@ -3696,6 +3849,8 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
 }
 
 static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
+    if (!tf_phase1_active(&g_phase1))
+        return;
     const InsnExecCtx *exec_ctx = (const InsnExecCtx *)udata;
     if (!exec_ctx)
         return;
@@ -3834,6 +3989,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
             vcpu_state->current_aux_seq_id = 0;
         }
     }
+    g_phase1.trace_seq = current_trace_seq_id;
+    g_phase1.pc = vaddr;
+    g_phase1.generation = dcfg_code_generation_for_pc(vaddr);
+    g_phase1.vcpu = cpu_index;
+    if (g_icount == 1)
+        tf_phase1_event(&g_phase1, "runtime_observation", "observed", NULL,
+                        "{\"kind\":\"instruction_callback\",\"instruction_phase\":\"before\"}");
     if (g_ir_enabled) {
         if (g_ir_has_start && vaddr == g_ir_start_pc)
             vcpu_state->ir_start_seq = current_trace_seq_id;
@@ -3864,11 +4026,14 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
     }
 
-    bool new_layer =
-        now_unpacked && !oep_found && cur_pg && !cur_pg->exec_seen && prev_jump_matches;
+    bool new_layer = now_unpacked && cur_pg && !cur_pg->exec_seen && prev_jump_matches;
     if (cur_pg)
         cur_pg->exec_seen = true;
 
+    if (new_layer && g_candidate_count >= g_phase1.max_candidates) {
+        tf_phase1_profile_lost(&g_phase1, "candidate_budget_exhausted");
+        return;
+    }
     if (new_layer) {
         oep_cand_t *candidate = g_new0(oep_cand_t, 1);
         candidate->addr = vaddr;
@@ -3886,6 +4051,10 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         }
         candidate->generation = g_layer;
         candidate->icount = g_icount;
+        candidate->candidate_id = ++g_candidate_count;
+        candidate->observed_seq = current_trace_seq_id;
+        candidate->code_generation = cur_pg->gen_written;
+        candidate->epoch = g_phase1.epoch;
         candidate->target_tainted = prev_target_tainted;
         ir_plugin_check(vcpu_state, cpu_index, prev_jump_seq_id, IR_RUNTIME_CANDIDATE, vaddr,
                         prev_target_reg);
@@ -3895,6 +4064,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->dse.candidate_query = DSE_SOLVER_NOT_RUN;
         candidate->dse.alternative_query = DSE_SOLVER_NOT_RUN;
 
+        phase1_candidate_event("oep_candidate_observed", candidate, false);
         if (prev_jump_matches) {
             TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_DSE);
             DseRelevanceContext relevance_context = {
@@ -3947,6 +4117,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                     (unsigned long)candidate->addr, prev_jump_seq_id, diagnostic->str);
             g_string_free(diagnostic, TRUE);
         }
+        phase1_candidate_event("oep_candidate_evaluated", candidate, false);
         oep_cands = g_list_append(oep_cands, candidate);
         g_layer_has_cand = true;
         g_last_cand_icount = g_icount;
@@ -3961,14 +4132,17 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     prev_target_tainted = false;
     //if we are too long in unpacked code without proceeding further - we end the cycle
     if (now_unpacked && !oep_found && g_last_cand_icount &&
-        (g_icount - g_last_cand_icount) > 200000) {
+        (g_icount - g_last_cand_icount) > g_phase1.selection_delay) {
         oep_cand_t *chosen = choose_oep_cand();
         if (chosen) {
             oep_addr = chosen->addr;
             oep_found = true;
             fprintf(stderr, "[OEP-FINAL gen=%u] 0x%lx\n", chosen->generation,
                     (unsigned long)chosen->addr);
-            do_dump(oep_addr);
+            g_selected_candidate = chosen;
+            phase1_candidate_event("oep_candidate_selected", chosen, true);
+            /* Memory capture is independently timestamped at finalization;
+             * selection never rewinds the guest to the observed OEP. */
         }
     }
     {
@@ -3981,7 +4155,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         }
         (void)dta_apply_reg_transfer(regs, meta);
     }
-    bool track_indirect = meta->is_indirect_branch && !oep_found;
+    bool track_indirect = meta->is_indirect_branch;
     if (track_indirect) { //indirect check
         bool target_resolved = false;
         bool target_tainted = false;
@@ -4132,6 +4306,13 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
     (void)vcpu_idx;
     (void)a7;
     (void)a8;
+    if (!tf_phase1_active(&g_phase1))
+        return;
+    if (g_phase1.enabled && is_i386 &&
+        (num == 2 || num == 11 || num == 120 || num == 190 || num == 358 || num == 435)) {
+        tf_phase1_profile_lost(&g_phase1, "process_or_thread_transition_requested");
+        return;
+    }
     pending_input_reset();
     pending_open_reset();
     pending_fd_reset();
@@ -4519,6 +4700,8 @@ static void vcpu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 }
 
 static void vcpu_tb_trans_impl(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+    if (!tf_phase1_active(&g_phase1))
+        return;
     (void)id;
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
     for (size_t i = 0; i < n_insns; i++) {
@@ -4566,6 +4749,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 
 static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num,
                                   int64_t ret) {
+    if (!tf_phase1_active(&g_phase1))
+        return;
     (void)id;
     (void)vcpu_idx;
     const bool syscall_failed = syscall_ret_is_error(ret);
@@ -4728,6 +4913,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             tf_runtime_log_name(g_runtime_diag.options.log),
             g_runtime_diag.options.profile ? "on" : "off",
             g_runtime_diag.options.progress_interval);
+    if (!tf_phase1_configure(&g_phase1, argc, argv)) {
+        tf_phase1_destroy(&g_phase1);
+        return -1;
+    }
     if (!info || !info->target_name) {
         fprintf(stderr, "[PLUGIN] missing target information\n");
         return -1;
@@ -4744,6 +4933,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     g_clear_pointer(&g_main_image_path, g_free);
 
     const char *target = info->target_name;
+    if (g_phase1.enabled && (strcmp(target, "i386") || info->system_emulation)) {
+        tf_phase1_start(&g_phase1, target, info->system_emulation, QEMU_PLUGIN_VERSION, false,
+                        false);
+        goto fail;
+    }
     current_arch = ARCH_UNKNOWN;
     is_i386 = false;
     if (strstr(target, "i386")) {
@@ -4759,6 +4953,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     }
 
     fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
+    if (g_phase1.enabled && (!is_i386 || info->system_emulation)) {
+        tf_phase1_start(&g_phase1, target, info->system_emulation, QEMU_PLUGIN_VERSION, false,
+                        false);
+        goto fail;
+    }
     if (!dta_shadow_options(argc, argv) || !ir_plugin_options(argc, argv))
         goto fail;
     if (g_ir_enabled && (!is_i386 || info->system_emulation)) {
@@ -4782,6 +4981,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         fprintf(stderr, "[REG] x86 flag observation contract: %s\n",
                 g_x86_flags_verified ? "verified" : "unverified; EFLAGS unavailable to DSE/REP/IR");
     }
+    if (!tf_phase1_start(&g_phase1, target, info->system_emulation, QEMU_PLUGIN_VERSION,
+                         g_x86_flags_verified, g_ir_enabled))
+        goto fail;
     if (!provenance_runtime_init(32)) {
         fprintf(stderr, "[PLUGIN] provenance runtime init failed\n");
         goto fail;
@@ -4856,6 +5058,9 @@ fail:
         fclose(g_ir_report);
         g_ir_report = NULL;
     }
+    tf_phase1_event(&g_phase1, "error", "error", "plugin_install_failed", NULL);
+    tf_phase1_finish(&g_phase1, "not_attempted");
+    tf_phase1_destroy(&g_phase1);
     plugin_install_cleanup(capstone_initialized, metadata_initialized);
 
     return -1;
