@@ -152,7 +152,3 @@ Destinations must be explicitly allowed. DNS replies do not expand the policy.
   channel, and state reset for fuzzing are still planned. `memory_isolation`
   remains `not_implemented` and `fuzzing_ready` remains `false`. Selecting an OEP
   candidate does not establish a proven starting point for fuzzing.
-
-More details: [unified runner](docs/UNIFIED_PIPELINE_V1.md),
-[Phase 1 contract](docs/PHASE1_RUNTIME_V1.md),
-[networking and capture format](docs/NETWORK_DNS_UDP_V1.md).
