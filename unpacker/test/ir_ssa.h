@@ -58,6 +58,30 @@ IrTraceSsaOptions ir_trace_ssa_default_options(void);
  * outputs remain allowed. Existing evaluators and analyses become stale. */
 IrTraceSsaResult ir_trace_ssa(IrModule *module, const IrTraceSsaOptions *options);
 
+typedef struct {
+    IrAnalysisLimits limits;
+    IrBlockId boundary; /* Must be the final FRAGMENT_END of this trace. */
+    const IrValueId *values;
+    uint32_t value_count;
+} IrTargetSliceOptions;
+typedef struct {
+    IrAnalysisInfo analysis;
+    uint32_t records, active_before, active_after, removed, removed_writes;
+    uint32_t outputs_before, outputs_after, guards, barriers, conditions, indirect_targets;
+    size_t retained_bytes;
+} IrTargetSliceInfo;
+/* Owned clone for target relations only. Requires trace SSA and explicit roots.
+ * Keeps all GUARD/BARRIER effects, every condition/indirect target and their
+ * complete transitive operands, including functional memory STORE chains.
+ * Does NOT promise exit-state or replay-observation equivalence. Use the
+ * untouched original for baseline and SAT-witness replay. It never substitutes
+ * observed values, drops path predicates or invents control continuations.
+ * Stable IDs imply dense arrays/tombstones remain allocated: this reduces
+ * active solver translation, not the earlier IR construction limit.
+ * Failure is transactional; source and its revision/status remain unchanged. */
+IrModule *ir_trace_target_slice(const IrModule *module, const IrTargetSliceOptions *options,
+                                 IrTargetSliceInfo *info);
+
 typedef enum {
     IR_USE_INSTRUCTION,
     IR_USE_CONDITION,

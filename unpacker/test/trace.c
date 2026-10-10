@@ -23,6 +23,7 @@ typedef struct {
 
 struct TraceDescriptorStore {
     GHashTable *by_key;
+    GHashTable *by_location; /* Borrowed keys/values; NULL value marks conflicting bytes. */
     GPtrArray *by_id;
     GMutex lock;
     bool lock_initialized;
@@ -217,13 +218,29 @@ static gboolean insn_desc_key_equal(gconstpointer left_opaque, gconstpointer rig
            memcmp(left->bytes, right->bytes, left->size) == 0;
 }
 
+static guint insn_desc_location_hash(gconstpointer opaque) {
+    const InsnDescKey *key = opaque;
+    uint64_t mixed = key->pc ^ ((uint64_t)key->code_generation << 32) ^
+                     ((uint64_t)key->arch << 16) ^ (uint32_t)key->mode;
+    return (guint)(mixed ^ (mixed >> 32));
+}
+
+static gboolean insn_desc_location_equal(gconstpointer a, gconstpointer b) {
+    const InsnDescKey *left = a, *right = b;
+    return left->pc == right->pc && left->code_generation == right->code_generation &&
+           left->arch == right->arch && left->mode == right->mode;
+}
+
 static struct TraceDescriptorStore *trace_descriptor_store_create(void) {
     struct TraceDescriptorStore *store = g_try_new0(struct TraceDescriptorStore, 1);
     if (!store)
         return NULL;
     store->by_key = g_hash_table_new_full(insn_desc_key_hash, insn_desc_key_equal, g_free, NULL);
+    store->by_location = g_hash_table_new(insn_desc_location_hash, insn_desc_location_equal);
     store->by_id = g_ptr_array_new_with_free_func(g_free);
-    if (!store->by_key || !store->by_id) {
+    if (!store->by_key || !store->by_location || !store->by_id) {
+        if (store->by_location)
+            g_hash_table_destroy(store->by_location);
         if (store->by_key) {
             g_hash_table_destroy(store->by_key);
         }
@@ -244,6 +261,8 @@ static void trace_descriptor_store_destroy(struct TraceDescriptorStore *store) {
     if (store->lock_initialized) {
         g_mutex_lock(&store->lock);
     }
+    if (store->by_location)
+        g_hash_table_destroy(store->by_location);
     if (store->by_key) {
         g_hash_table_destroy(store->by_key);
         store->by_key = NULL;
@@ -352,12 +371,16 @@ bool trace_effect_summary_from_meta(const InsnMeta *meta, EffectSummary *out) {
     }
 
     out->special_defs = trace_x86_special_mask(meta->flags_write_mask);
-    if (meta->family == DTA_FAMILY_STRING) {
+    if (meta->family == DTA_FAMILY_STRING || insn_meta_is_plain_scasd(meta)) {
         out->special_address_uses |= trace_special_state_bit(X86_SPECIAL_STATE_DF);
     }
-    if (meta->insn_id == X86_INS_CLD || meta->insn_id == X86_INS_STD) {
+    if (meta->writes_df) {
         out->special_defs |= trace_special_state_bit(X86_SPECIAL_STATE_DF);
     }
+    if (insn_meta_is_plain_scasd(meta))
+        out->special_address_uses |= trace_special_state_bit(X86_SPECIAL_STATE_ES);
+    if (meta->writes_es)
+        out->special_defs |= trace_special_state_bit(X86_SPECIAL_STATE_ES);
     if (meta->is_indirect_branch && meta->branch_target_reg >= 0 && meta->branch_target_reg < 64) {
         out->register_control_uses |= UINT64_C(1) << meta->branch_target_reg;
     }
@@ -426,6 +449,7 @@ InsnDescId trace_insn_desc_intern(TraceBuffer *tb, TraceArchKind arch, TraceArch
     }
     *stored_key = lookup;
     desc->desc_id = (InsnDescId)store->by_id->len + 1U;
+    desc->available_seq = tb->next_seq_id;
     desc->arch = arch;
     desc->mode = mode;
     desc->pc = pc;
@@ -445,6 +469,8 @@ InsnDescId trace_insn_desc_intern(TraceBuffer *tb, TraceArchKind arch, TraceArch
         (void)trace_effect_summary_from_meta(NULL, &desc->effects);
     }
     g_ptr_array_add(store->by_id, desc);
+    bool conflict = g_hash_table_contains(store->by_location, stored_key);
+    g_hash_table_insert(store->by_location, stored_key, conflict ? NULL : desc);
     g_hash_table_insert(store->by_key, stored_key, desc);
     g_mutex_unlock(&store->lock);
     return desc->desc_id;
@@ -461,6 +487,30 @@ const InsnDesc *trace_insn_desc_get(const TraceBuffer *tb, InsnDescId desc_id) {
     if (store->by_id && index < store->by_id->len) {
         result = g_ptr_array_index(store->by_id, (guint)index);
     }
+    g_mutex_unlock(&store->lock);
+    return result;
+}
+
+TraceDescLookup trace_insn_desc_find(const TraceBuffer *tb, TraceArchKind arch, TraceArchMode mode,
+                                     uint64_t pc, uint32_t generation, uint64_t before_seq,
+                                     const InsnDesc **out) {
+    if (out)
+        *out = NULL;
+    if (!tb || !tb->descriptor_store || !out)
+        return TRACE_DESC_ABSENT;
+    InsnDescKey key = {.arch = arch, .mode = mode, .pc = pc, .code_generation = generation};
+    struct TraceDescriptorStore *store = tb->descriptor_store;
+    g_mutex_lock(&store->lock);
+    gpointer value = NULL;
+    bool found = g_hash_table_lookup_extended(store->by_location, &key, NULL, &value);
+    const InsnDesc *desc = value;
+    TraceDescLookup result = !found  ? TRACE_DESC_ABSENT
+                             : !desc ? TRACE_DESC_AMBIGUOUS
+                             : !desc->available_seq || desc->available_seq > before_seq
+                                 ? TRACE_DESC_FUTURE
+                                 : TRACE_DESC_FOUND;
+    if (result == TRACE_DESC_FOUND)
+        *out = desc;
     g_mutex_unlock(&store->lock);
     return result;
 }
@@ -556,18 +606,22 @@ const TraceEntry *trace_get_last(const TraceBuffer *tb, uint32_t i) {
 }
 
 const TraceEntry *trace_find_seq(const TraceBuffer *tb, uint64_t seq_id, uint32_t *back_index) {
-    if (!tb || seq_id == 0)
+    if (!tb || !tb->counter || seq_id == 0)
         return NULL;
-    for (uint32_t i = 0; i < tb->counter; i++) {
-        const TraceEntry *entry = trace_get_last(tb, i);
-        if (entry && entry->seq_id == seq_id) {
-            if (back_index) {
-                *back_index = i;
-            }
-            return entry;
-        }
-    }
-    return NULL;
+    /* trace_append assigns consecutive sequence numbers. Subtract from the
+     * newest entry, not next_seq_id, which can wrap at UINT64_MAX. */
+    const TraceEntry *latest = trace_get_last(tb, 0);
+    if (!latest || seq_id > latest->seq_id)
+        return NULL;
+    uint64_t distance = latest->seq_id - seq_id;
+    if (distance >= tb->counter)
+        return NULL;
+    const TraceEntry *entry = trace_get_last(tb, (uint32_t)distance);
+    if (!entry || entry->seq_id != seq_id)
+        return NULL;
+    if (back_index)
+        *back_index = (uint32_t)distance;
+    return entry;
 }
 
 bool trace_record_control_transfer(TraceBuffer *tb, uint64_t seq_id, DcfgEdgeId edge_id,

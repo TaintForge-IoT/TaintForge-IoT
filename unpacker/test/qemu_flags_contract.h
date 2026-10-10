@@ -14,4 +14,11 @@
 bool tf_qemu_flags_options(int argc, char **argv, const char **receipt, FILE *errors);
 bool tf_qemu_flags_receipt_check(const char *receipt, const char *executable, FILE *errors);
 
+#define TF_QEMU_ES_RECEIPT_PREFIX "TAINTFORGE_X86_ES_V1\nqemu_sha256="
+#define TF_QEMU_ES_RECEIPT_SUFFIX \
+    "\nprobe=segment-cache-v1\ntarget=i386-linux-user\nnormal_checked=7\n" \
+    "single_checked=7\nlegacy_checked=7\nmemory_checked=18\nmismatches=0\n"
+bool tf_qemu_es_options(int argc, char **argv, const char **receipt, FILE *errors);
+bool tf_qemu_es_receipt_check(const char *receipt, const char *executable, FILE *errors);
+
 #endif

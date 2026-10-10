@@ -12,11 +12,13 @@
  * protection from a hostile guest remain execution-backend responsibilities. */
 typedef struct {
     bool enabled, storage_failed, profile_lost, finished, flags_required, analysis_incomplete;
+    bool capture_at_entry;
     char *session, *attempt, *instance;
     char *events_path, *manifest_path, *dump_path, *report_path, *ir_path;
     FILE *events;
     uint64_t event_seq, max_events, dropped_events, epoch, trace_seq, pc;
     uint64_t max_dump_bytes, selection_delay, max_candidates;
+    uint64_t max_capture_bytes;
     uint32_t generation, vcpu;
     pid_t owner;
     const char *profile_reason;

@@ -7,7 +7,8 @@
 typedef enum {
     MEM_BASE,
     MEM_STORE,
-    MEM_OPAQUE
+    MEM_OPAQUE,
+    MEM_ZERO
 } MemoryKind;
 
 typedef struct {
@@ -242,6 +243,8 @@ static IrBits memory_byte(IrEval *e, uint32_t handle, uint64_t address) {
         address &= mask;
         if (n->kind == MEM_OPAQUE)
             return ir_bits_unknown(n->reasons | IR_REASON_MEMORY);
+        if (n->kind == MEM_ZERO)
+            return ir_bits_known(0, 8);
         if (n->kind == MEM_BASE) {
             IrBits b =
                 e->bindings.read_byte
@@ -423,6 +426,10 @@ static void execute(IrEval *e, const IrInst *inst) {
     case IR_OP_CONST:
         r.bits = ir_bits_known(s->immediate, s->type.bits);
         break;
+    case IR_OP_ZERO_MEMORY:
+        r.memory = memory_add(e, (MemoryNode){.kind = MEM_ZERO, .address_bits = s->type.bits});
+        r.bits = (IrBits){.reasons = r.memory ? 0 : IR_REASON_BUDGET};
+        break;
     case IR_OP_INPUT:
         r = read_input(e, s);
         break;
@@ -558,7 +565,9 @@ static IrEvalResult run(IrEval *e, IrBlockId stop, IrEvalBranch *events, uint32_
             break;
         if (t->kind == IR_TERM_FRAGMENT_END || t->kind == IR_TERM_PROGRAM_EXIT) {
             e->result.reasons |= t->reasons;
-            if (stop)
+            if (stop == block && t->kind == IR_TERM_FRAGMENT_END)
+                e->result.status = e->result.reasons ? IR_EVAL_UNKNOWN : IR_EVAL_FRAGMENT_END;
+            else if (stop)
                 fail_eval(e, IR_EVAL_UNKNOWN, IR_REASON_NOT_EXECUTED);
             else
                 finish(e, t->kind == IR_TERM_FRAGMENT_END ? IR_EVAL_FRAGMENT_END
@@ -630,6 +639,21 @@ IrEvalResult ir_eval_run_to_branch(IrEval *e, IrBlockId block, IrEvalBranch *eve
     if (!current(e) || !count || (capacity && !events) || !block ||
         block > e->module->block_count ||
         e->module->blocks[block - 1].terminator.kind != IR_TERM_CJUMP) {
+        IrEvalResult r = {.status = IR_EVAL_INVALID};
+        if (current(e))
+            e->result = r;
+        return r;
+    }
+    return run(e, block, events, capacity, count);
+}
+
+IrEvalResult ir_eval_run_to_fragment(IrEval *e, IrBlockId block, IrEvalBranch *events,
+                                     uint32_t capacity, uint32_t *count) {
+    if (count)
+        *count = 0;
+    if (!current(e) || !count || (capacity && !events) || !block ||
+        block > e->module->block_count ||
+        e->module->blocks[block - 1].terminator.kind != IR_TERM_FRAGMENT_END) {
         IrEvalResult r = {.status = IR_EVAL_INVALID};
         if (current(e))
             e->result = r;

@@ -6,6 +6,95 @@
 #include <string.h>
 
 typedef struct {
+    const DcfgRegionNode *nodes;
+    uint32_t count, boundary, budget;
+    uint8_t color[DCFG_REGION_MAX_NODES + 1U];
+    DcfgRegionRelation memo[DCFG_REGION_MAX_NODES + 1U];
+    DcfgRegionResult result;
+} DcfgRegionQuery;
+
+static void dcfg_region_issue(DcfgRegionQuery *q, uint32_t issue, uint32_t node,
+                              uint32_t successor) {
+    q->result.issues |= issue;
+    if (!q->result.witness_issue) {
+        q->result.witness_issue = issue;
+        q->result.witness_node = node;
+        q->result.witness_successor = successor;
+    }
+}
+
+static DcfgRegionRelation dcfg_region_visit(DcfgRegionQuery *q, uint32_t id, uint32_t source,
+                                            uint32_t successor) {
+    if (!id || id > q->count) {
+        dcfg_region_issue(q, id ? DCFG_REGION_INVALID : DCFG_REGION_OPEN, source, successor);
+        return DCFG_REGION_UNKNOWN;
+    }
+    if (q->color[id] == 1) {
+        dcfg_region_issue(q, DCFG_REGION_CYCLE, id, UINT32_MAX);
+        return DCFG_REGION_UNKNOWN;
+    }
+    if (q->color[id] == 2)
+        return q->memo[id];
+    if (q->result.visited == q->budget) {
+        dcfg_region_issue(q, DCFG_REGION_BUDGET, id, UINT32_MAX);
+        return DCFG_REGION_UNKNOWN;
+    }
+    ++q->result.visited;
+    q->color[id] = 1;
+    const DcfgRegionNode *n = &q->nodes[id];
+    DcfgRegionRelation relation = DCFG_REGION_UNKNOWN;
+    if (id == q->boundary) {
+        relation = DCFG_REGION_YES;
+    } else {
+        q->result.register_writes |= n->register_writes;
+        q->result.special_writes |= n->special_writes;
+        if (n->successor_count > 2 || (n->terminal && n->successor_count)) {
+            dcfg_region_issue(q, DCFG_REGION_INVALID, id, UINT32_MAX);
+        } else if (n->opaque) {
+            dcfg_region_issue(q, DCFG_REGION_OPAQUE, id, UINT32_MAX);
+        } else if (n->terminal) {
+            relation = DCFG_REGION_NO;
+        } else if (!n->successor_count) {
+            dcfg_region_issue(q, DCFG_REGION_OPEN, id, UINT32_MAX);
+        } else {
+            relation = DCFG_REGION_YES;
+            for (uint32_t i = 0; i < n->successor_count; ++i) {
+                DcfgRegionRelation child = dcfg_region_visit(q, n->successors[i], id, i);
+                if (child == DCFG_REGION_NO)
+                    relation = DCFG_REGION_NO;
+                else if (child == DCFG_REGION_UNKNOWN && relation == DCFG_REGION_YES)
+                    relation = DCFG_REGION_UNKNOWN;
+            }
+        }
+    }
+    q->color[id] = 2;
+    q->memo[id] = relation;
+    return relation;
+}
+
+DcfgRegionResult dcfg_region_analyze(const DcfgRegionNode *nodes, uint32_t count, uint32_t branch,
+                                     uint32_t boundary, uint32_t budget) {
+    DcfgRegionQuery q = {.nodes = nodes, .count = count, .boundary = boundary, .budget = budget};
+    if (!nodes || !count || count > DCFG_REGION_MAX_NODES || !branch || branch > count ||
+        !boundary || boundary > count || !budget) {
+        dcfg_region_issue(&q, DCFG_REGION_INVALID, 0, UINT32_MAX);
+        return q.result;
+    }
+    q.result.postdominates = dcfg_region_visit(&q, branch, 0, UINT32_MAX);
+    if (q.result.issues) {
+        q.result.postdominates = DCFG_REGION_UNKNOWN;
+    } else if (q.result.postdominates == DCFG_REGION_YES) {
+        q.result.control_dependent = DCFG_REGION_NO;
+    } else {
+        q.result.control_dependent = DCFG_REGION_NO;
+        for (uint32_t i = 0; i < nodes[branch].successor_count; ++i)
+            if (q.memo[nodes[branch].successors[i]] == DCFG_REGION_YES)
+                q.result.control_dependent = DCFG_REGION_YES;
+    }
+    return q.result;
+}
+
+typedef struct {
     DcfgNodeId source_node;
     DcfgNodeId target_node;
     DcfgEdgeKind kind;

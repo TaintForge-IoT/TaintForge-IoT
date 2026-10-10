@@ -627,6 +627,67 @@ static bool lift_arith(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, cons
     return commit_operand(ctx, x86, aux, arch, dst, result, width);
 }
 
+/* Unprefixed 32-bit register forms. Memory and partial-register forms need
+ * separate input/alias contracts. CF is checked before either arithmetic step. */
+static bool lift_adc_sbb(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const InsnAux *aux,
+                     const DseArch *arch) {
+    if (!ctx || !insn || !x86 || !aux || !arch || arch->natural_width != 32 ||
+        arch->big_endian || !aux->execution_complete || aux->has_mem_read ||
+        aux->has_mem_write || x86->op_count != 2 || insn->size == 0)
+        return false;
+    /* Check the actual opcode as well: decoders may discard ignored prefixes. */
+    bool subtract = insn->id == X86_INS_SBB;
+    uint8_t opcode = insn->bytes[0];
+    if (opcode != 0x81 && opcode != 0x83 &&
+        !(subtract ? opcode == 0x19 || opcode == 0x1b || opcode == 0x1d
+                   : opcode == 0x11 || opcode == 0x13 || opcode == 0x15))
+        return false;
+    const cs_x86_op *dst = &x86->operands[0], *src = &x86->operands[1];
+    if (dst->type != X86_OP_REG || dst->size != 4 ||
+        (src->type != X86_OP_REG && src->type != X86_OP_IMM) || src->size != 4)
+        return false;
+
+    SymExpr *carry_in = dse_get_x86_flag_checked(ctx, aux, X86_FLAG_CF);
+    if (!carry_in)
+        return false;
+    SymExpr *left = get_operand_expr(ctx, x86, dst, 32, aux, arch);
+    SymExpr *right = get_operand_expr(ctx, x86, src, 32, aux, arch);
+    SymExpr *sum = NULL, *result = NULL, *carry_out = NULL;
+    bool ok = false;
+    if (!left || !right)
+        goto cleanup;
+    sum = subtract ? sym_expr_sub(sym_expr_clone(left), sym_expr_clone(right))
+                   : sym_expr_add(sym_expr_clone(left), sym_expr_clone(right));
+    result = subtract ? sym_expr_sub(sym_expr_clone(sum), sym_expr_zext(sym_expr_clone(carry_in), 32))
+                      : sym_expr_add(sym_expr_clone(sum), sym_expr_zext(sym_expr_clone(carry_in), 32));
+    if (!sum || !result)
+        goto cleanup;
+    /* Carry may come from either addition. In particular, b + CF must not be
+     * truncated before calculating CF/OF/AF from the original operands. */
+    carry_out = subtract
+        ? sym_expr_or(sym_expr_ult(sym_expr_clone(left), sym_expr_clone(right)),
+                      sym_expr_ult(sym_expr_clone(sum), sym_expr_zext(sym_expr_clone(carry_in), 32)))
+        : sym_expr_or(sym_expr_ult(sym_expr_clone(sum), sym_expr_clone(left)),
+                      sym_expr_ult(sym_expr_clone(result), sym_expr_clone(sum)));
+    if (!carry_out)
+        goto cleanup;
+    x86_set_arithmetic_flags(ctx, left, right, result, subtract, true);
+    dse_set_x86_flag(ctx, X86_FLAG_CF, carry_out);
+    carry_out = NULL;
+    if (ctx->resource_limit_hit || (ctx->x86_flags_poisoned & X86_FLAG_TRACKED))
+        goto cleanup;
+    ok = commit_reg(ctx, aux, arch, dst->reg, result, 32);
+    result = NULL; /* commit_reg consumes its input even on failure. */
+cleanup:
+    sym_expr_free(carry_in);
+    sym_expr_free(left);
+    sym_expr_free(right);
+    sym_expr_free(sum);
+    sym_expr_free(result);
+    sym_expr_free(carry_out);
+    return ok;
+}
+
 static bool lift_compare(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const InsnAux *aux,
                          const DseArch *arch) {
     if (!ctx || !insn || !x86 || !aux || !arch || x86->op_count != 2 ||
@@ -1249,12 +1310,13 @@ static bool lift_lods(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
     if (!ctx || !insn || !x86 || !aux || !arch || arch->natural_width != 32 || arch->big_endian ||
         x86_has_address_size_override(x86) || x86_has_segment_override(x86) ||
         !aux->execution_complete || !aux->has_mem_read || aux->mem_read_overflow ||
-        aux->mem_read_count != 1 || aux->mem_read_total != 1 || !aux->eflags_valid) {
+        aux->mem_read_count != 1 || aux->mem_read_total != 1) {
         return false;
     }
     for (unsigned prefix_index = 0; prefix_index < (sizeof(x86->prefix) / sizeof(x86->prefix[0]));
          prefix_index++) {
-        if (x86->prefix[prefix_index] == 0xf2 || x86->prefix[prefix_index] == 0xf3) {
+        if (x86->prefix[prefix_index] == 0xf0 || x86->prefix[prefix_index] == 0xf2 ||
+            x86->prefix[prefix_index] == 0xf3) {
             return false;
         }
     }
@@ -1262,6 +1324,9 @@ static bool lift_lods(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
     if (element_size == 0 || element_size > 4 || aux->mem_reads[0].size != element_size) {
         return false;
     }
+    int8_t direction = (aux->eflags_before & (UINT32_C(1) << 10)) != 0 ? -1 : 1;
+    if (!dse_check_x86_direction(ctx, aux, direction))
+        return false;
     SymExpr *source_address =
         dse_read_rid_observed_root(ctx, aux, REG_RSI, arch->natural_width, arch->natural_width);
     if (!source_address)
@@ -1277,8 +1342,62 @@ static bool lift_lods(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
                           arch->natural_width)) {
         return false;
     }
-    int8_t direction = (aux->eflags_before & (UINT32_C(1) << 10)) != 0 ? -1 : 1;
     return x86_update_string_index(ctx, aux, arch, REG_RSI, element_size, direction);
+}
+
+static bool lift_scasd(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const InsnAux *aux,
+                       const DseArch *arch) {
+    if (!ctx || !insn || !x86 || !aux || !arch || arch->natural_width != 32 || arch->big_endian ||
+        insn->size != 1 || insn->bytes[0] != 0xaf || x86->op_count != 2 ||
+        !aux->execution_complete || !aux->has_mem_read || aux->has_mem_write ||
+        aux->mem_write_count || aux->mem_write_total || aux->mem_write_overflow ||
+        aux->mem_read_overflow || aux->mem_read_count != 1 || aux->mem_read_total != 1 ||
+        aux->string_summary.active)
+        return false;
+    const cs_x86_op *acc = &x86->operands[0], *mem = &x86->operands[1];
+    if (acc->type != X86_OP_REG || acc->reg != X86_REG_EAX || acc->size != 4 ||
+        mem->type != X86_OP_MEM || mem->size != 4 || mem->mem.segment != X86_REG_ES ||
+        mem->mem.base != X86_REG_EDI || mem->mem.index != X86_REG_INVALID || mem->mem.disp != 0)
+        return false;
+    const DseMemRead *read = &aux->mem_reads[0];
+    if (read->size != 4 || !read->value_valid || !aux->mem_read_value_valid ||
+        read->addr > UINT32_MAX - 3U || read->value > UINT32_MAX ||
+        read->addr != aux->mem_read_addr || read->value != aux->mem_read_val ||
+        read->taint != aux->mem_read_taint || read->effective_taint != aux->mem_read_effective_taint ||
+        read->address_tainted != aux->mem_read_address_tainted)
+        return false;
+    int8_t direction = (aux->eflags_before & (UINT32_C(1) << 10)) ? -1 : 1;
+    if (!dse_check_x86_direction(ctx, aux, direction))
+        return false;
+
+    bool index_live = !ctx->demand_active || ctx->demand_reg_live_after[REG_RDI] != 0;
+    SymExpr *index = index_live ? dse_read_rid_fit(ctx, aux, REG_RDI, 32, 32)
+                                : dse_read_rid_observed_root(ctx, aux, REG_RDI, 32, 32);
+    SymExpr *left = NULL, *right = NULL, *result = NULL, *next = NULL;
+    bool ok = false;
+    if (!index || !dse_constrain_observed_flat_es(ctx, sym_expr_clone(index), aux))
+        goto cleanup;
+    left = dse_read_rid_fit(ctx, aux, REG_RAX, 32, 32);
+    right = dse_load_mem(ctx, aux, 32, false);
+    if (!left || !right)
+        goto cleanup;
+    result = sym_expr_sub(sym_expr_clone(left), sym_expr_clone(right));
+    next = direction > 0 ? sym_expr_add(sym_expr_clone(index), sym_expr_const(4, 32))
+                          : sym_expr_sub(sym_expr_clone(index), sym_expr_const(4, 32));
+    if (!result || !next)
+        goto cleanup;
+    x86_set_arithmetic_flags(ctx, left, right, result, true, false);
+    if (ctx->resource_limit_hit || (ctx->x86_flags_poisoned & X86_FLAG_TRACKED))
+        goto cleanup;
+    ok = commit_reg(ctx, aux, arch, X86_REG_EDI, next, 32);
+    next = NULL;
+cleanup:
+    sym_expr_free(index);
+    sym_expr_free(left);
+    sym_expr_free(right);
+    sym_expr_free(result);
+    sym_expr_free(next);
+    return ok;
 }
 
 static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86,
@@ -1288,6 +1407,9 @@ static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x8
         return false;
     }
     const DseStringSummary *summary = &aux->string_summary;
+    if (x86->prefix[0] == 0xf0 || x86->prefix[0] == 0xf2 ||
+        (x86->prefix[0] == 0xf3) != summary->has_rep_prefix)
+        return false;
     uint8_t instruction_element_size = x86_string_element_size(insn->id);
     if (instruction_element_size == 0 || instruction_element_size != summary->element_size ||
         summary->element_size > (arch->natural_width / 8U) ||
@@ -1303,6 +1425,9 @@ static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x8
         if (!dse_aux_has_exact_stos(aux))
             return false;
     }
+    if (summary->expected_iterations != 0 &&
+        !dse_check_x86_direction(ctx, aux, summary->direction))
+        return false;
     if (!x86_constrain_string_count(ctx, aux, arch, summary)) {
         return false;
     }
@@ -1658,6 +1783,9 @@ static bool x86_lift_one(DSECtx *ctx, const cs_insn *insn, const InsnAux *aux,
         return lift_mov(ctx, insn, x86, aux, arch);
     case X86_INS_LEA:
         return lift_lea(ctx, insn, x86, aux, arch);
+    case X86_INS_ADC:
+    case X86_INS_SBB:
+        return lift_adc_sbb(ctx, insn, x86, aux, arch);
     case X86_INS_ADD:
     case X86_INS_SUB:
     case X86_INS_XOR:
@@ -1708,8 +1836,25 @@ static bool x86_lift_one(DSECtx *ctx, const cs_insn *insn, const InsnAux *aux,
     case X86_INS_LODSD:
     case X86_INS_LODSQ:
         return lift_lods(ctx, insn, x86, aux, arch);
+    case X86_INS_SCASD:
+        return lift_scasd(ctx, insn, x86, aux, arch);
     case X86_INS_NOP:
         return true;
+    case X86_INS_CLD:
+    case X86_INS_STD: {
+        if (!aux || !aux->execution_complete || arch->natural_width != 32 || insn->size != 1)
+            return false;
+        for (unsigned i = 0; i < sizeof(x86->prefix) / sizeof(x86->prefix[0]); ++i)
+            if (x86->prefix[i])
+                return false;
+        SymExpr *df = sym_expr_const(insn->id == X86_INS_STD, 1);
+        if (!df)
+            return false;
+        sym_expr_free(ctx->state.x86_flags[DSE_FLAG_SLOT_DF]);
+        ctx->state.x86_flags[DSE_FLAG_SLOT_DF] = df;
+        ctx->x86_df_poisoned = false;
+        return true;
+    }
     case X86_INS_JMP:
         return lift_jmp(ctx, insn, x86, aux, arch);
     case X86_INS_JO:

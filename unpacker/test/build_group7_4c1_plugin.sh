@@ -40,8 +40,8 @@ read -r -a tf_runtime_ldflags <<<"${TF_PLUGIN_LDFLAGS:-}"
 tf_runtime_sources=()
 for tf_runtime_name in qemu_unpacker.c dta.c provenance.c dcfg.c trace.c aux_trace.c \
     trace_deps.c trace_deps_x86.c replay_input.c replay_sources.c dse.c dse_lift_x86.c \
-    ir.c ir_eval.c ir_opt.c ir_lift_x86.c ir_replay.c ir_inputs.c ir_runtime.c ir_ssa.c ir_smt.c \
-    ir_branches.c runtime_diag.c qemu_flags_contract.c elf_image.c phase1_io.c; do
+    ir.c ir_eval.c ir_opt.c ir_lift_x86.c ir_environment.c ir_replay.c ir_inputs.c ir_runtime.c ir_ssa.c ir_smt.c \
+    ir_branches.c ir_concolic.c ir_oep.c runtime_diag.c qemu_flags_contract.c elf_image.c phase1_io.c; do
     tf_runtime_sources+=("$tf_runtime_src/$tf_runtime_name")
 done
 export TF_BUILD_CPPFLAGS="${tf_runtime_cpp[*]}"

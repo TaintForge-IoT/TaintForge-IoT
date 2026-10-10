@@ -1498,11 +1498,58 @@ static DtaTransferResult apply_arithmetic_transfer(RegShadow *rs, const RegShado
     return carry_input_missing ? DTA_TRANSFER_INCOMPLETE : DTA_TRANSFER_CONSERVATIVE;
 }
 
+static bool immediate_shift_labels(const RegShadow *rs, const InsnMeta *meta,
+                                   const ProvLabelId *input, uint8_t width, ProvLabelId *output) {
+    if (!meta->shift_count_valid || !meta->shift_count_is_immediate ||
+        meta->reg_slice_detail_truncated ||
+        (width != 1 && width != 2 && width != 4 && width != 8) ||
+        meta->shift_operand_width != width * 8U) {
+        return false;
+    }
+    bool left = meta->insn_id == X86_INS_SHL || meta->insn_id == X86_INS_SAL;
+    bool sign = meta->insn_id == X86_INS_SAR;
+    if (!left && !sign && meta->insn_id != X86_INS_SHR)
+        return false;
+
+    int bits = width * 8;
+    int shift = meta->shift_count_imm & (width == 8 ? 63 : 31);
+    for (uint8_t byte = 0; byte < width; ++byte) {
+        /* A destination byte can intersect at most two source bytes. Inserted
+         * zero bits have no source; SAR extends the original sign byte. */
+        int first = byte * 8 + (left ? -shift : shift);
+        int last = first + 7;
+        if (last < 0 || first >= bits) {
+            output[byte] = sign ? input[width - 1] : PROV_LABEL_CLEAN;
+            continue;
+        }
+        if (first < 0)
+            first = 0;
+        if (last >= bits)
+            last = bits - 1;
+        output[byte] = first / 8 == last / 8
+                           ? input[first / 8]
+                           : reg_join_labels(rs, input[first / 8], input[last / 8]);
+    }
+    return true;
+}
+
 static DtaTransferResult apply_shift_rotate_transfer(RegShadow *rs, const RegShadow *snapshot,
                                                      const InsnMeta *meta) {
     RegSlice dst = meta_first_reg_write(meta);
     if (!reg_slice_is_valid(dst))
         return DTA_TRANSFER_NOT_APPLICABLE;
+    if (meta->reg_read_count == 1 && meta->reg_write_count == 1 &&
+        reg_slice_equal(meta->reg_reads[0], dst)) {
+        ProvLabelId input[MAX_REG_BYTES], output[MAX_REG_BYTES];
+        for (uint8_t byte = 0; byte < dst.width; ++byte)
+            input[byte] = snapshot_slice_label(snapshot, dst, byte);
+        if (immediate_shift_labels(snapshot, meta, input, dst.width, output)) {
+            for (uint8_t byte = 0; byte < dst.width; ++byte)
+                write_slice_label(rs, dst, byte, output[byte]);
+            rs->src_ip[dst.reg_id] = 0;
+            return DTA_TRANSFER_CONSERVATIVE;
+        }
+    }
     ProvLabelId joined = meta_read_state_join(snapshot, meta);
     if (joined == PROV_LABEL_ID_INVALID || meta->reg_read_count == 0) {
         joined = incomplete_input_join(snapshot, meta, PROV_INCOMPLETE_IMPLICIT_OPERAND);
@@ -2142,6 +2189,11 @@ DtaTransferResult dta_compute_mem_write_labels(const RegShadow *pre_regs, const 
         }
         return DTA_TRANSFER_CONSERVATIVE;
     case DTA_FAMILY_SHIFT_ROTATE: {
+        if (meta->has_mem_read && meta->has_mem_write && meta->reg_read_count == 0 &&
+            immediate_shift_labels(pre_regs, meta, old_memory, width, output)) {
+            memcpy(result_labels, output, width * sizeof(*result_labels));
+            return DTA_TRANSFER_CONSERVATIVE;
+        }
         ProvLabelId inputs[MAX_REG_BYTES * 2];
         uint32_t count = 0;
         for (uint8_t byte = 0; byte < width; byte++) {
@@ -2733,6 +2785,18 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
     if (insn->detail) {
         //lookup on W/R flag
         cs_x86 *x86 = &insn->detail->x86;
+        m->writes_df = (x86->eflags &
+                        (X86_EFLAGS_MODIFY_DF | X86_EFLAGS_RESET_DF | X86_EFLAGS_SET_DF)) != 0;
+        cs_regs read_regs, write_regs;
+        uint8_t read_count = 0, write_count = 0;
+        if (cs_regs_access(handle, insn, read_regs, &read_count, write_regs, &write_count) == CS_ERR_OK)
+            for (unsigned reg = 0; reg < write_count; ++reg)
+                m->writes_es |= write_regs[reg] == X86_REG_ES;
+        if (insn->id == X86_INS_LES || insn->id == X86_INS_IRET ||
+            insn->id == X86_INS_IRETD || insn->id == X86_INS_IRETQ ||
+            ((insn->id == X86_INS_MOV || insn->id == X86_INS_POP) && x86->op_count &&
+             x86->operands[0].type == X86_OP_REG && x86->operands[0].reg == X86_REG_ES))
+            m->writes_es = true;
         if (m->family == DTA_FAMILY_SHIFT_ROTATE && x86->op_count >= 2) {
             const cs_x86_op *count_op = &x86->operands[x86->op_count - 1];
             m->shift_operand_width = (uint8_t)(x86->operands[0].size * 8U);
@@ -2827,6 +2891,33 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
             if (insn->detail->regs_write[i] == X86_REG_EFLAGS && m->flags_write_mask == 0) {
                 m->flags_write_mask = X86_FLAG_TRACKED;
             }
+            if (insn->detail->regs_write[i] == X86_REG_EFLAGS &&
+                m->family == DTA_FAMILY_UNSUPPORTED)
+                m->writes_df = true;
+        }
+        if (insn->id == X86_INS_CLD || insn->id == X86_INS_STD) {
+            m->writes_df = true;
+            m->flags_read_mask = m->flags_write_mask = 0;
+        }
+        if (insn_meta_is_plain_scasd(m)) {
+            /* SCAS reads DF and writes arithmetic flags; EFLAGS is a container.
+             * Keep the DTA family incomplete until its label transfer is modeled. */
+            m->writes_df = false;
+            m->flags_read_mask = 0;
+            m->flags_write_mask = X86_FLAG_TRACKED;
+            m->has_mem_read = true;
+            m->mem_addr_reg_mask |= UINT32_C(1) << REG_RDI;
+            m->mem_read_addr_reg_mask |= UINT32_C(1) << REG_RDI;
+            RegSlice accumulator = reg_slice_from_x86(X86_REG_EAX, 4);
+            RegSlice index = reg_slice_from_x86(X86_REG_EDI, 4);
+            append_reg_slice(m->reg_reads, &m->reg_read_count, accumulator,
+                             &m->reg_slice_detail_truncated);
+            append_reg_slice(m->reg_reads, &m->reg_read_count, index,
+                             &m->reg_slice_detail_truncated);
+            append_reg_slice(m->reg_writes, &m->reg_write_count, index,
+                             &m->reg_slice_detail_truncated);
+            m->regs_read_mask |= (UINT32_C(1) << REG_RAX) | (UINT32_C(1) << REG_RDI);
+            m->regs_written_mask |= UINT32_C(1) << REG_RDI;
         }
         // implicit mem access
         switch (insn->id) {

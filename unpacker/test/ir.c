@@ -8,6 +8,7 @@ size_t ir_module_allocated_bytes(const IrModule *m) {
            (size_t)m->block_capacity * sizeof(*m->blocks) +
            (size_t)m->state_capacity * sizeof(*m->states) +
            (size_t)m->output_capacity * sizeof(*m->outputs) +
+           m->output_index_bytes +
            (m->trace_rank ? (size_t)m->block_count * sizeof(*m->trace_rank) : 0);
 }
 
@@ -45,9 +46,9 @@ static const char *const op_names[IR_OP_COUNT] = {
     "CONST",       "INPUT", "UNKNOWN", "COPY",  "ADD",    "SUB",  "MUL",  "AND",
     "OR",          "XOR",   "NOT",     "NEG",   "SHL",    "LSHR", "ASHR", "EXTRACT",
     "CONCAT",      "ZEXT",  "SEXT",    "EQ",    "ULT",    "SLT",  "ITE",  "READ_STATE",
-    "WRITE_STATE", "LOAD",  "STORE",   "GUARD", "BARRIER"};
+    "WRITE_STATE", "LOAD",  "STORE",   "GUARD", "BARRIER", "ZERO_MEMORY"};
 static const unsigned char op_arity[IR_OP_COUNT] = {0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2,
-                                                    1, 2, 1, 1, 2, 2, 2, 3, 0, 1, 2, 3, 1, 0};
+                                                    1, 2, 1, 1, 2, 2, 2, 3, 0, 1, 2, 3, 1, 0, 0};
 
 const char *ir_opcode_name(IrOpcode op) {
     return (unsigned)op < IR_OP_COUNT ? op_names[op] : "INVALID";
@@ -89,6 +90,7 @@ void ir_module_destroy(IrModule *m) {
     free(m->blocks);
     free(m->states);
     free(m->outputs);
+    free(m->output_bits);
     free(m->trace_rank);
     free(m);
 }
@@ -129,8 +131,11 @@ void ir_module_note_quality(IrModule *m, IrQuality quality) {
 /* Reserve before publishing counts/IDs. A failed operation never exposes a
  * half-built instruction, even when a preceding reserve has succeeded. */
 static void *reserve(IrModule *m, void *ptr, uint32_t *capacity, uint32_t needed, uint32_t limit,
-                     size_t size) {
+                     size_t size, IrBudgetKind kind) {
     if (needed > limit) {
+        if (m->status == IR_OK)
+            m->construction.failure = (IrBudgetFailure){kind, needed - 1U, limit, needed,
+                                                        m->build_origin, m->build_phase};
         ir_fail(m, IR_RESOURCE_LIMIT, "module record budget");
         return NULL;
     }
@@ -210,7 +215,7 @@ IrBlockId ir_block_add(IrModule *m) {
     if (!m || m->status != IR_OK)
         return 0;
     IrBlock *blocks = reserve(m, m->blocks, &m->block_capacity, m->block_count + 1,
-                              m->limits.blocks, sizeof(*m->blocks));
+                              m->limits.blocks, sizeof(*m->blocks), IR_BUDGET_BLOCKS);
     if (!blocks)
         return 0;
     m->blocks = blocks;
@@ -249,7 +254,7 @@ IrStateId ir_state_add(IrModule *m, IrType type, uint64_t key, bool live_out) {
             return 0;
         }
     IrState *states = reserve(m, m->states, &m->state_capacity, m->state_count + 1,
-                              m->limits.states, sizeof(*m->states));
+                              m->limits.states, sizeof(*m->states), IR_BUDGET_STATES);
     if (!states)
         return 0;
     m->states = states;
@@ -302,6 +307,9 @@ static bool spec_valid(const IrModule *m, IrBlockId block, IrInstId before, cons
     switch (s->op) {
     case IR_OP_CONST:
         ok = s->type.kind == IR_TYPE_BV && (s->immediate & ~ir_width_mask(s->type.bits)) == 0;
+        break;
+    case IR_OP_ZERO_MEMORY:
+        ok = s->type.kind == IR_TYPE_MEM;
         break;
     case IR_OP_INPUT:
         ok = s->type.kind != IR_TYPE_VOID;
@@ -407,18 +415,21 @@ static IrInstId append(IrModule *m, IrBlockId block, IrInstSpec spec, bool effec
                 return 0;
             }
         }
+    m->build_origin = spec.origin;
     IrInst *insts = reserve(m, m->insts, &m->inst_capacity, m->inst_count + 1,
-                            m->limits.instructions, sizeof(*m->insts));
+                            m->limits.instructions, sizeof(*m->insts), IR_BUDGET_INSTRUCTIONS);
     if (!insts)
         return 0;
     m->insts = insts;
     if (!effect) {
         IrValue *values = reserve(m, m->values, &m->value_capacity, m->value_count + 1,
-                                  m->limits.values, sizeof(*m->values));
+                                  m->limits.values, sizeof(*m->values), IR_BUDGET_VALUES);
         if (!values)
             return 0;
         m->values = values;
     }
+    ++m->construction.opcodes[spec.op];
+    ++m->construction.phases[m->build_phase];
     IrInstId id = m->inst_count + 1;
     IrValueId result = effect ? 0 : m->value_count + 1;
     m->insts[m->inst_count++] = (IrInst){spec, result, block, 0, false};
@@ -495,6 +506,27 @@ bool ir_block_terminate(IrModule *m, IrBlockId block, IrTerminator term) {
     return true;
 }
 
+void ir_outputs_clear(IrModule *m) {
+    if (m->output_index_bytes)
+        memset(m->output_bits, 0, m->output_index_bytes);
+    m->output_count = 0;
+}
+
+static bool output_index_reserve(IrModule *m, uint32_t byte) {
+    if (byte < m->output_index_bytes)
+        return true;
+    /* The value was validated before this call. Match the existing geometric
+     * value allocation; avoid overflow in ceil(value_capacity / 8). */
+    uint32_t bytes = m->value_capacity / 8U + (m->value_capacity % 8U != 0);
+    unsigned char *bits = realloc(m->output_bits, bytes);
+    if (!bits)
+        return ir_fail(m, IR_OUT_OF_MEMORY, "output index allocation failed");
+    memset(bits + m->output_index_bytes, 0, bytes - m->output_index_bytes);
+    m->output_bits = bits;
+    m->output_index_bytes = bytes;
+    return true;
+}
+
 bool ir_module_add_output(IrModule *m, IrValueId id) {
     if (!m || m->status != IR_OK)
         return false;
@@ -502,15 +534,21 @@ bool ir_module_add_output(IrModule *m, IrValueId id) {
     const IrInst *d = v ? ir_module_inst(m, v->definition) : NULL;
     if (!d || d->removed)
         return ir_fail(m, IR_INVALID, "invalid output");
-    for (uint32_t i = 0; i < m->output_count; ++i)
-        if (m->outputs[i] == id)
-            return true;
+    uint32_t byte = (id - 1U) / 8U;
+    unsigned char mask = (unsigned char)(1U << ((id - 1U) % 8U));
+    if (byte < m->output_index_bytes && (m->output_bits[byte] & mask))
+        return true;
     IrValueId *outputs = reserve(m, m->outputs, &m->output_capacity, m->output_count + 1,
-                                 m->limits.outputs, sizeof(*m->outputs));
+                                 m->limits.outputs, sizeof(*m->outputs), IR_BUDGET_OUTPUTS);
     if (!outputs)
         return false;
     m->outputs = outputs;
+    /* Keep output-budget failure precedence. Publish membership/count/revision
+     * only after both allocations succeed. Duplicates never allocate. */
+    if (!output_index_reserve(m, byte))
+        return false;
     m->outputs[m->output_count++] = id;
+    m->output_bits[byte] |= mask;
     ++m->revision;
     return true;
 }
@@ -903,6 +941,9 @@ IrModule *ir_module_clone(const IrModule *m) {
         return NULL;
     n->entry = m->entry;
     n->quality = m->quality;
+    n->construction = m->construction;
+    n->build_phase = m->build_phase;
+    n->build_origin = m->build_origin;
     n->revision = m->revision;
 #define COPY_ARRAY(field, count, cap)                                                              \
     do {                                                                                           \
@@ -914,13 +955,15 @@ IrModule *ir_module_clone(const IrModule *m) {
             }                                                                                      \
             memcpy(n->field, m->field, (size_t)m->count * sizeof(*n->field));                      \
         }                                                                                          \
-        n->count = n->cap = m->count;                                                              \
+        n->count = m->count;                                                                        \
+        n->cap = m->count;                                                                          \
     } while (0)
     COPY_ARRAY(insts, inst_count, inst_capacity);
     COPY_ARRAY(values, value_count, value_capacity);
     COPY_ARRAY(blocks, block_count, block_capacity);
     COPY_ARRAY(states, state_count, state_capacity);
     COPY_ARRAY(outputs, output_count, output_capacity);
+    COPY_ARRAY(output_bits, output_index_bytes, output_index_bytes);
 #undef COPY_ARRAY
     if (m->trace_rank) {
         n->trace_rank = malloc((size_t)m->block_count * sizeof(*n->trace_rank));
@@ -931,4 +974,63 @@ IrModule *ir_module_clone(const IrModule *m) {
         memcpy(n->trace_rank, m->trace_rank, (size_t)m->block_count * sizeof(*n->trace_rank));
     }
     return n;
+}
+
+IrBuildPhase ir_module_build_phase(IrModule *m, IrBuildPhase phase) {
+    IrBuildPhase old = m ? m->build_phase : IR_BUILD_OTHER;
+    if (m && (unsigned)phase < IR_BUILD_PHASE_COUNT) m->build_phase = phase;
+    return old;
+}
+void ir_module_build_origin(IrModule *m, IrOrigin origin) {
+    if (m) m->build_origin = origin;
+}
+IrBuildMetrics ir_module_build_metrics(const IrModule *m) {
+    if (!m) return (IrBuildMetrics){.status = IR_INVALID};
+    IrBuildMetrics result = m->construction;
+    result.records = (IrLimits){m->inst_count, m->value_count, m->block_count,
+                               m->state_count, m->output_count};
+    result.limits = m->limits;
+    result.allocated_bytes = ir_module_allocated_bytes(m);
+    result.status = m->status;
+    return result;
+}
+const char *ir_budget_kind_name(IrBudgetKind kind) {
+    static const char *const names[] = {"none", "instructions", "values", "blocks", "states",
+        "outputs", "steps", "observations", "memory_bytes", "repeat_iterations"};
+    return (unsigned)kind < sizeof(names)/sizeof(*names) ? names[kind] : "invalid";
+}
+const char *ir_build_phase_name(IrBuildPhase phase) {
+    static const char *const names[] = {"other", "setup", "x86_semantics", "register_access",
+        "arithmetic_flags", "memory_model", "environment", "replay_observations",
+        "trace_control", "flag_definedness", "code_fetch"};
+    return (unsigned)phase < IR_BUILD_PHASE_COUNT ? names[phase] : "invalid";
+}
+bool ir_budget_report_json(FILE *f, const IrBudgetFailure *v) {
+    if (!f || !v) return false;
+    if (v->kind == IR_BUDGET_NONE) { fputs("null", f); return !ferror(f); }
+    fprintf(f, "{\"resource\":\"%s\",\"used\":%" PRIu64 ",\"limit\":%" PRIu64
+        ",\"requested\":%" PRIu64 ",\"phase\":\"%s\",\"origin\":{\"seq\":%" PRIu64
+        ",\"pc\":%" PRIu64 ",\"descriptor\":%" PRIu64 ",\"generation\":%" PRIu64
+        ",\"vcpu\":%u,\"identity_valid\":%s}}", ir_budget_kind_name(v->kind), v->used,
+        v->limit, v->requested, ir_build_phase_name(v->phase), v->origin.seq_id, v->origin.pc,
+        v->origin.descriptor_id, v->origin.code_generation, v->origin.vcpu_id,
+        v->origin.has_trace_identity ? "true" : "false");
+    return !ferror(f);
+}
+static void limits_json(FILE *f, IrLimits v) {
+    fprintf(f, "{\"instructions\":%u,\"values\":%u,\"blocks\":%u,\"states\":%u,\"outputs\":%u}",
+        v.instructions, v.values, v.blocks, v.states, v.outputs);
+}
+bool ir_build_report_json(FILE *f, const IrBuildMetrics *v) {
+    if (!f || !v) return false;
+    fprintf(f, "{\"status\":%u,\"allocated_bytes\":%zu,\"records\":", v->status, v->allocated_bytes);
+    limits_json(f, v->records); fputs(",\"limits\":", f); limits_json(f, v->limits);
+    fputs(",\"failure\":", f); ir_budget_report_json(f, &v->failure);
+    fputs(",\"opcodes\":{", f);
+    for (unsigned i=0; i<IR_OP_COUNT; ++i)
+        fprintf(f, "%s\"%s\":%" PRIu64, i ? "," : "", ir_opcode_name(i), v->opcodes[i]);
+    fputs("},\"phases\":{", f);
+    for (unsigned i=0; i<IR_BUILD_PHASE_COUNT; ++i)
+        fprintf(f, "%s\"%s\":%" PRIu64, i ? "," : "", ir_build_phase_name(i), v->phases[i]);
+    fputs("}}", f); return !ferror(f);
 }

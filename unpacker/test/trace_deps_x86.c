@@ -134,6 +134,25 @@ bool trace_deps_x86_build(const TraceEntry *entry, const InsnDesc *desc, const I
     if (!complete)
         return false;
 
+    if (meta->insn_id == X86_INS_INT && desc->size == 2 &&
+        desc->bytes[0] == 0xcd && desc->bytes[1] == 0x80) {
+        /* Linux i386 ABI effects are not present in Capstone's INT metadata.
+         * Retain the boundary even when its EAX result looks untainted. The
+         * lifter still rejects every call without an explicit model. */
+        out->may_write[REG_RAX] = UINT32_MAX;
+        out->must_write[REG_RAX] = UINT32_MAX;
+        out->value_uses[REG_RAX] = out->explicit_value_uses[REG_RAX] = UINT32_MAX;
+        if (aux->syscall && (aux->syscall->number == 90 || aux->syscall->number == 6))
+            out->value_uses[REG_RBX] = out->explicit_value_uses[REG_RBX] = UINT32_MAX;
+        if (aux->syscall && (aux->syscall->number == 93 || aux->syscall->number == 125 ||
+                             aux->syscall->number == 356 || aux->syscall->number == 4)) {
+            out->value_uses[REG_RBX] = out->explicit_value_uses[REG_RBX] = UINT32_MAX;
+            out->value_uses[REG_RCX] = out->explicit_value_uses[REG_RCX] = UINT32_MAX;
+            if (aux->syscall->number == 125 || aux->syscall->number == 4)
+                out->value_uses[REG_RDX] = out->explicit_value_uses[REG_RDX] = UINT32_MAX;
+        }
+    }
+
     if (meta->insn_id == X86_INS_LEA) {
         for (unsigned reg = 0; reg < REG_COUNT; reg++) {
             out->value_uses[reg] |= out->address_uses[reg];
@@ -172,6 +191,10 @@ bool trace_deps_x86_build(const TraceEntry *entry, const InsnDesc *desc, const I
         /* Capstone reports the EFLAGS container. Only DF changes here. */
         out->special_may_write = trace_special_state_bit(X86_SPECIAL_STATE_DF);
         out->special_must_write = out->special_may_write;
+        out->special_value_uses = 0;
+    }
+    if (insn_meta_is_plain_scasd(meta)) {
+        promote_writes(out);
         out->special_value_uses = 0;
     }
     if (meta->insn_id == X86_INS_AND || meta->insn_id == X86_INS_OR ||
@@ -235,6 +258,10 @@ uint64_t trace_deps_x86_forced_value_regs(const InsnMeta *meta, const uint8_t ne
     case X86_INS_STOSD:
     case X86_INS_STOSQ:
         if (needed[REG_RDI] & natural_mask)
+            forced |= UINT64_C(1) << REG_RDI;
+        break;
+    case X86_INS_SCASD:
+        if (insn_meta_is_plain_scasd(meta) && (needed[REG_RDI] & natural_mask))
             forced |= UINT64_C(1) << REG_RDI;
         break;
     default:

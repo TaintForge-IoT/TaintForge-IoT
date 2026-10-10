@@ -68,6 +68,7 @@ static bool replay_copy_aux(ReplayInput *input, ReplayRecord *record, const Insn
                             size_t max_bytes) {
     record->aux = *source;
     record->aux.sources = NULL;
+    record->aux.syscall = NULL;
     const DseSourceObservation *sources = dse_aux_sources(source);
     record->aux.source_metadata_lost =
         source->source_metadata_lost || (source->sources && !sources);
@@ -76,7 +77,15 @@ static bool replay_copy_aux(ReplayInput *input, ReplayRecord *record, const Insn
     /* Clear borrowed pointers even when validation/allocation subsequently fails. */
     target->values = NULL;
     target->value_taint = NULL;
+    target->write_values = NULL;
+    target->write_capacity = 0;
     target->capacity = 0;
+    if (source->syscall) {
+        record->aux.syscall = dse_aux_syscall_copy(source->syscall, max_bytes - input->bytes);
+        if (!record->aux.syscall)
+            return false;
+        input->bytes += dse_aux_syscall_owned_bytes(source->syscall);
+    }
     if (sources) {
         if (sizeof(*sources) > max_bytes - input->bytes)
             return false;
@@ -88,11 +97,15 @@ static bool replay_copy_aux(ReplayInput *input, ReplayRecord *record, const Insn
     }
     if (summary->bytes_captured > summary->capacity ||
         summary->capacity > DSE_MAX_STRING_BYTES_PER_INSN ||
-        (summary->bytes_captured != 0 && (!summary->values || !summary->value_taint))) {
+        (summary->bytes_captured != 0 && (!summary->values || !summary->value_taint)) ||
+        summary->write_bytes_captured > summary->write_capacity ||
+        summary->write_capacity > DSE_MAX_STRING_BYTES_PER_INSN ||
+        (summary->write_bytes_captured && !summary->write_values)) {
         record->step.issues |= REPLAY_INPUT_STRING_INVALID;
         target->exact = false;
         target->pattern_mismatch = true;
         target->bytes_captured = 0;
+        target->write_bytes_captured = 0;
         return true;
     }
     size_t bytes = (size_t)summary->bytes_captured * 2U;
@@ -106,6 +119,15 @@ static bool replay_copy_aux(ReplayInput *input, ReplayRecord *record, const Insn
         memcpy(target->values, summary->values, summary->bytes_captured);
         memcpy(target->value_taint, summary->value_taint, summary->bytes_captured);
         target->capacity = summary->bytes_captured;
+        input->bytes += bytes;
+    }
+    bytes = summary->write_bytes_captured;
+    if (bytes > max_bytes - input->bytes) return false;
+    if (bytes) {
+        target->write_values = malloc(bytes);
+        if (!target->write_values) return false;
+        memcpy(target->write_values, summary->write_values, bytes);
+        target->write_capacity = (uint32_t)bytes;
         input->bytes += bytes;
     }
     record->aux_valid = true;
@@ -234,8 +256,10 @@ void replay_input_destroy(ReplayInput *input) {
     if (input->records) {
         for (size_t index = 0; index <= input->count; index++) {
             free(input->records[index].aux.sources);
+            dse_aux_syscall_free(input->records[index].aux.syscall);
             free(input->records[index].aux.string_summary.values);
             free(input->records[index].aux.string_summary.value_taint);
+            free(input->records[index].aux.string_summary.write_values);
         }
         free(input->records);
     }

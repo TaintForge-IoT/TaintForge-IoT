@@ -97,6 +97,48 @@ void dcfg_graph_get_stats(DcfgGraph *graph, DcfgStats *out_stats);
 const char *dcfg_edge_kind_name(DcfgEdgeKind kind);
 const char *dcfg_relevance_name(DcfgRelevance relevance);
 
+#define DCFG_REGION_MAX_NODES 512U
+
+typedef enum {
+    DCFG_REGION_UNKNOWN = 0,
+    DCFG_REGION_NO,
+    DCFG_REGION_YES
+} DcfgRegionRelation;
+
+enum {
+    DCFG_REGION_OPEN = 1U << 0,
+    DCFG_REGION_CYCLE = 1U << 1,
+    DCFG_REGION_OPAQUE = 1U << 2,
+    DCFG_REGION_BUDGET = 1U << 3,
+    DCFG_REGION_INVALID = 1U << 4
+};
+
+/* IDs are 1..count; successor 0 is an UNKNOWN continuation, never an exit.
+ * The caller supplies exhaustive successors, including unobserved direct arms.
+ * An opaque node may have additional effects or continuations. */
+typedef struct {
+    uint32_t successors[2];
+    uint8_t successor_count;
+    bool terminal;
+    bool opaque;
+    uint64_t register_writes, special_writes;
+} DcfgRegionNode;
+
+typedef struct {
+    DcfgRegionRelation postdominates, control_dependent;
+    uint32_t issues, visited;
+    uint64_t register_writes, special_writes;
+    /* First failing node, or source and successor slot for an unresolved edge.
+     * A node-only witness has successor UINT32_MAX. Zero issue means absent. */
+    uint32_t witness_issue, witness_node, witness_successor;
+} DcfgRegionResult;
+
+/* On-demand postdominance for one boundary. Stop before its effects; accumulate
+ * may-writes on every arm. Cycles stay UNKNOWN, including cycles with exits.
+ * nodes[0] is unused. The function does not infer CFG completeness from DCFG. */
+DcfgRegionResult dcfg_region_analyze(const DcfgRegionNode *nodes, uint32_t count, uint32_t branch,
+                                     uint32_t boundary, uint32_t budget);
+
 #ifdef __cplusplus
 }
 #endif

@@ -81,6 +81,7 @@ typedef struct {
 typedef struct {
     InsnDescId desc_id;
     MetaId meta_id;
+    uint64_t available_seq; /* First sequence that could execute these decoded bytes. */
 
     TraceArchKind arch;
     TraceArchMode mode;
@@ -183,6 +184,10 @@ typedef struct {
     MetaId meta_id;
     uint64_t pc;
     uint32_t code_generation;
+    /* Page generation at execution, independent of a cached translation's generation.
+     * Zero page size means that the producer cannot provide this snapshot. */
+    uint32_t code_page_generation, code_page_size;
+    uint64_t code_history_start; /* Lower bound after untracked external memory effects. */
     uint64_t bytes_hash;
     uint8_t instr_bytes[MAX_INSN_BYTES];
     uint8_t size;
@@ -215,6 +220,17 @@ InsnDescId trace_insn_desc_intern(TraceBuffer *tb, TraceArchKind arch, TraceArch
                                   uint64_t pc, uint32_t code_generation, const uint8_t *bytes,
                                   uint8_t size, const InsnMeta *meta);
 const InsnDesc *trace_insn_desc_get(const TraceBuffer *tb, InsnDescId desc_id);
+
+typedef enum {
+    TRACE_DESC_FOUND = 0,
+    TRACE_DESC_ABSENT,
+    TRACE_DESC_AMBIGUOUS,
+    TRACE_DESC_FUTURE
+} TraceDescLookup;
+
+TraceDescLookup trace_insn_desc_find(const TraceBuffer *tb, TraceArchKind arch, TraceArchMode mode,
+                                     uint64_t pc, uint32_t generation, uint64_t before_seq,
+                                     const InsnDesc **out);
 uint64_t trace_insn_desc_count(const TraceBuffer *tb);
 const TraceEntry *trace_append(TraceBuffer *tb, const TraceEntry *entry);
 const TraceEntry *trace_get_last(const TraceBuffer *tb, uint32_t i);

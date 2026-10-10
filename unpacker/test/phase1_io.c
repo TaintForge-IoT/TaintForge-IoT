@@ -152,6 +152,7 @@ bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv) {
     io->max_dump_bytes = UINT64_C(256) * 1024 * 1024;
     io->max_candidates = 1024;
     io->selection_delay = 200000;
+    io->max_capture_bytes = UINT64_C(64) * 1024 * 1024;
     for (int i = 0; i < argc; ++i) {
         if (!g_str_has_prefix(argv[i], "tf-"))
             continue;
@@ -179,6 +180,14 @@ bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv) {
             slot = &io->report_path;
         else if (OPTION("tf-ir-report"))
             slot = &io->ir_path;
+        else if (OPTION("tf-capture")) {
+            if (strcmp(value, "entry") && strcmp(value, "exit"))
+                goto invalid;
+            io->capture_at_entry = !strcmp(value, "entry");
+        } else if (OPTION("tf-max-capture-bytes")) {
+            if (!number(value, &io->max_capture_bytes, UINT64_C(1024) * 1024 * 1024))
+                goto invalid;
+        }
         else if (OPTION("tf-require-flags")) {
             if (strcmp(value, "on") && strcmp(value, "off"))
                 goto invalid;

@@ -172,6 +172,10 @@ bool ir_runtime_check_sources(IrRuntime *r, const TraceBuffer *trace, const DseA
     replay_options.capture_target = request->kind == IR_RUNTIME_CANDIDATE;
     replay = ir_replay_x86_build(input, &replay_options, &p->build);
     p->build_us = elapsed(phase);
+    p->ir_instructions = p->build.construction.records.instructions;
+    p->ir_values = p->build.construction.records.values;
+    p->ir_blocks = p->build.construction.records.blocks;
+    p->observations = p->build.observations;
     if (p->build.stopped_seq) {
         const ReplayStep *stop = replay_input_find(input, p->build.stopped_seq);
         if (stop) {
@@ -275,7 +279,9 @@ static const IssueName build_names[] = {{IR_REPLAY_IDENTITY, "identity"},
                                         {IR_REPLAY_CONTROL_MISMATCH, "control_mismatch"},
                                         {IR_REPLAY_MEMORY_MODEL, "memory_model"},
                                         {IR_REPLAY_BUDGET, "build_budget"},
-                                        {IR_REPLAY_INPUT_BUDGET, "input_budget"}};
+                                        {IR_REPLAY_INPUT_BUDGET, "input_budget"},
+                                        {IR_REPLAY_SYSCALL_OBSERVATION, "syscall_observation"},
+                                        {IR_REPLAY_SYSCALL_MODEL, "syscall_model"}};
 
 static void names_json(FILE *f, uint32_t bits, const IssueName *names, size_t n) {
     fputc('[', f);
@@ -379,6 +385,43 @@ bool ir_runtime_report_json(FILE *f, const IrRuntimeReport *p) {
         p->capture_status, p->capture_issues, p->build_attempted ? "true" : "false",
         p->build.status, p->build_attempted ? build_name(p->build.status) : "not_run");
     names_json(f, p->build.issues, build_names, G_N_ELEMENTS(build_names));
+    fputs(",\"construction\":", f);
+    ir_build_report_json(f, &p->build.construction);
+    fputs(",\"replay_budget\":", f);
+    ir_budget_report_json(f, &p->build.replay_budget);
+    fprintf(f,
+            ",\"environment\":{\"modeled_munmap\":%u,\"modeled_mprotect\":%u,\"stopped_syscall\":",
+            p->build.modeled_munmap, p->build.modeled_mprotect);
+    if (p->build.syscall_present) {
+        const DseSyscallObservation *e = &p->build.stopped_syscall;
+        fprintf(f,
+                "{\"seq\":%" PRIu64
+                ",\"number\":%u,\"returned\":%s,\"invalid\":%s,\"result\":%u,\"args\":[",
+                e->seq_id, e->number, e->returned ? "true" : "false", e->invalid ? "true" : "false",
+                e->result);
+        for (unsigned i = 0; i < 6; ++i)
+            fprintf(f, "%s%u", i ? "," : "", e->args[i]);
+        fputs("]}", f);
+    } else
+        fputs("null", f);
+    fprintf(f,",\"modeled_readlink\":%u,\"readlink_bytes\":%u,\"executable_snapshot_bytes\":%u,\"external_opens\":%u",
+        p->build.modeled_readlink,p->build.readlink_bytes,p->build.executable_snapshot_bytes,p->build.files.external_opens);
+    const IrEnvironmentStats *files=&p->build.files;
+    fprintf(f,",\"files\":{\"created\":%u,\"live\":%u,\"descriptors\":%u,\"resizes\":%u,"
+              "\"closes\":%u,\"mappings\":%u,\"mappings_live\":%u,\"replacements\":%u,"
+              "\"unmapped\":%u,\"writes\":%u,\"bytes_stored\":%u,\"content_cells\":%u,"
+              "\"memory_loads\":%u,\"memory_stores\":%u,\"fetch_bytes\":%u,"
+              "\"anonymous_maps\":%u,\"shared_fixed_maps\":%u,\"modeled_msync\":%u,"
+              "\"modeled_brk\":%u,\"brk_initialized\":%s,\"brk_initial\":%u,\"brk_current\":%u},\"reason\":",
+        files->files_created,files->files_live,files->descriptors_live,files->resizes,
+        files->closes,files->mappings_created,files->mappings_live,files->replacements,
+        files->unmapped,files->writes,files->bytes_stored,files->live_content_cells,
+        files->memory_loads,files->memory_stores,files->fetch_bytes,
+        files->anonymous_maps,files->shared_fixed_maps,files->syncs,files->brk_calls,
+        files->brk_initialized?"true":"false",files->brk_initial,files->brk_current);
+    if(p->build.environment_reason) fprintf(f,"\"%s\"",p->build.environment_reason);
+    else fputs("null",f);
+    fputc('}', f);
     fprintf(f, ",\"initial_state\":{\"gpr_mask\":%u,\"eflags_valid\":%s,\"eflags\":%u,\"gpr\":[",
             p->initial_gpr_mask, p->initial_eflags_valid ? "true" : "false", p->initial_eflags);
     for (unsigned i = 0; i < IR_X86_GPR_COUNT; ++i)
@@ -455,11 +498,15 @@ bool ir_runtime_summary_json(FILE *f, const IrRuntime *r) {
         ","
         "\"lifted_steps\":%" PRIu64 ",\"total_us\":%" PRIu64 ",\"peak_capture_bytes\":%zu,"
         "\"peak_replay_allocated_bytes\":%zu,\"peak_evaluator_allocated_bytes\":%zu,"
-        "\"window_limit\":%u,\"check_limit\":%u,\"capture_limit_bytes\":%zu,\"flat32_ram\":%s}\n",
+        "\"window_limit\":%u,\"check_limit\":%u,\"capture_limit_bytes\":%zu,\"flat32_ram\":%s,\"tls32_ram\":%s,\"observed_munmap\":%s,\"observed_mprotect\":%s,\"observed_files\":%s}\n",
         r->checks, r->matches, r->mismatches, r->unknown, r->errors, r->skipped_budget,
         r->selected_steps, r->lifted_steps, r->total_us, r->peak_capture_bytes,
         r->peak_replay_bytes, r->peak_evaluator_bytes, r->options.window_steps,
         r->options.max_checks, r->options.capture_bytes,
-        r->options.replay.x86.flat32_ram ? "true" : "false");
+        r->options.replay.x86.flat32_ram ? "true" : "false",
+        r->options.replay.x86.tls32_ram ? "true" : "false",
+        r->options.replay.observed_munmap ? "true" : "false",
+        r->options.replay.observed_mprotect ? "true" : "false",
+        r->options.replay.observed_files ? "true" : "false");
     return !ferror(f);
 }

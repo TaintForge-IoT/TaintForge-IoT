@@ -363,6 +363,7 @@ IrTraceSsaResult ir_trace_ssa(IrModule *m, const IrTraceSsaOptions *options) {
         (uint64_t)m->value_count * sizeof(*m->values) +
         (uint64_t)m->block_count * (sizeof(*m->blocks) + sizeof(uint32_t)) +
         (uint64_t)m->state_count * sizeof(*m->states) +
+        m->output_index_bytes + ((uint64_t)m->value_count + 7) / 8 +
         2 * ((uint64_t)m->output_count + o.roots.value_count + 16) * sizeof(*m->outputs) +
         ((uint64_t)m->state_count + 1) * (sizeof(*current) + sizeof(bool));
     if (!bytes(&b, copy_bytes))
@@ -370,7 +371,8 @@ IrTraceSsaResult ir_trace_ssa(IrModule *m, const IrTraceSsaOptions *options) {
     /* Clone validation and copying are bounded scans too. */
     if (!work(&b, 5 * (uint64_t)m->inst_count + 5 * (uint64_t)m->block_count +
                       2 * (uint64_t)m->value_count + 2 * (uint64_t)m->state_count +
-                      2 * (uint64_t)m->output_count + 1))
+                      2 * (uint64_t)m->output_count + 1 +
+                      2 * (uint64_t)m->output_index_bytes + ((uint64_t)m->value_count + 7) / 8))
         goto done;
     n = ir_module_clone(m);
     if (!n) {
@@ -416,7 +418,7 @@ IrTraceSsaResult ir_trace_ssa(IrModule *m, const IrTraceSsaOptions *options) {
         block = ir_trace_next(&n->blocks[block - 1].terminator, &valid);
     }
     if (!o.roots.keep_outputs)
-        n->output_count = 0;
+        ir_outputs_clear(n);
     for (uint32_t i = 0; i < o.roots.value_count; ++i) {
         if (!work(&b, (uint64_t)n->output_count + 1))
             goto done;
@@ -460,4 +462,100 @@ done:
     if (b.info.status != IR_OK)
         result.renamed_reads = result.initial_reads = result.removed = result.removed_writes = 0;
     return result;
+}
+
+IrModule *ir_trace_target_slice(const IrModule *m, const IrTargetSliceOptions *o,
+                                 IrTargetSliceInfo *info) {
+    Budget b = budget(o ? &o->limits : NULL);
+    IrTargetSliceInfo result = {0};
+    IrModule *copy = NULL;
+    IrLiveness live = {.module = m};
+    IrInstId *stack = NULL;
+    uint32_t count = 0;
+    if (!o || !o->value_count) { error(&b, IR_INVALID, "explicit target roots required"); goto done; }
+    IrSsaRoots roots = {.values = o->values, .value_count = o->value_count};
+    if (!validate(m, true, &b) || !roots_valid(m, &roots, &b)) goto done;
+    const IrBlock *boundary = ir_module_block(m, o->boundary);
+    if (!boundary || m->trace_rank[o->boundary - 1] != m->block_count ||
+        boundary->terminator.kind != IR_TERM_FRAGMENT_END) {
+        error(&b, IR_INVALID, "target boundary must be final fragment end"); goto done;
+    }
+    uint64_t copy_bytes = sizeof(*m) + (uint64_t)m->inst_count * sizeof(*m->insts) +
+        (uint64_t)m->value_count * sizeof(*m->values) +
+        (uint64_t)m->block_count * (sizeof(*m->blocks) + sizeof(uint32_t)) +
+        (uint64_t)m->state_count * sizeof(*m->states) +
+        m->output_index_bytes + ((uint64_t)m->value_count + 7) / 8 +
+        2 * ((uint64_t)m->output_count + o->value_count + 16) * sizeof(*m->outputs);
+    uint64_t scratch = ((uint64_t)m->inst_count + 1) * (sizeof(bool) + sizeof(*stack));
+    if (!bytes(&b, copy_bytes + scratch + (uint64_t)m->state_count + 1)) goto done;
+    live.insts = calloc(m->inst_count ? m->inst_count : 1, sizeof(*live.insts));
+    stack = calloc(m->inst_count ? m->inst_count : 1, sizeof(*stack));
+    if (!live.insts || !stack) goto oom;
+    result.records = m->inst_count; result.outputs_before = m->output_count;
+    for (uint32_t i = 0; i < o->value_count; ++i) {
+        if (!work(&b, 1)) goto done;
+        mark_value(&live, o->values[i], stack, &count);
+    }
+    for (uint32_t i = 0; i < m->inst_count; ++i) {
+        if (!work(&b, 1)) goto done;
+        const IrInst *ins = &m->insts[i];
+        if (ins->removed) continue;
+        ++result.active_before;
+        if (ins->spec.op == IR_OP_GUARD || ins->spec.op == IR_OP_BARRIER) {
+            result.guards += ins->spec.op == IR_OP_GUARD;
+            result.barriers += ins->spec.op == IR_OP_BARRIER;
+            mark(&live, i + 1, stack, &count);
+        }
+    }
+    for (uint32_t i = 0; i < m->block_count; ++i) {
+        if (!work(&b, 1)) goto done;
+        const IrTerminator *term = &m->blocks[i].terminator;
+        result.conditions += term->condition != 0;
+        result.indirect_targets += term->indirect_target != 0;
+        mark_value(&live, term->condition, stack, &count);
+        mark_value(&live, term->indirect_target, stack, &count);
+    }
+    while (count) {
+        const IrInst *ins = &m->insts[stack[--count] - 1];
+        if (!work(&b, 1 + ir_opcode_arity(ins->spec.op))) goto done;
+        for (unsigned i = 0; i < ir_opcode_arity(ins->spec.op); ++i)
+            mark_value(&live, ins->spec.args[i], stack, &count);
+    }
+    /* Clone's validation and array copy are bounded too. */
+    if (!work(&b, 5 * (uint64_t)m->inst_count + 5 * (uint64_t)m->block_count +
+        2 * (uint64_t)m->value_count + 2 * (uint64_t)m->state_count +
+        2 * (uint64_t)m->output_count + 1 +
+        2 * (uint64_t)m->output_index_bytes + ((uint64_t)m->value_count + 7) / 8)) goto done;
+    copy = ir_module_clone(m);
+    if (!copy) goto oom;
+    if (!work(&b, (uint64_t)m->inst_count + m->state_count)) goto done;
+    for (uint32_t i = 0; i < m->inst_count; ++i) {
+        IrInst *ins = &copy->insts[i];
+        if (!ins->removed && !live.insts[i]) {
+            ins->removed = true; ++result.removed;
+            result.removed_writes += ins->spec.op == IR_OP_WRITE_STATE;
+        }
+    }
+    for (uint32_t i = 0; i < copy->state_count; ++i) copy->states[i].live_out = false;
+    ir_outputs_clear(copy);
+    for (uint32_t i = 0; i < o->value_count; ++i) {
+        if (!work(&b, (uint64_t)copy->output_count + 1)) goto done;
+        if (!ir_module_add_output(copy, o->values[i])) {
+            error(&b, copy->status, copy->error); goto done;
+        }
+    }
+    if (!validate(copy, true, &b)) goto done;
+    copy->revision = m->revision + 1;
+    result.active_after = result.active_before - result.removed;
+    result.outputs_after = copy->output_count;
+    result.retained_bytes = ir_module_allocated_bytes(copy);
+    goto done;
+oom:
+    error(&b, IR_OUT_OF_MEMORY, "target slice allocation");
+done:
+    free(live.insts); free(stack);
+    if (b.info.status != IR_OK) { ir_module_destroy(copy); copy = NULL; }
+    result.analysis = b.info;
+    if (info) *info = result;
+    return copy;
 }

@@ -94,6 +94,13 @@ IrEvalResult ir_eval_run(IrEval *eval);
  * exhaustion is RESOURCE_LIMIT, never a truncated successful prefix. */
 IrEvalResult ir_eval_run_to_branch(IrEval *eval, IrBlockId block, IrEvalBranch *events,
                                    uint32_t capacity, uint32_t *count);
+/* Execute through the requested FRAGMENT_END, recording every preceding
+ * CJUMP. All instructions/guards must execute; unrelated exports/live-outs
+ * are not checked. Inspect the required boundary value separately. Earlier
+ * exits, unknown conditions/effects and capacity exhaustion still stop.
+ * This is a boundary evaluator, not an observation or OEP verifier. */
+IrEvalResult ir_eval_run_to_fragment(IrEval *eval, IrBlockId block, IrEvalBranch *events,
+                                     uint32_t capacity, uint32_t *count);
 IrEvalResult ir_eval_result(const IrEval *eval);
 /* Owned allocations including capacities, excluding the borrowed module and
  * bindings. After a run this is its allocation high-water mark. */

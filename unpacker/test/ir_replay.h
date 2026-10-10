@@ -7,6 +7,9 @@
 #include "ir_inputs.h"
 
 typedef struct IrReplay IrReplay;
+#define IR_PROC_EXE_API 1
+#define IR_REPLAY_CHECKPOINT_REUSE_API 1
+#define IR_PROC_EXE_INPUT_KEY UINT64_C(0x20000)
 
 typedef enum {
     IR_REPLAY_READY,
@@ -27,7 +30,9 @@ enum {
     IR_REPLAY_CONTROL_MISMATCH = 1U << 7,
     IR_REPLAY_MEMORY_MODEL = 1U << 8,
     IR_REPLAY_BUDGET = 1U << 9,
-    IR_REPLAY_INPUT_BUDGET = 1U << 10
+    IR_REPLAY_INPUT_BUDGET = 1U << 10,
+    IR_REPLAY_SYSCALL_OBSERVATION = 1U << 11,
+    IR_REPLAY_SYSCALL_MODEL = 1U << 12
 };
 
 typedef struct {
@@ -35,6 +40,17 @@ typedef struct {
     uint32_t issues;
     uint32_t selected_steps, lifted_steps;
     uint64_t stopped_seq;
+    IrOrigin stopped_origin; /* Also available after a fatal build/destroy. */
+    IrBuildMetrics construction;
+    IrBudgetFailure replay_budget; /* Replay-owned limits, distinct from module limits. */
+    uint32_t observations, memory_bytes;
+    uint32_t modeled_munmap;
+    uint32_t modeled_mprotect;
+    IrEnvironmentStats files;
+    uint32_t modeled_readlink, readlink_bytes, executable_snapshot_bytes;
+    const char *environment_reason; /* Static reason; never an owned pointer. */
+    bool syscall_present;
+    DseSyscallObservation stopped_syscall;
 } IrReplayBuildInfo;
 
 typedef struct {
@@ -43,8 +59,32 @@ typedef struct {
     uint32_t max_steps;
     uint32_t max_observations;
     uint32_t max_memory_bytes;
+    uint32_t max_repeat_iterations; /* Per REP occurrence; guarded exact trace count. */
     IrInputLimits inputs;
     bool capture_target; /* Project the exact trigger's pre-transfer destination. */
+    /* Optional query predicate emitted at the trigger, after every prefix
+     * effect/guard. It is an output, never a constraint on execution.
+     * Requires capture_target; both equality and inequality can be queried. */
+    bool compare_target;
+    uint32_t target_candidate;
+    /* Linux i386 INT 80 munmap only, 4 KiB pages, serialized execution and
+     * fixed observed environment result. Argument changes stop at a GUARD.
+     * Successful ranges stay inaccessible until an explicit modeled mapping. */
+    bool observed_munmap;
+    /* Successful Linux i386 INT 80 mprotect, 4 KiB pages, ordinary RAM with
+     * explicit R/W/X permissions (no implicit EXEC or protection keys).
+     * Only NONE, R, RW, RX, RWX are modeled. Errors remain UNKNOWN. */
+    bool observed_mprotect;
+    /* Serialized Linux i386 memfd/create/resize/map/write/close model, fixed
+     * anonymous/shared remap, mmap2, MS_SYNC and provider-observed brk;
+     * fixed observed syscall outcomes and arguments, symbolic buffer contents.
+     * Requires flat32_ram; no external files, aliases or unobserved history. */
+    bool observed_files;
+    /* Explicit immutable /proc/self/exe provider; requires observed_files.
+     * No arbitrary host path lookup or success inferred from an fd alone. */
+    bool observed_proc_exe;
+    uint32_t max_executable_bytes;
+    uint32_t max_file_objects, max_file_content_cells;
 } IrReplayOptions;
 
 typedef enum {
@@ -55,11 +95,15 @@ typedef enum {
     IR_REPLAY_WRITE_ADDRESS,
     IR_REPLAY_WRITE_VALUE,
     IR_REPLAY_BRANCH_CONDITION,
-    IR_REPLAY_TRANSFER_TARGET
+    IR_REPLAY_TRANSFER_TARGET,
+    IR_REPLAY_TLS_BASE
 } IrReplayObservationKind;
 
 typedef struct {
     IrReplayObservationKind kind;
+    /* Exported BV1 CONST at this checkpoint, never a path constraint. A shared
+     * value is observable only after this marker executes. Zero for non-state observations. */
+    IrValueId reached;
     IrOrigin origin;
     IrValueId value;
     uint8_t width;
@@ -76,6 +120,8 @@ typedef struct {
     IrX86LiftStatus status;
     IrValueId value;
     int gpr_index;
+    IrBlockId boundary;
+    IrValueId matches_candidate; /* BV1, only with options.compare_target. */
 } IrReplayTarget;
 
 typedef enum {
@@ -107,7 +153,9 @@ typedef struct {
 IrReplayOptions ir_replay_default_options(void);
 /* Builds an owned, bounded fragment from selected steps, ending BEFORE trigger.
  * Only adjacent same-vCPU occurrences with verified semantic successors are
- * connected. Jcc needs an exact BranchEvent in the owned occurrence. Other
+ * connected. Jcc needs an exact BranchEvent in the owned occurrence. LOOP
+ * may also use an unambiguous next_pc (distinct taken/fallthrough addresses).
+ * Coincident LOOP successors still require an explicit event. Other
  * Indirect transfers guard the computed destination before following an
  * observed adjacent occurrence. Unobserved conditional successors remain ADDRESS exits; following them evaluates to UNKNOWN.
  * Repeated PCs get distinct dynamic blocks, not an invented CFG merge.

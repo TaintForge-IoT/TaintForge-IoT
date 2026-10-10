@@ -21,6 +21,11 @@
 #define DSE_MAX_REPLAY_EVAL_NODES DSE_MAX_EXPR_NODES
 
 static bool g_dse_verbose_diagnostics = true;
+static bool g_dse_control_pruning = true;
+
+void dse_set_control_pruning(bool enabled) {
+    g_dse_control_pruning = enabled;
+}
 #define DSE_DIAGNOSTIC(...)                                                                        \
     do {                                                                                           \
         if (g_dse_verbose_diagnostics)                                                             \
@@ -29,6 +34,192 @@ static bool g_dse_verbose_diagnostics = true;
 
 void dse_set_verbose_diagnostics(bool enabled) {
     g_dse_verbose_diagnostics = enabled;
+}
+
+static const char *const dse_cfg_stop_names[] = {"none",
+                                                 "trace_start",
+                                                 "trace_buffer_boundary",
+                                                 "control_scan_window",
+                                                 "cfg_scan_budget",
+                                                 "trace_entry_missing",
+                                                 "sequence_gap",
+                                                 "vcpu_change",
+                                                 "metadata_missing",
+                                                 "code_identity",
+                                                 "unsupported_mode",
+                                                 "aux_missing",
+                                                 "execution_incomplete",
+                                                 "next_pc_missing",
+                                                 "next_pc_mismatch",
+                                                 "memory_read",
+                                                 "memory_write",
+                                                 "memory_read_write",
+                                                 "opaque_instruction",
+                                                 "cfg_node_budget",
+                                                 "return",
+                                                 "call",
+                                                 "indirect_jump"};
+static const char *const dse_cfg_failure_names[] = {"none",
+                                                    "region_budget",
+                                                    "region_code_identity",
+                                                    "branch_outside_region",
+                                                    "boundary_outside_region",
+                                                    "occurrence_order",
+                                                    "branch_node_missing",
+                                                    "boundary_node_missing",
+                                                    "same_cfg_node",
+                                                    "query_code_identity",
+                                                    "missing_successor",
+                                                    "opaque_node",
+                                                    "cycle",
+                                                    "query_budget",
+                                                    "invalid_graph",
+                                                    "boundary_not_postdominating",
+                                                    "memory_read_unmodeled"};
+G_STATIC_ASSERT(G_N_ELEMENTS(dse_cfg_stop_names) == DSE_CFG_STOP_COUNT);
+G_STATIC_ASSERT(G_N_ELEMENTS(dse_cfg_failure_names) == DSE_CFG_FAILURE_COUNT);
+static const char *const dse_cfg_resolve_names[] = {"none",
+                                                    "page_version_unavailable",
+                                                    "stale_translation",
+                                                    "page_boundary",
+                                                    "descriptor_missing",
+                                                    "descriptor_ambiguous",
+                                                    "descriptor_after_prefix",
+                                                    "descriptor_invalid",
+                                                    "continuation_budget",
+                                                    "descriptor_before_barrier"};
+G_STATIC_ASSERT(G_N_ELEMENTS(dse_cfg_resolve_names) == DSE_CFG_RESOLVE_COUNT);
+
+static void dse_control_origin_json(GString *out, const TraceEntry *e) {
+    if (!e) {
+        g_string_append(out, "null");
+        return;
+    }
+    g_string_append_printf(out,
+                           "{\"seq\":%" PRIu64 ",\"pc\":%" PRIu64
+                           ",\"vcpu\":%u,\"generation\":%u,\"descriptor\":%" PRIu64,
+                           e->seq_id, e->pc, e->vcpu_index, e->code_generation, e->insn_desc_id);
+    if (!e->seq_id)
+        g_string_append(out, ",\"source\":\"decoded_descriptor\"");
+    g_string_append_c(out, '}');
+}
+
+static void dse_cfg_counts_json(GString *out, const uint32_t *counts, const char *const *names,
+                                size_t count) {
+    g_string_append_c(out, '{');
+    bool comma = false;
+    for (size_t i = 1; i < count; ++i) {
+        if (counts[i]) {
+            g_string_append_printf(out, "%s\"%s\":%u", comma ? "," : "", names[i], counts[i]);
+            comma = true;
+        }
+    }
+    g_string_append_c(out, '}');
+}
+
+static void dse_cfg_diagnostics_json(GString *out, const DseControlStats *s) {
+    if (!s->cfg_regions && !s->cfg_queries) {
+        g_string_append(out, "null");
+        return;
+    }
+    g_string_append(out, "{\"build_stops\":");
+    dse_cfg_counts_json(out, s->cfg_stops, dse_cfg_stop_names, DSE_CFG_STOP_COUNT);
+    g_string_append(out, ",\"query_failures\":");
+    dse_cfg_counts_json(out, s->cfg_failures, dse_cfg_failure_names, DSE_CFG_FAILURE_COUNT);
+    g_string_append_printf(
+        out, ",\"continuations\":{\"attempts\":%u,\"lookups\":%u,\"added\":%u,\"failures\":",
+        s->cfg_resolve_attempts, s->cfg_resolve_lookups, s->cfg_resolve_added);
+    dse_cfg_counts_json(out, s->cfg_resolve_failures, dse_cfg_resolve_names, DSE_CFG_RESOLVE_COUNT);
+    g_string_append_c(out, '}');
+    g_string_append_printf(out, ",\"example_limit\":%u,\"examples_omitted\":%u,\"examples\":[",
+                           DSE_CFG_MAX_EXAMPLES, s->cfg_examples_omitted);
+    for (uint32_t i = 0; i < s->cfg_example_count; ++i) {
+        const DseCfgExample *e = &s->cfg_examples[i];
+        const DseCfgBuildStop *stop = &e->build_stop;
+        g_string_append_printf(out, "%s{\"count\":%u,\"reason\":\"%s\",\"branch\":", i ? "," : "",
+                               e->count, dse_cfg_failure_names[e->reason]);
+        dse_control_origin_json(out, &e->branch);
+        g_string_append(out, ",\"boundary\":");
+        dse_control_origin_json(out, &e->boundary);
+        g_string_append(out, ",\"at\":");
+        dse_control_origin_json(out, e->at_present ? &e->at : NULL);
+        g_string_append_printf(
+            out, ",\"build_stop\":{\"reason\":\"%s\",\"at\":", dse_cfg_stop_names[stop->reason]);
+        dse_control_origin_json(out, stop->site_present ? &stop->site : NULL);
+        g_string_append(out, ",\"expected_next_pc\":");
+        if (stop->expected_next_valid)
+            g_string_append_printf(out, "%" PRIu64, stop->expected_next_pc);
+        else
+            g_string_append(out, "null");
+        g_string_append(out, ",\"observed_next_pc\":");
+        if (stop->observed_next_valid)
+            g_string_append_printf(out, "%" PRIu64, stop->observed_next_pc);
+        else
+            g_string_append(out, "null");
+        g_string_append(out, "},\"missing_edge\":");
+        if (e->edge_issue == DSE_CFG_EDGE_NONE) {
+            g_string_append(out, "null");
+        } else {
+            const char *kind = e->edge_kind == TRACE_BRANCH_JUMP_DIRECT ? "direct_jump"
+                               : e->edge_kind == TRACE_BRANCH_CONDITIONAL && e->successor_index
+                                   ? "taken"
+                                   : "fallthrough";
+            g_string_append_printf(out,
+                                   "{\"from_pc\":%" PRIu64 ",\"to_pc\":%" PRIu64
+                                   ",\"kind\":\"%s\",\"reason\":\"%s\",\"target_generation\":",
+                                   e->at.pc, e->target_pc, kind,
+                                   e->edge_issue == DSE_CFG_EDGE_GENERATION
+                                       ? "generation_mismatch"
+                                       : "target_not_in_region");
+            if (e->edge_issue == DSE_CFG_EDGE_GENERATION)
+                g_string_append_printf(out, "%u", e->target_generation);
+            else
+                g_string_append(out, "null");
+            if (e->resolution)
+                g_string_append_printf(out, ",\"resolution\":\"%s\"",
+                                       dse_cfg_resolve_names[e->resolution]);
+            g_string_append_c(out, '}');
+        }
+        g_string_append_c(out, '}');
+    }
+    g_string_append(out, "]}");
+}
+
+void dse_control_append_json(GString *out, const DseControlStats *s) {
+    if (!out || !s)
+        return;
+    g_string_append_printf(out,
+                           "{\"scope\":\"bounded_trace_prefix\",\"relation\":\"%s\","
+                           "\"first_seq\":%" PRIu64 ",\"trigger_seq\":%" PRIu64 ","
+                           "\"vcpu\":%u,\"scanned\":%u,\"branches\":%u,\"retained\":%u,"
+                           "\"disjoint_retained\":%u,\"issues\":%u,\"first_unknown\":",
+                           s->trigger_seq ? (s->issues       ? "UNKNOWN"
+                                             : s->cfg_pruned ? "proven_independent"
+                                                             : "none_in_scope")
+                                          : "not_analyzed",
+                           s->first_seq, s->trigger_seq, s->vcpu, s->scanned, s->branches,
+                           s->retained, s->disjoint_retained, s->issues);
+    dse_control_origin_json(out, s->first_unknown.seq_id ? &s->first_unknown : NULL);
+    static const char *const reasons[] = {"partial_dcfg",         "open_trace_boundary",
+                                          "branch_event_missing", "branch_event_conflict",
+                                          "control_scan_budget",  "slice_or_path_budget",
+                                          "trace_order_conflict", "metadata_missing"};
+    g_string_append(out, ",\"reasons\":[");
+    bool comma = false;
+    for (unsigned i = 0; i < G_N_ELEMENTS(reasons); ++i) {
+        if (s->issues & (1U << i)) {
+            g_string_append_printf(out, "%s\"%s\"", comma ? "," : "", reasons[i]);
+            comma = true;
+        }
+    }
+    g_string_append_printf(out,
+                           "],\"cfg\":{\"nodes\":%u,\"queries\":%u,\"pruned\":%u,"
+                           "\"unknown\":%u,\"effect_conflicts\":%u,\"issues\":%u,"
+                           "\"regions\":%u,\"scanned\":%u,\"diagnostics\":",
+                           s->cfg_nodes, s->cfg_queries, s->cfg_pruned, s->cfg_unknown,
+                           s->cfg_effect_conflicts, s->cfg_issues, s->cfg_regions, s->cfg_scanned);
+    dse_cfg_diagnostics_json(out, s);
+    g_string_append(out, "}}");
 }
 
 static void dse_diagnostic_origin(DSECtx *ctx, const TraceEntry *entry) {
@@ -69,7 +260,8 @@ void dse_replay_diagnostic_append_json(GString *out, const DseReplayDiagnostic *
         return;
     }
     static const char *const sites[] = {"root",     "address_read", "address_write", "branch",
-                                        "register", "memory_read",  "memory_write",  "target"};
+                                        "register", "memory_read",  "memory_write",  "target",
+                                        "flag"};
     const char *site = (unsigned)d->site < G_N_ELEMENTS(sites) ? sites[d->site] : "unknown";
     g_string_append_printf(out,
                            "{\"kind\":\"%s\",\"site\":\"%s\",\"origin_valid\":%s,"
@@ -122,11 +314,12 @@ typedef struct {
 } DseRootOriginKey;
 
 typedef struct DseSlicePlan {
-    uint64_t seq_id[MAX_SLICE];
-    uint8_t data_reg_live_after[MAX_SLICE][REG_COUNT];
-    uint8_t replay_reg_live_after[MAX_SLICE][REG_COUNT];
-    bool data_all_memory_writes[MAX_SLICE];
-    bool replay_all_memory_writes[MAX_SLICE];
+    uint64_t *seq_id;
+    uint8_t (*data_reg_live_after)[REG_COUNT];
+    uint8_t (*replay_reg_live_after)[REG_COUNT];
+    bool *data_all_memory_writes;
+    bool *replay_all_memory_writes;
+    const TraceEntry **entries;
     GHashTable *data_memory_writes;
     GHashTable *replay_memory_writes;
 } DseSlicePlan;
@@ -1330,6 +1523,19 @@ void sym_state_set_reg(SymState *state, RegId rid, SymExpr *expr) {
     sym_expr_free(old);
 }
 
+static void dse_file_byte_free(gpointer value) {
+    sym_expr_free((SymExpr *)value);
+}
+
+static void dse_file_state_clear(DseFileState *files) {
+    if (!files)
+        return;
+    for (uint32_t i = 0; i < files->count; ++i)
+        if (files->objects[i].bytes)
+            g_hash_table_destroy(files->objects[i].bytes);
+    *files = (DseFileState){0};
+}
+
 static void dse_reset_register_root_epochs(DSECtx *ctx) {
     if (!ctx)
         return;
@@ -1518,6 +1724,7 @@ bool dse_ctx_init(DSECtx *ctx) {
 void dse_ctx_free(DSECtx *ctx) {
     if (!ctx)
         return;
+    dse_file_state_clear(&ctx->files);
     dse_z3_cache_clear(ctx);
     if (ctx->z3_expr_cache) {
         g_hash_table_destroy(ctx->z3_expr_cache);
@@ -1944,7 +2151,7 @@ bool dse_constrain_observed_address(DSECtx *ctx, SymExpr *address, uint64_t obse
     return true;
 }
 
-bool dse_path_assert(DSECtx *ctx, SymExpr *cond, bool expected) {
+static bool dse_assert_condition(DSECtx *ctx, SymExpr *cond, bool expected, bool branch) {
     if (!ctx || !cond || cond->width != 1 || !ctx->has_solver || !ctx->z3_ctx ||
         !ctx->path_predicate) {
         if (ctx) {
@@ -1990,9 +2197,16 @@ bool dse_path_assert(DSECtx *ctx, SymExpr *cond, bool expected) {
     Z3_dec_ref(z3, ctx->path_predicate);
     ctx->path_predicate = predicate;
     Z3_dec_ref(z3, condition);
-    ctx->path_constraints++;
+    if (branch)
+        ctx->path_constraints++;
+    else
+        ctx->syscalls.argument_constraints++;
     sym_expr_free(cond);
     return true;
+}
+
+bool dse_path_assert(DSECtx *ctx, SymExpr *cond, bool expected) {
+    return dse_assert_condition(ctx, cond, expected, true);
 }
 
 static int dse_x86_flag_slot(uint8_t flag) {
@@ -2084,6 +2298,29 @@ SymExpr *dse_get_x86_flag(DSECtx *ctx, const InsnAux *aux, uint8_t flag) {
     return root;
 }
 
+SymExpr *dse_get_x86_flag_checked(DSECtx *ctx, const InsnAux *aux, uint8_t flag) {
+    int bit = dse_x86_eflags_bit(flag);
+    if (!ctx || bit < 0)
+        return NULL;
+    if (!aux || !aux->eflags_valid) {
+        dse_record_replay_missing(ctx);
+        dse_mark_path_failure(ctx);
+        dse_invalidate_x86_flags(ctx, flag);
+        return NULL;
+    }
+    SymExpr *value = dse_get_x86_flag(ctx, aux, flag);
+    if (!value)
+        return NULL;
+    if (dse_replay_expect(ctx, value, (aux->eflags_before >> (uint32_t)bit) & 1U,
+                          DSE_REPLAY_SITE_FLAG, (uint64_t)bit, 0) != DSE_REPLAY_CHECK_OK) {
+        sym_expr_free(value);
+        dse_mark_path_failure(ctx);
+        dse_invalidate_x86_flags(ctx, flag);
+        return NULL;
+    }
+    return value;
+}
+
 void dse_set_x86_flag(DSECtx *ctx, uint8_t flag, SymExpr *value) {
     int slot = dse_x86_flag_slot(flag);
     if (!ctx || slot < 0) {
@@ -2121,12 +2358,676 @@ void dse_invalidate_x86_flags(DSECtx *ctx, uint8_t flags) {
     ctx->x86_flags_poisoned |= flags;
 }
 
+bool dse_constrain_observed_flat_es(DSECtx *ctx, SymExpr *offset, const InsnAux *aux) {
+    if (!ctx || !aux) {
+        sym_expr_free(offset);
+        return false;
+    }
+    if (!dse_constrain_observed_address(ctx, offset, aux->mem_read_addr, DSE_ADDRESS_READ))
+        return false;
+    const char *issue = dse_aux_es_contract_issue(aux);
+    if (!issue && aux->mem_read_addr > UINT32_MAX - 3U)
+        issue = "segment_limit_crossed";
+    if (issue) {
+        dse_mark_path_failure(ctx);
+        DSE_DIAGNOSTIC(stderr, "[DSE-SEGMENT-UNKNOWN] pc=0x%" PRIx64 " seq=%" PRIu64
+                       " segment=es reason=%s scope=observed_flat_address\n",
+                       aux->pc, aux->seq_id, issue);
+    }
+    return true;
+}
+
+bool dse_check_x86_direction(DSECtx *ctx, const InsnAux *aux, int8_t direction) {
+    if (!ctx)
+        return false;
+    const DseDirectionFact *fact = aux ? &aux->df_before : NULL;
+    if (!ctx->state.x86_flags[DSE_FLAG_SLOT_DF] && !ctx->x86_df_poisoned && fact &&
+        fact->valid && fact->value <= 1 && fact->writer_seq != 0 &&
+        fact->writer_seq < ctx->replay_first_seq && fact->writer_descriptor != 0 &&
+        fact->boundary_seq == aux->seq_id && ctx->replay_origin_valid &&
+        ctx->replay_origin.seq_id == aux->seq_id &&
+        ctx->replay_origin.vcpu_index == fact->vcpu_index && aux->eflags_valid) {
+        uint8_t writer_byte = fact->value ? 0xfd : 0xfc;
+        if (fact->writer_bytes_hash == trace_instruction_bytes_hash(&writer_byte, 1)) {
+            ctx->state.x86_flags[DSE_FLAG_SLOT_DF] = sym_expr_const(fact->value, 1);
+            /* The writer's prefix was observed, not symbolically replayed.
+             * Never turn that evidence into an eligible OEP proof. */
+            dse_mark_path_failure(ctx);
+            DSE_DIAGNOSTIC(stderr, "[DSE-DF-BOUNDARY] pc=0x%" PRIx64 " seq=%" PRIu64
+                " writer_pc=0x%" PRIx64 " writer_seq=%" PRIu64 " generation=%u"
+                " descriptor=%" PRIu64 " vcpu=%u value=%u syscall_steps=%u scope=observed_prefix\n",
+                aux->pc, aux->seq_id, fact->writer_pc, fact->writer_seq,
+                fact->writer_generation, fact->writer_descriptor, fact->vcpu_index, fact->value,
+                fact->syscall_steps);
+        }
+    }
+    const SymExpr *df = ctx->state.x86_flags[DSE_FLAG_SLOT_DF];
+    /* An observed DF is not a definition at the slice boundary. */
+    if (!df || df->type != SYM_CONST || df->width != 1 || !aux || !aux->eflags_valid ||
+        (direction != 1 && direction != -1)) {
+        const char *reason = !df ? "definition_missing" :
+                             df->type != SYM_CONST || df->width != 1 ? "definition_symbolic" :
+                             !aux || !aux->eflags_valid ? "observation_missing" :
+                             "invalid_direction";
+        DSE_DIAGNOSTIC(stderr, "[DSE-DF-UNKNOWN] pc=0x%" PRIx64 " seq=%" PRIu64 " reason=%s\n",
+                       aux ? aux->pc : 0, aux ? aux->seq_id : 0, reason);
+        dse_mark_path_failure(ctx);
+        return false;
+    }
+    if (dse_replay_expect(ctx, df, (aux->eflags_before >> 10) & 1U,
+                          DSE_REPLAY_SITE_FLAG, 10, 0) != DSE_REPLAY_CHECK_OK ||
+        dse_replay_expect(ctx, df, direction < 0, DSE_REPLAY_SITE_FLAG, 10, 0) !=
+            DSE_REPLAY_CHECK_OK) {
+        dse_mark_path_failure(ctx);
+        return false;
+    }
+    return true;
+}
+
 //init all
 static const TraceBuffer *g_tb = NULL;
 static const DseAuxRing *g_ring = NULL;
 static const DseArch *g_arch = NULL;
 static uint32_t g_total = 0, g_concretized = 0;
 static uint32_t g_aux_miss = 0, g_unsupported = 0;
+
+static bool dse_syscall_instruction(const InsnMeta *meta) {
+    return meta && (meta->insn_id == X86_INS_INT || meta->insn_id == X86_INS_SYSENTER ||
+                    meta->insn_id == X86_INS_SYSCALL);
+}
+
+void dse_syscall_append_json(GString *out, const DseSyscallStats *s) {
+    if (!out || !s)
+        return;
+    g_string_append_printf(out,
+        "{\"seen\":%u,\"returns_modeled\":%u,\"unsupported\":%u,"
+        "\"observation_failures\":%u,\"effects_unmodeled\":%u,"
+        "\"argument_constraints\":%u,\"name_constraints\":%u,"
+        "\"files\":{\"created\":%u,\"live\":%u,\"resizes\":%u,\"invalidations\":%u,"
+        "\"last_update\":{\"id\":%" PRIu64 ",\"fd\":%u,\"flags\":%u,"
+        "\"size\":%" PRIu64 ",\"version\":%" PRIu64 "}},"
+        "\"mappings\":{\"created\":%u,\"live\":%u,\"argument_constraints\":%u,"
+        "\"replaced\":%u,\"cells_discarded\":%" PRIu64 ","
+        "\"reads\":%" PRIu64 ",\"zero_reads\":%" PRIu64 ",\"writes\":%" PRIu64
+        ",\"access_failures\":%" PRIu64 ",\"last_base\":%" PRIu64 ",\"last_end\":%" PRIu64
+        ",\"file_id\":%" PRIu64 ",\"file_version\":%" PRIu64
+        ",\"bad_address\":%" PRIu64 ",\"first_reason\":\"%s\"},"
+        "\"writes\":{\"calls\":%u,\"bytes\":%" PRIu64 ",\"shared_bytes\":%" PRIu64
+        ",\"buffer_checks\":%" PRIu64 ",\"content_bytes\":%u,\"file_id\":%" PRIu64
+        ",\"offset\":%" PRIu64 ",\"size\":%" PRIu64 ",\"position\":%" PRIu64 "},"
+        "\"closes\":{\"calls\":%u,\"descriptors_live\":%u,\"objects_released\":%u,"
+        "\"mappings_preserved\":%u,\"last_file\":%" PRIu64 ",\"last_fd\":%u,\"retained\":%s},"
+        "\"first_unknown\":",
+        s->seen, s->returns_modeled, s->unsupported, s->observation_failures,
+        s->effects_unmodeled, s->argument_constraints, s->name_constraints,
+        s->file_objects_created, s->file_objects_live, s->file_resizes, s->file_state_invalidations,
+        s->last_file_id, s->last_file_fd, s->last_file_flags, s->last_file_size, s->last_file_version,
+        s->mappings_created, s->mappings_live, s->mmap_argument_constraints,
+        s->mappings_replaced, s->mapping_cells_discarded,
+        s->mapping_reads, s->mapping_zero_reads, s->mapping_writes, s->mapping_access_failures,
+        s->last_mapping_base, s->last_mapping_end, s->last_mapping_file, s->last_mapping_version,
+        s->mapping_bad_address, s->mapping_first_reason ? s->mapping_first_reason : "",
+        s->file_write_calls, s->file_write_bytes, s->file_write_shared_bytes,
+        s->file_buffer_checks, s->file_content_bytes, s->last_write_file,
+        s->last_write_offset, s->last_write_size, s->last_file_position,
+        s->file_closes, s->file_descriptors_live, s->file_objects_released, s->close_mappings_preserved,
+        s->last_close_file, s->last_close_fd, s->last_close_retained ? "true" : "false");
+    if (!s->first_reason) {
+        g_string_append(out, "null}");
+        return;
+    }
+    g_string_append_printf(out,
+        "{\"seq\":%" PRIu64 ",\"pc\":%" PRIu64 ",\"vcpu\":%u,"
+        "\"generation\":%u,\"descriptor\":%" PRIu64 ",\"reason\":\"%s\","
+        "\"observation_present\":%s,\"number\":%u,\"result\":%u}}",
+        s->first_unknown.seq_id, s->first_unknown.pc, s->first_unknown.vcpu_index,
+        s->first_unknown.code_generation, s->first_unknown.insn_desc_id, s->first_reason,
+        s->first_has_observation ? "true" : "false", s->first_number, s->first_result);
+}
+
+static void dse_syscall_issue(DSECtx *ctx, const TraceEntry *entry, const InsnAux *aux,
+                              const char *reason) {
+    const DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!ctx->syscalls.first_reason) {
+        ctx->syscalls.first_unknown = *entry;
+        ctx->syscalls.first_reason = reason;
+        ctx->syscalls.first_has_observation = s != NULL;
+        ctx->syscalls.first_number = s ? s->number : 0;
+        ctx->syscalls.first_result = s ? s->result : 0;
+    }
+    dse_mark_path_failure(ctx);
+    DSE_DIAGNOSTIC(stderr,
+        "[DSE-SYSCALL-UNKNOWN] pc=0x%" PRIx64 " seq=%" PRIu64 " vcpu=%u number=%u reason=%s\n",
+        entry->pc, entry->seq_id, entry->vcpu_index, s ? s->number : 0, reason);
+}
+
+static void dse_forget_external_memory(DSECtx *ctx) {
+    /* ftruncate may affect an existing mapping through a file alias. Neither
+     * plugin memory callbacks nor a successful return prove an empty effect. */
+    if (ctx->state.sym_mem)
+        g_hash_table_remove_all(ctx->state.sym_mem);
+    if (ctx->memory_root_epoch != UINT64_MAX)
+        ctx->memory_root_epoch++;
+    ctx->memory_model_complete = false;
+}
+
+static void dse_forget_files(DSECtx *ctx) {
+    if (ctx->files.count)
+        ctx->syscalls.file_state_invalidations++;
+    dse_file_state_clear(&ctx->files);
+    ctx->syscalls.file_objects_live = 0;
+    ctx->syscalls.mappings_live = 0;
+    ctx->syscalls.file_content_bytes = 0;
+    ctx->syscalls.file_descriptors_live = 0;
+}
+
+static DseFileObject *dse_file_lookup(DSECtx *ctx, uint32_t fd) {
+    for (uint32_t i = 0; i < ctx->files.count; ++i)
+        if (ctx->files.objects[i].fd_open && ctx->files.objects[i].fd == fd)
+            return &ctx->files.objects[i];
+    return NULL;
+}
+
+static DseFileObject *dse_file_by_id(DSECtx *ctx, uint64_t id) {
+    for (uint32_t i = 0; i < ctx->files.count; ++i)
+        if (ctx->files.objects[i].id == id)
+            return &ctx->files.objects[i];
+    return NULL;
+}
+
+/* Takes ownership of value. Sparse non-initial contents share the usual
+ * expression lifetime and resource accounting, never observed constants. */
+static bool dse_file_put_byte(DSECtx *ctx, DseFileObject *file, uint64_t offset, SymExpr *value) {
+    if (!value)
+        return false;
+    gint64 lookup = (gint64)offset;
+    bool exists = file->bytes && g_hash_table_contains(file->bytes, &lookup);
+    if (!exists && ctx->files.content_bytes >= DSE_MAX_FILE_CONTENT_BYTES) {
+        sym_expr_free(value);
+        dse_mark_resource_limit(ctx);
+        return false;
+    }
+    gint64 *key = g_try_new(gint64, 1);
+    if (!file->bytes)
+        file->bytes = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, dse_file_byte_free);
+    if (!key || !file->bytes) {
+        g_free(key);
+        sym_expr_free(value);
+        dse_mark_resource_limit(ctx);
+        return false;
+    }
+    *key = lookup;
+    g_hash_table_replace(file->bytes, key, value);
+    if (!exists)
+        ctx->files.content_bytes++;
+    ctx->syscalls.file_content_bytes = ctx->files.content_bytes;
+    return true;
+}
+
+static void dse_file_truncate_bytes(DSECtx *ctx, DseFileObject *file, uint64_t size) {
+    if (!file->bytes)
+        return;
+    GHashTableIter it;
+    gpointer key;
+    g_hash_table_iter_init(&it, file->bytes);
+    while (g_hash_table_iter_next(&it, &key, NULL)) {
+        if ((uint64_t)*(gint64 *)key >= size) {
+            g_hash_table_iter_remove(&it);
+            ctx->files.content_bytes--;
+        }
+    }
+    ctx->syscalls.file_content_bytes = ctx->files.content_bytes;
+}
+
+static void dse_file_diagnostic(DSECtx *ctx, const DseFileObject *file,
+                                const TraceEntry *entry, const char *operation) {
+    ctx->syscalls.file_objects_live = ctx->files.count;
+    ctx->syscalls.last_file_id = file->id;
+    ctx->syscalls.last_file_fd = file->fd;
+    ctx->syscalls.last_file_flags = file->flags;
+    ctx->syscalls.last_file_size = file->size;
+    ctx->syscalls.last_file_version = file->version;
+    DSE_DIAGNOSTIC(stderr,
+        "[DSE-FILE-MODELED] seq=%" PRIu64 " pc=0x%" PRIx64
+        " operation=%s object=%" PRIu64 " fd=%u size=%" PRIu64
+        " version=%" PRIu64 " scope=fresh_unmapped_memfd\n",
+        entry->seq_id, entry->pc, operation, file->id, file->fd, file->size, file->version);
+}
+
+static bool dse_memfd_name_guard(DSECtx *ctx, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    /* The pointer is already guarded. Kernel reads are separate from the
+     * instruction's ordinary memory callbacks. Reuse tracked bytes, including
+     * their program writers; never overwrite an existing symbolic expression. */
+    InsnAux read = {.seq_id = aux->seq_id, .pc = aux->pc, .has_mem_read = true,
+                    .mem_read_value_valid = true, .mem_read_taint = 1};
+    for (uint16_t i = 0; i < s->name_size; ++i) {
+        read.mem_read_addr = (uint64_t)s->args[0] + i;
+        read.mem_read_val = s->name[i];
+        SymExpr *value = dse_load_mem(ctx, &read, 8, false);
+        if (!value || !dse_assert_condition(ctx,
+                sym_expr_eq(value, sym_expr_const(s->name[i], 8)), true, false))
+            return false;
+        ctx->syscalls.argument_constraints--;
+        ctx->syscalls.name_constraints++;
+    }
+    return true;
+}
+
+static DseFileMapping *dse_mapping_at(DSECtx *ctx, uint64_t address) {
+    for (uint32_t i = 0; i < ctx->files.mapping_count; ++i) {
+        DseFileMapping *map = &ctx->files.mappings[i];
+        if (address >= map->base && address < map->end)
+            return map;
+    }
+    return NULL;
+}
+
+/* Also used by the backward frontier: a successful non-fixed mapping defines
+ * new memory, so earlier writers at the same virtual addresses are not inputs.
+ * The lifter separately validates complete identity, arguments and backing. */
+static bool dse_old_mmap_range(const InsnAux *aux, uint64_t *base, uint64_t *end) {
+    const DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 90 || aux->syscall_metadata_lost || s->invalid || !s->returned ||
+        !s->boundary_ordered || !s->mmap_args_valid || !s->mmap_args_observed ||
+        s->result >= UINT32_C(0xfffff001) || (s->result & 4095U) || !s->mmap_args[1] ||
+        (s->mmap_args[3] != 1 && s->mmap_args[3] != 2 && s->mmap_args[3] != 0x12) ||
+        (s->mmap_args[3] == 0x12 && s->mmap_args[0] != s->result))
+        return false;
+    *base = s->result;
+    *end = *base + (((uint64_t)s->mmap_args[1] + 4095U) & ~UINT64_C(4095));
+    return *end <= (UINT64_C(1) << 32);
+}
+
+static const char *dse_mapping_backing_issue(DSECtx *ctx, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    const uint32_t *a = s->mmap_args;
+    DseFileObject *file = dse_file_lookup(ctx, a[4]);
+    uint64_t base, end;
+    if (!file)
+        return "mmap_file_object_missing";
+    if ((uint64_t)a[5] + a[1] > file->size)
+        return "mmap_file_range_unsupported";
+    if (!dse_old_mmap_range(aux, &base, &end))
+        return "mmap_range_or_offset_unsupported";
+    if (a[3] == 0x12) {
+        DseFileMapping *old = dse_mapping_at(ctx, base);
+        if (!old)
+            return "mmap_fixed_mapping_missing";
+        if (old->base != base || old->end != end)
+            return "mmap_fixed_partial_range";
+        if (old->file_id != file->id || old->offset != a[5])
+            return "mmap_fixed_backing_changed";
+        if (old->flags != 1)
+            return "mmap_fixed_source_not_shared";
+        /* tmpfs may retain dirty bytes beyond EOF in its page cache. Our
+         * file model does not describe those bytes across replacement. */
+        if (old->shared_tail_written)
+            return "mmap_fixed_shared_tail_dirty";
+        return NULL;
+    }
+    if (file->mapped)
+        return "mmap_alias_or_remap_unsupported";
+    if (ctx->files.mapping_count >= DSE_MAX_FILE_OBJECTS)
+        return "mapping_budget";
+    for (uint32_t i = 0; i < ctx->files.mapping_count; ++i) {
+        const DseFileMapping *map = &ctx->files.mappings[i];
+        if (base < map->end && map->base < end)
+            return "mmap_overlaps_mapping";
+    }
+    if (ctx->state.sym_mem) {
+        GHashTableIter it;
+        gpointer key;
+        g_hash_table_iter_init(&it, ctx->state.sym_mem);
+        while (g_hash_table_iter_next(&it, &key, NULL)) {
+            uint64_t address = (uint64_t)*(gint64 *)key;
+            if (address >= base && address < end)
+                return "mmap_overlaps_tracked_memory";
+        }
+    }
+    return NULL;
+}
+
+static bool dse_mmap_args_guard(DSECtx *ctx, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    InsnAux read = {.seq_id = aux->seq_id, .pc = aux->pc, .has_mem_read = true,
+                    .mem_read_value_valid = true, .mem_read_taint = 15};
+    for (unsigned i = 0; i < 6; ++i) {
+        read.mem_read_addr = (uint64_t)s->args[0] + 4U * i;
+        read.mem_read_val = s->mmap_args[i];
+        SymExpr *value = dse_load_mem(ctx, &read, 32, false);
+        if (!value || !dse_assert_condition(ctx,
+                sym_expr_eq(value, sym_expr_const(s->mmap_args[i], 32)), true, false))
+            return false;
+        ctx->syscalls.argument_constraints--;
+        ctx->syscalls.mmap_argument_constraints++;
+    }
+    return true;
+}
+
+static const char *dse_mapped_mprotect(DSECtx *ctx, const InsnAux *aux, bool apply) {
+    const uint32_t *a = aux->syscall->args;
+    uint64_t end = (uint64_t)a[0] + (((uint64_t)a[1] + 4095U) & ~UINT64_C(4095));
+    for (uint32_t i = 0; i < ctx->files.mapping_count; ++i) {
+        DseFileMapping *map = &ctx->files.mappings[i];
+        if (a[1] && a[0] < map->end && map->base < end) {
+            if (a[0] > map->base || end < map->end)
+                return "mapped_mprotect_partial";
+            if (apply)
+                map->prot = a[2];
+        }
+    }
+    return NULL;
+}
+
+static const char *dse_write_backing_issue(DSECtx *ctx, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    DseFileObject *file = dse_file_lookup(ctx, s->args[0]);
+    if (!file)
+        return "write_file_object_missing";
+    if (file->position > file->size || s->result > file->size - file->position)
+        return "write_range_or_growth_unsupported";
+    if (s->result && file->version == UINT64_MAX)
+        return "file_version_overflow";
+    for (uint32_t i = 0; i < ctx->files.mapping_count; ++i) {
+        const DseFileMapping *map = &ctx->files.mappings[i];
+        if (map->file_id != file->id)
+            continue;
+        if (s->result && map->flags != 1)
+            return "write_private_mapping_unsupported";
+        /* File writes have no guest store callback to advance code-page
+         * generations. Do not certify executable views without that bridge. */
+        if (s->result && (map->prot & 4U))
+            return "write_executable_mapping_unsupported";
+        /* Copy-in and file updates may interleave inside the kernel. An entry
+         * snapshot is insufficient if that write can change its own buffer. */
+        if (s->result && s->args[1] < map->end &&
+            map->base < (uint64_t)s->args[1] + s->result)
+            return "write_buffer_alias_unsupported";
+    }
+    return NULL;
+}
+
+static bool dse_file_write(DSECtx *ctx, const TraceEntry *entry, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    DseFileObject *file = dse_file_lookup(ctx, s->args[0]);
+    SymExpr **values = s->result ? g_try_new0(SymExpr *, s->result) : NULL;
+    if (s->result && !values) {
+        dse_mark_resource_limit(ctx);
+        return false;
+    }
+    bool ok = false;
+    /* Keep byte expressions, not equalities pinning every byte to its trace
+     * value. Replay checks certify the observed execution without erasing
+     * the dependency on the source buffer. Stage before modifying any view. */
+    for (uint32_t i = 0; i < s->result; ++i) {
+        uint64_t address = (uint64_t)s->args[1] + i;
+        if (!dse_load_tracked_byte_at(ctx, address, entry->seq_id, s->write_values[i], true,
+                                      &values[i]) ||
+            dse_replay_expect(ctx, values[i], s->write_values[i], DSE_REPLAY_SITE_MEMORY_READ,
+                              address, 0) != DSE_REPLAY_CHECK_OK)
+            goto done;
+        ctx->syscalls.file_buffer_checks++;
+    }
+    for (uint32_t i = 0; i < s->result; ++i) {
+        uint64_t offset = file->position + i;
+        if (!dse_file_put_byte(ctx, file, offset, sym_expr_clone(values[i])))
+            goto done;
+        for (uint32_t j = 0; j < ctx->files.mapping_count; ++j) {
+            const DseFileMapping *map = &ctx->files.mappings[j];
+            if (map->file_id != file->id || map->flags != 1 || offset < map->offset ||
+                offset - map->offset >= map->end - map->base)
+                continue;
+            /* Kernel file writes also affect read-only shared views. Drop an
+             * older local cell; the next load reads the new file expression. */
+            gint64 address = (gint64)(map->base + offset - map->offset);
+            if (ctx->state.sym_mem)
+                g_hash_table_remove(ctx->state.sym_mem, &address);
+            ctx->syscalls.file_write_shared_bytes++;
+        }
+    }
+    ctx->syscalls.file_write_calls++;
+    ctx->syscalls.file_write_bytes += s->result;
+    ctx->syscalls.last_write_file = file->id;
+    ctx->syscalls.last_write_offset = file->position;
+    ctx->syscalls.last_write_size = s->result;
+    file->position += s->result;
+    if (s->result)
+        file->version++;
+    ctx->syscalls.last_file_position = file->position;
+    dse_file_diagnostic(ctx, file, entry, "write");
+    DSE_DIAGNOSTIC(stderr, "[DSE-WRITE-MODELED] seq=%" PRIu64 " pc=0x%" PRIx64
+        " object=%" PRIu64 " offset=%" PRIu64 " requested=%u written=%u position=%" PRIu64
+        " version=%" PRIu64 " scope=observed_memfd_write\n", entry->seq_id, entry->pc,
+        file->id, ctx->syscalls.last_write_offset, s->args[2], s->result, file->position, file->version);
+    ok = true;
+done:
+    for (uint32_t i = 0; i < s->result; ++i)
+        sym_expr_free(values[i]);
+    g_free(values);
+    return ok;
+}
+
+static void dse_file_close(DSECtx *ctx, DseFileObject *file, const TraceEntry *entry) {
+    uint32_t references = 0;
+    for (uint32_t i = 0; i < ctx->files.mapping_count; ++i)
+        references += ctx->files.mappings[i].file_id == file->id;
+    ctx->syscalls.file_closes++;
+    ctx->syscalls.file_descriptors_live--;
+    ctx->syscalls.close_mappings_preserved += references;
+    ctx->syscalls.last_close_file = file->id;
+    ctx->syscalls.last_close_fd = file->fd;
+    ctx->syscalls.last_close_retained = references != 0;
+    DSE_DIAGNOSTIC(stderr, "[DSE-CLOSE-MODELED] seq=%" PRIu64 " pc=0x%" PRIx64
+        " fd=%u object=%" PRIu64 " version=%" PRIu64 " mappings=%u retained=%u\n",
+        entry->seq_id, entry->pc, file->fd, file->id, file->version, references, references != 0);
+    file->fd_open = false;
+    if (!references) {
+        /* No fd or mapping can reach this object. Release its owned bytes
+         * and compact the table; mapping references use IDs, never pointers. */
+        uint32_t index = (uint32_t)(file - ctx->files.objects);
+        if (file->bytes) {
+            ctx->files.content_bytes -= g_hash_table_size(file->bytes);
+            g_hash_table_destroy(file->bytes);
+        }
+        uint32_t last = --ctx->files.count;
+        if (index != last)
+            ctx->files.objects[index] = ctx->files.objects[last];
+        ctx->files.objects[last] = (DseFileObject){0};
+        ctx->syscalls.file_objects_released++;
+    }
+    ctx->syscalls.file_objects_live = ctx->files.count;
+    ctx->syscalls.file_content_bytes = ctx->files.content_bytes;
+}
+
+static bool dse_lift_syscall(DSECtx *ctx, const TraceEntry *entry, const InsnAux *aux) {
+    ctx->syscalls.seen++;
+    const DseSyscallObservation *s = aux->syscall;
+    if (ctx->files.count &&
+        (!s || !s->boundary_ordered || !s->boundary_id ||
+         ctx->files.last_boundary == UINT64_MAX ||
+         s->boundary_id != ctx->files.last_boundary + 1 ||
+         entry->vcpu_index != ctx->files.vcpu || entry->seq_id <= ctx->files.last_seq)) {
+        dse_forget_files(ctx);
+        dse_forget_external_memory(ctx);
+        dse_syscall_issue(ctx, entry, aux, "file_syscall_history_gap");
+    }
+    if (!aux->syscall || aux->syscall_metadata_lost ||
+        (aux->syscall->number != 93 && aux->syscall->number != 125 &&
+         aux->syscall->number != 356 && aux->syscall->number != 90 &&
+         aux->syscall->number != 4 && aux->syscall->number != 6) ||
+        entry->size != 2 || entry->instr_bytes[0] != 0xcd || entry->instr_bytes[1] != 0x80) {
+        ctx->syscalls.unsupported++;
+        dse_forget_files(ctx);
+        dse_syscall_issue(ctx, entry, aux,
+                          aux->syscall && !aux->syscall_metadata_lost ? "syscall_model_missing"
+                                                                    : "observation_missing");
+        return false;
+    }
+    bool protect = aux->syscall->number == 125;
+    bool create = aux->syscall->number == 356;
+    bool mmap = aux->syscall->number == 90;
+    bool write = aux->syscall->number == 4;
+    bool close = aux->syscall->number == 6;
+    const char *issue = g_arch->natural_width != 32 || g_arch->big_endian
+                           ? "unsupported_abi"
+                           : close ? dse_aux_close_issue(entry, aux)
+                           : write ? dse_aux_write_issue(entry, aux)
+                           : mmap ? dse_aux_old_mmap_issue(entry, aux)
+                           : create ? dse_aux_memfd_issue(entry, aux)
+                           : protect ? dse_aux_mprotect_issue(entry, aux)
+                                     : dse_aux_ftruncate_issue(entry, aux);
+    if (!issue && mmap)
+        issue = dse_mapping_backing_issue(ctx, aux);
+    if (!issue && protect)
+        issue = dse_mapped_mprotect(ctx, aux, false);
+    if (!issue && write)
+        issue = dse_write_backing_issue(ctx, aux);
+    if (!issue && close && !dse_file_lookup(ctx, s->args[0]))
+        issue = "close_file_object_missing";
+    if (!issue && create && dse_file_lookup(ctx, s->result))
+        issue = "memfd_live_fd_collision";
+    if (!issue && create && ctx->files.count == DSE_MAX_FILE_OBJECTS) {
+        dse_mark_resource_limit(ctx);
+        issue = "file_object_budget";
+    }
+    if (issue) {
+        ctx->syscalls.observation_failures++;
+        dse_forget_files(ctx);
+        dse_syscall_issue(ctx, entry, aux, issue);
+        return false;
+    }
+    const unsigned regs[4] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX};
+    const uint32_t expected[4] = {s->number, s->args[0], s->args[1], s->args[2]};
+    /* A conditional replay of this recorded environment response: constrain
+     * number and arguments, check their existing expressions, then define EAX.
+     * Never seed over a disagreeing expression, or count these as branches. */
+    for (unsigned i = 0; i < (mmap || close ? 2U : (protect || write) ? 4U : 3U); ++i) {
+        SymExpr *v = dse_read_rid_fit(ctx, aux, (int)regs[i], 32, 32);
+        if (!v || !dse_assert_condition(ctx, sym_expr_eq(v, sym_expr_const(expected[i], 32)),
+                                         true, false)) {
+            ctx->syscalls.observation_failures++;
+            dse_forget_files(ctx);
+            dse_syscall_issue(ctx, entry, aux, "argument_replay_failed");
+            return false;
+        }
+    }
+    if (create && !dse_memfd_name_guard(ctx, aux)) {
+        ctx->syscalls.observation_failures++;
+        dse_forget_files(ctx);
+        dse_syscall_issue(ctx, entry, aux, "memfd_name_replay_failed");
+        return false;
+    }
+    if (mmap && !dse_mmap_args_guard(ctx, aux)) {
+        ctx->syscalls.observation_failures++;
+        dse_forget_files(ctx);
+        dse_syscall_issue(ctx, entry, aux, "mmap_arguments_replay_failed");
+        return false;
+    }
+    if (write && !dse_file_write(ctx, entry, aux)) {
+        ctx->syscalls.observation_failures++;
+        dse_forget_files(ctx);
+        dse_forget_external_memory(ctx);
+        dse_syscall_issue(ctx, entry, aux, "write_buffer_replay_or_resource_failed");
+        return false;
+    }
+    SymExpr *result = sym_expr_const(s->result, 32);
+    if (!result)
+        return false;
+    dse_set_reg(ctx, REG_RAX, result, 32);
+    ctx->syscalls.returns_modeled++;
+    ctx->files.last_boundary = s->boundary_id;
+    ctx->files.last_seq = entry->seq_id;
+    ctx->files.vcpu = entry->vcpu_index;
+    if (write)
+        return true;
+    if (close) {
+        dse_file_close(ctx, dse_file_lookup(ctx, s->args[0]), entry);
+        return true;
+    }
+    if (mmap) {
+        const uint32_t *a = s->mmap_args;
+        DseFileObject *file = dse_file_lookup(ctx, a[4]);
+        bool replace = a[3] == 0x12;
+        DseFileMapping *map = replace ? dse_mapping_at(ctx, s->result)
+                                     : &ctx->files.mappings[ctx->files.mapping_count++];
+        /* All identity, range, backing and argument checks precede mutation.
+         * MAP_FIXED destroys the old view, including cached zero/tail bytes.
+         * Shared writes survive in the file's owned byte expressions. */
+        if (replace && ctx->state.sym_mem) {
+            GHashTableIter it;
+            gpointer key;
+            g_hash_table_iter_init(&it, ctx->state.sym_mem);
+            while (g_hash_table_iter_next(&it, &key, NULL)) {
+                uint64_t address = (uint64_t)*(gint64 *)key;
+                if (address >= map->base && address < map->end) {
+                    g_hash_table_iter_remove(&it);
+                    ctx->syscalls.mapping_cells_discarded++;
+                }
+            }
+        }
+        *map = (DseFileMapping){.base = s->result,
+            .end = (uint64_t)s->result + (((uint64_t)a[1] + 4095U) & ~UINT64_C(4095)),
+            .offset = a[5], .prot = a[2], .flags = a[3] & 3U, .file_id = file->id,
+            .file_version = file->version, .created_seq = entry->seq_id};
+        file->mapped = true;
+        ctx->syscalls.mappings_created++;
+        ctx->syscalls.mappings_replaced += replace;
+        ctx->syscalls.mappings_live = ctx->files.mapping_count;
+        ctx->syscalls.last_mapping_base = map->base;
+        ctx->syscalls.last_mapping_end = map->end;
+        ctx->syscalls.last_mapping_file = map->file_id;
+        ctx->syscalls.last_mapping_version = map->file_version;
+        DSE_DIAGNOSTIC(stderr,
+            "[DSE-MMAP-MODELED] seq=%" PRIu64 " pc=0x%" PRIx64
+            " base=0x%" PRIx64 " end=0x%" PRIx64 " object=%" PRIu64
+            " version=%" PRIu64 " offset=%u prot=%u flags=%u scope=%s\n",
+            entry->seq_id, entry->pc, map->base, map->end, file->id, file->version,
+            a[5], a[2], a[3], replace ? "exact_shared_to_private" : "first_memfd_mapping");
+        return true;
+    }
+    if (create) {
+        DseFileObject *file = &ctx->files.objects[ctx->files.count++];
+        *file = (DseFileObject){.id = s->boundary_id, .fd = s->result,
+                                .flags = s->args[1], .size = 0, .version = 1, .fd_open = true};
+        ctx->syscalls.file_objects_created++;
+        ctx->syscalls.file_descriptors_live++;
+        dse_file_diagnostic(ctx, file, entry, "create");
+        return true;
+    }
+    if (protect) {
+        (void)dse_mapped_mprotect(ctx, aux, true);
+        /* Conditional on the checked successful response and fixed arguments.
+         * DSE constrains every modeled memory access to its observed address;
+         * this does not authorize access through unexecuted CFG successors. */
+        DSE_DIAGNOSTIC(stderr,
+            "[DSE-SYSCALL-RETURN] pc=0x%" PRIx64 " seq=%" PRIu64
+            " number=125 base=0x%x length=%u prot=%u result=0 scope=observed_mapping\n",
+            entry->pc, entry->seq_id, s->args[0], s->args[1], s->args[2]);
+        return true;
+    }
+    DseFileObject *file = dse_file_lookup(ctx, s->args[0]);
+    if (file && !file->mapped && s->result == 0 && s->args[1] <= INT32_MAX &&
+        s->boundary_ordered && file->version != UINT64_MAX) {
+        /* Truncate does not move the open description's position. Drop the
+         * removed suffix so a later grow restores zeros, not stale contents. */
+        dse_file_truncate_bytes(ctx, file, s->args[1]);
+        file->size = s->args[1];
+        file->version++;
+        ctx->syscalls.file_resizes++;
+        dse_file_diagnostic(ctx, file, entry, "truncate");
+        return true;
+    }
+    ctx->syscalls.effects_unmodeled++;
+    dse_forget_files(ctx);
+    dse_forget_external_memory(ctx);
+    dse_syscall_issue(ctx, entry, aux, "file_effects_unmodeled");
+    DSE_DIAGNOSTIC(stderr,
+        "[DSE-SYSCALL-RETURN] pc=0x%" PRIx64 " seq=%" PRIu64
+        " number=93 fd=%u length=%u result=0x%x scope=observed_environment_return\n",
+        entry->pc, entry->seq_id, s->args[0], s->args[1], s->result);
+    return true;
+}
 
 static uint8_t dse_lift_natural_byte_mask(void) {
     if (!g_arch || g_arch->natural_width == 0 || g_arch->natural_width > 64 ||
@@ -2173,16 +3074,37 @@ static uint32_t dse_observed_write_count(const InsnAux *aux) {
 
 //dealing with invalid lift
 static void dse_invalidate_lift_outputs(DSECtx *ctx, const InsnMeta *meta, const InsnAux *aux) {
-    if (!ctx || !meta)
+    if (!ctx)
         return;
+    sym_expr_free(ctx->state.x86_flags[DSE_FLAG_SLOT_DF]);
+    ctx->state.x86_flags[DSE_FLAG_SLOT_DF] = NULL;
+    ctx->x86_df_poisoned = true;
+    /* A lost or opaque writer invalidates lazy initial-byte facts as well as
+     * the materialized cells. Otherwise a later clean read could resurrect
+     * the mapping's original zero after an unmodeled write. */
+    if (ctx->files.mapping_count &&
+        (!meta || meta->has_mem_write || (aux && aux->has_mem_write))) {
+        dse_forget_files(ctx);
+        ctx->memory_model_complete = false;
+        dse_mark_path_failure(ctx);
+    }
+    if (!meta)
+        return;
+    bool syscall = dse_syscall_instruction(meta);
     for (int rid = 0; rid < REG_COUNT; rid++) {
-        if ((meta->regs_written_mask & (UINT32_C(1) << rid)) == 0) {
+        if (!syscall && (meta->regs_written_mask & (UINT32_C(1) << rid)) == 0) {
             continue;
         }
         sym_state_set_reg(&ctx->state, (RegId)rid, NULL);
         dse_advance_register_root_epoch(ctx, rid);
     }
-    dse_invalidate_x86_flags(ctx, meta->flags_write_mask);
+    dse_invalidate_x86_flags(ctx, syscall ? X86_FLAG_TRACKED : meta->flags_write_mask);
+    if (syscall) {
+        dse_forget_files(ctx);
+        ctx->register_model_complete = false;
+        ctx->replay_model_complete = false;
+        dse_forget_external_memory(ctx);
+    }
     bool writes_memory = meta->has_mem_write || (aux && aux->has_mem_write);
     if (writes_memory) {
         if (ctx->state.sym_mem) {
@@ -2205,6 +3127,8 @@ static bool dse_lift_observed_insn(DSECtx *ctx, const TraceEntry *entry, const I
     }
     if (ctx->resource_limit_hit)
         return false;
+    if (ctx->replay_first_seq == 0)
+        ctx->replay_first_seq = entry->seq_id;
     g_total++;
     const uint8_t *instruction_bytes = entry->instr_bytes;
     uint8_t instruction_size = entry->size;
@@ -2244,7 +3168,8 @@ static bool dse_lift_observed_insn(DSECtx *ctx, const TraceEntry *entry, const I
     uint32_t write_before = ctx->address_write_modeled;
     uint32_t address_failures_before = ctx->address_failures;
     uint32_t replay_failures_before = ctx->replay_failures;
-    bool ok = g_arch->lift_one(ctx, insn, aux, g_arch);
+    bool ok = dse_syscall_instruction(meta) ? dse_lift_syscall(ctx, entry, aux)
+                                            : g_arch->lift_one(ctx, insn, aux, g_arch);
     if (ctx->resource_limit_hit) {
         cs_free(insn, count);
         return false;
@@ -2306,12 +3231,14 @@ bool dse_lift_replay_step(DSECtx *ctx, const ReplayInput *input, uint32_t index,
     const ReplayStep *step = index == replay_input_count(input) ? replay_input_trigger(input)
                                                                 : replay_input_step(input, index);
     if (!step || step->issues != 0) {
+        dse_invalidate_lift_outputs(ctx, NULL, NULL);
         dse_record_replay_missing(ctx);
         return false;
     }
     const InsnMeta *meta = replay_input_meta(input, step->entry.seq_id);
     const InsnAux *aux = replay_input_aux(input, step->entry.seq_id);
     if (!meta || !aux) {
+        dse_invalidate_lift_outputs(ctx, meta, aux);
         dse_record_replay_missing(ctx);
         return false;
     }
@@ -2374,8 +3301,12 @@ void dse_lift_begin(DSECtx *ctx) {
         ctx->path_model_complete = ctx->path_predicate != NULL;
         ctx->path_constraints = 0;
         ctx->path_failures = 0;
+        ctx->syscalls = (DseSyscallStats){0};
+        dse_file_state_clear(&ctx->files);
         ctx->string_summaries = 0;
         ctx->x86_flags_poisoned = 0;
+        ctx->x86_df_poisoned = false;
+        ctx->replay_first_seq = 0;
         ctx->memory_root_epoch = 1;
         ctx->next_lineage_id = 1;
         ctx->root_provenance_complete = ctx->root_provenance != NULL && ctx->root_origins != NULL &&
@@ -2791,6 +3722,9 @@ static SymExpr *dse_normalize_reg_value(DSECtx *ctx, const InsnAux *aux, int rid
         return NULL;
     }
 
+    /* Every byte must still pass replay before retaining the existing value. */
+    bool reuse_current = current && required_byte_mask == natural_mask &&
+                         (aux->reg_taint[rid] & natural_mask) == natural_mask;
     uint64_t root_epoch = ctx->register_root_epoch[rid];
     if (!current && root_epoch == 0) {
         root_epoch = 1;
@@ -2843,11 +3777,15 @@ static SymExpr *dse_normalize_reg_value(DSECtx *ctx, const InsnAux *aux, int rid
             sym_expr_free(normalized);
             return NULL;
         }
+        if (reuse_current) {
+            sym_expr_free(byte);
+            continue;
+        }
         normalized = normalized ? sym_expr_concat(byte, normalized) : byte;
         if (!normalized)
             return NULL;
     }
-    return normalized;
+    return reuse_current ? sym_expr_clone(current) : normalized;
 }
 
 //get reg in needed width
@@ -3143,13 +4081,33 @@ static void dse_audit_last_memory_writer(uint64_t address, uint64_t symbolic_wri
         (unsigned long)address, (unsigned long)read_seq, (unsigned long)symbolic_writer_seq);
 }
 
+static void dse_mapping_access_failure(DSECtx *ctx, uint64_t address, const char *reason) {
+    ctx->memory_model_complete = false;
+    dse_mark_path_failure(ctx);
+    ctx->syscalls.mapping_access_failures++;
+    if (!ctx->syscalls.mapping_first_reason) {
+        ctx->syscalls.mapping_first_reason = reason;
+        ctx->syscalls.mapping_bad_address = address;
+    }
+    DSE_DIAGNOSTIC(stderr, "[DSE-MAP-ACCESS-UNKNOWN] seq=%" PRIu64
+        " address=0x%" PRIx64 " reason=%s\n", ctx->replay_origin.seq_id, address, reason);
+}
+
 bool dse_load_tracked_byte_at(DSECtx *ctx, uint64_t address, uint64_t epoch, uint8_t observed_value,
                               bool value_tainted, SymExpr **out_symbolic_value) {
     if (out_symbolic_value)
         *out_symbolic_value = NULL;
     if (!ctx || !out_symbolic_value)
         return false;
-    if (!value_tainted) {
+    DseFileMapping *map = dse_mapping_at(ctx, address);
+    if (map) {
+        if (!(map->prot & 1U)) {
+            dse_mapping_access_failure(ctx, address, "mapping_not_readable");
+            return false;
+        }
+        ctx->syscalls.mapping_reads++;
+    }
+    if (!value_tainted && !map) {
         SymExpr *constant = sym_expr_const(observed_value, 8);
         if (!constant)
             return false;
@@ -3184,6 +4142,32 @@ bool dse_load_tracked_byte_at(DSECtx *ctx, uint64_t address, uint64_t epoch, uin
             return true;
         }
     }
+    if (map) {
+        DseFileObject *file = dse_file_by_id(ctx, map->file_id);
+        if (!file) {
+            dse_mapping_access_failure(ctx, address, "mapping_file_missing");
+            return false;
+        }
+        uint64_t offset = map->offset + address - map->base;
+        gint64 key = (gint64)offset;
+        SymExpr *stored = offset < file->size && file->bytes ? g_hash_table_lookup(file->bytes, &key) : NULL;
+        /* Only absent file bytes (or the partial-page tail) are initial zero.
+         * File writes retain source expressions even for DTA-clean loads. */
+        SymExpr *value = stored ? sym_expr_clone(stored) : sym_expr_const(0, 8);
+        if (!value)
+            return false;
+        if (dse_replay_expect(ctx, value, observed_value, DSE_REPLAY_SITE_MEMORY_READ,
+                              address, 0) != DSE_REPLAY_CHECK_OK) {
+            sym_expr_free(value);
+            dse_mapping_access_failure(ctx, address, stored ? "mapping_file_byte_mismatch"
+                                                           : "mapping_initial_byte_mismatch");
+            return false;
+        }
+        if (!stored)
+            ctx->syscalls.mapping_zero_reads++;
+        *out_symbolic_value = value;
+        return true;
+    }
     SymExpr *root = dse_new_observed_epoch_var(ctx, address, epoch, ctx->memory_root_epoch, epoch,
                                                0, 8, DSE_VAR_MEMORY_ROOT, observed_value, NULL);
     if (!root)
@@ -3196,6 +4180,12 @@ bool dse_store_tracked_byte_at(DSECtx *ctx, uint64_t address, SymExpr *symbolic_
                                const InsnAux *writer_aux, uint8_t observed_value) {
     if (!ctx) {
         sym_expr_free(symbolic_value);
+        return false;
+    }
+    DseFileMapping *map = dse_mapping_at(ctx, address);
+    if (map && !(map->prot & 2U)) {
+        sym_expr_free(symbolic_value);
+        dse_mapping_access_failure(ctx, address, "mapping_not_writable");
         return false;
     }
     if (!symbolic_value || symbolic_value->width != 8) {
@@ -3237,7 +4227,24 @@ bool dse_store_tracked_byte_at(DSECtx *ctx, uint64_t address, SymExpr *symbolic_
     cell->expr = symbolic_value;
     cell->writer_seq = writer_aux ? writer_aux->seq_id : 0;
     cell->writer_pc = writer_aux ? writer_aux->pc : 0;
+    if (map && map->flags == 1) {
+        DseFileObject *file = dse_file_by_id(ctx, map->file_id);
+        uint64_t offset = map->offset + address - map->base;
+        if (!file || file->version == UINT64_MAX ||
+            (offset < file->size && !dse_file_put_byte(ctx, file, offset, sym_expr_clone(symbolic_value)))) {
+            sym_expr_free(symbolic_value);
+            g_free(key); g_free(cell);
+            dse_mapping_access_failure(ctx, address, "mapping_file_update_failed");
+            return false;
+        }
+        if (offset < file->size)
+            file->version++;
+        else
+            map->shared_tail_written = true;
+    }
     g_hash_table_replace(ctx->state.sym_mem, key, cell);
+    if (map)
+        ctx->syscalls.mapping_writes++;
     return true;
 }
 
@@ -3410,6 +4417,8 @@ const char *dse_verdict_name(DseVerdict verdict) {
 
 const char *dse_verify_reason_name(DseVerifyReason reason) {
     switch (reason) {
+    case DSE_REASON_DISABLED:
+        return "DISABLED";
     case DSE_REASON_NONE:
         return "NONE";
     case DSE_REASON_INVALID_INPUT:
@@ -3484,6 +4493,7 @@ static void dse_capture_verify_metrics(DseVerifyResult *result, const DSECtx *ct
         result->address_failures = ctx->address_failures;
         result->path_constraints = ctx->path_constraints;
         result->path_failures = ctx->path_failures;
+        result->syscalls = ctx->syscalls;
         result->string_summaries = ctx->string_summaries;
         result->expr_nodes_created = ctx->expr_nodes_created;
         result->z3_cache_nodes = ctx->z3_cache_nodes;
@@ -3501,8 +4511,9 @@ static void dse_capture_verify_metrics(DseVerifyResult *result, const DSECtx *ct
          result->concretized == 0 && !result->resource_limit_hit &&
          result->register_model_complete && result->memory_model_complete &&
          result->address_model_complete && result->path_model_complete);
-    result->proof_eligible = result->data_slice_complete && result->lift_complete && ctx &&
-                             ctx->replay_model_complete && !ctx->replay_mismatch;
+    result->proof_eligible = result->slice_complete && result->data_slice_complete &&
+                             result->lift_complete && ctx && ctx->replay_model_complete &&
+                             !ctx->replay_mismatch;
 }
 
 DseSolverStatus dse_check_target_relation(DSECtx *ctx, SymExpr *target_expr, uint64_t oep_candidate,
@@ -4159,13 +5170,14 @@ static bool dse_mem_need_add(GHashTable *needed_memory, uint64_t address) {
     return true;
 }
 
-static bool dse_mem_need_add_read(GHashTable *needed_memory, const DseMemRead *read) {
+static bool dse_mem_need_add_read(GHashTable *needed_memory, const DseMemRead *read,
+                                  bool include_clean) {
     if (!needed_memory || !read || read->size == 0 || read->size > MAX_REG_BYTES ||
         read->addr > (UINT64_MAX - (uint64_t)(read->size - 1))) {
         return false;
     }
     for (uint8_t byte = 0; byte < read->size; byte++) {
-        if ((read->taint & (uint8_t)(1U << byte)) == 0) {
+        if (!include_clean && (read->taint & (uint8_t)(1U << byte)) == 0) {
             continue;
         }
         if (!dse_mem_need_add(needed_memory, read->addr + byte)) {
@@ -4175,7 +5187,8 @@ static bool dse_mem_need_add_read(GHashTable *needed_memory, const DseMemRead *r
     return true;
 }
 
-static bool dse_mem_need_add_aux_reads(GHashTable *needed_memory, const InsnAux *aux) {
+static bool dse_mem_need_add_aux_reads(GHashTable *needed_memory, const InsnAux *aux,
+                                       bool include_clean) {
     if (!needed_memory || !aux)
         return false;
     if (aux->mem_read_overflow)
@@ -4184,7 +5197,7 @@ static bool dse_mem_need_add_aux_reads(GHashTable *needed_memory, const InsnAux 
         return false;
     }
     for (uint8_t i = 0; i < aux->mem_read_count; i++) {
-        if (!dse_mem_need_add_read(needed_memory, &aux->mem_reads[i])) {
+        if (!dse_mem_need_add_read(needed_memory, &aux->mem_reads[i], include_clean)) {
             return false;
         }
     }
@@ -4273,8 +5286,8 @@ static bool dse_mem_need_exact_string_write_overlaps(const GHashTable *needed_me
 }
 
 static bool dse_mem_need_apply_exact_string(GHashTable *needed_memory,
-                                            uint8_t needed_registers[REG_COUNT],
-                                            const InsnAux *aux) {
+                                            uint8_t needed_registers[REG_COUNT], const InsnAux *aux,
+                                            bool include_clean) {
     if (!needed_memory || !needed_registers || !dse_aux_has_usable_exact_string(aux)) {
         return false;
     }
@@ -4306,7 +5319,7 @@ static bool dse_mem_need_apply_exact_string(GHashTable *needed_memory,
                     continue;
                 }
                 uint32_t captured_index = event * summary->element_size + byte;
-                if (summary->value_taint[captured_index] == 0) {
+                if (!include_clean && summary->value_taint[captured_index] == 0) {
                     continue;
                 }
                 uint64_t source = dse_string_event_byte_address(
@@ -4315,7 +5328,8 @@ static bool dse_mem_need_apply_exact_string(GHashTable *needed_memory,
                     return false;
             }
         } else {
-            needed_registers[REG_RAX] |= (uint8_t)(needed_mask & aux->reg_taint[REG_RAX]);
+            needed_registers[REG_RAX] |=
+                (uint8_t)(needed_mask & (include_clean ? UINT8_MAX : aux->reg_taint[REG_RAX]));
         }
     }
     return true;
@@ -4542,22 +5556,26 @@ static gboolean dse_demand_mem_key_equal(gconstpointer left, gconstpointer right
     return a && b && a->seq_id == b->seq_id && a->address == b->address;
 }
 
+static void dse_slice_plan_destroy(DseSlicePlan *plan);
+
 static bool dse_slice_plan_init(DseSlicePlan *plan) {
     if (!plan)
         return false;
     memset(plan, 0, sizeof(*plan));
+    plan->seq_id = g_try_new0(uint64_t, MAX_SLICE);
+    plan->data_reg_live_after = g_try_malloc0_n(MAX_SLICE, sizeof(*plan->data_reg_live_after));
+    plan->replay_reg_live_after = g_try_malloc0_n(MAX_SLICE, sizeof(*plan->replay_reg_live_after));
+    plan->data_all_memory_writes = g_try_new0(bool, MAX_SLICE);
+    plan->replay_all_memory_writes = g_try_new0(bool, MAX_SLICE);
+    plan->entries = g_try_new0(const TraceEntry *, MAX_SLICE);
     plan->data_memory_writes =
         g_hash_table_new_full(dse_demand_mem_key_hash, dse_demand_mem_key_equal, g_free, NULL);
     plan->replay_memory_writes =
         g_hash_table_new_full(dse_demand_mem_key_hash, dse_demand_mem_key_equal, g_free, NULL);
-    if (!plan->data_memory_writes || !plan->replay_memory_writes) {
-        if (plan->data_memory_writes) {
-            g_hash_table_destroy(plan->data_memory_writes);
-        }
-        if (plan->replay_memory_writes) {
-            g_hash_table_destroy(plan->replay_memory_writes);
-        }
-        memset(plan, 0, sizeof(*plan));
+    if (!plan->seq_id || !plan->data_reg_live_after || !plan->replay_reg_live_after ||
+        !plan->data_all_memory_writes || !plan->replay_all_memory_writes || !plan->entries ||
+        !plan->data_memory_writes || !plan->replay_memory_writes) {
+        dse_slice_plan_destroy(plan);
         return false;
     }
     return true;
@@ -4566,6 +5584,12 @@ static bool dse_slice_plan_init(DseSlicePlan *plan) {
 static void dse_slice_plan_destroy(DseSlicePlan *plan) {
     if (!plan)
         return;
+    g_free(plan->seq_id);
+    g_free(plan->data_reg_live_after);
+    g_free(plan->replay_reg_live_after);
+    g_free(plan->data_all_memory_writes);
+    g_free(plan->replay_all_memory_writes);
+    g_free(plan->entries);
     if (plan->data_memory_writes) {
         g_hash_table_destroy(plan->data_memory_writes);
     }
@@ -4802,6 +5826,10 @@ dse_dependency_frontier_memory_relevant(const DseDependencyFrontier *frontier,
     gpointer key = NULL;
     g_hash_table_iter_init(&iterator, frontier->memory);
     while (g_hash_table_iter_next(&iterator, &key, NULL)) {
+        uint64_t base, end;
+        if (dse_old_mmap_range(aux, &base, &end) &&
+            (uint64_t)*(const gint64 *)key >= base && (uint64_t)*(const gint64 *)key < end)
+            return TRACE_DEP_YES;
         TraceDepRelation relation =
             trace_deps_memory_overlap(deps, TRACE_MEM_WRITE, (uint64_t)*(const gint64 *)key, 1);
         if (relation == TRACE_DEP_UNKNOWN)
@@ -4816,16 +5844,31 @@ static bool dse_dependency_frontier_apply(DseDependencyFrontier *frontier, const
                                           const InsnMeta *meta, const InsnAux *aux,
                                           bool register_relevant, bool memory_relevant,
                                           bool flag_relevant, bool path_relevant,
-                                          uint8_t natural_mask) {
+                                          uint8_t natural_mask, bool include_clean) {
     if (!frontier || !frontier->memory || !meta || !aux) {
         return false;
     }
     uint8_t needed_before[REG_COUNT];
     dse_copy_reg_worklist(needed_before, frontier->regs);
+    uint64_t map_base, map_end;
+    /* The accepted fixed replacement keeps the same file and offset. Keep
+     * demands at these addresses so prior shared stores remain producers of
+     * the new private view. The first mapping still closes the old frontier. */
+    if (dse_old_mmap_range(aux, &map_base, &map_end) && aux->syscall->mmap_args[3] != 0x12) {
+        GHashTableIter it;
+        gpointer key;
+        g_hash_table_iter_init(&it, frontier->memory);
+        while (g_hash_table_iter_next(&it, &key, NULL)) {
+            uint64_t address = (uint64_t)*(gint64 *)key;
+            if (address >= map_base && address < map_end)
+                g_hash_table_iter_remove(&it);
+        }
+    }
     bool exact_string = dse_aux_has_usable_exact_string(aux);
     if (memory_relevant) {
         if (exact_string) {
-            if (!dse_mem_need_apply_exact_string(frontier->memory, frontier->regs, aux)) {
+            if (!dse_mem_need_apply_exact_string(frontier->memory, frontier->regs, aux,
+                                                 include_clean)) {
                 return false;
             }
         } else {
@@ -4840,8 +5883,9 @@ static bool dse_dependency_frontier_apply(DseDependencyFrontier *frontier, const
     if (path_relevant) {
         frontier->special |= deps->special_control_uses;
         for (int reg = 0; reg < REG_COUNT; reg++)
-            frontier->regs[reg] |= (uint8_t)(trace_deps_bytes(deps->control_uses[reg], false) &
-                                             aux->reg_taint[reg] & natural_mask);
+            frontier->regs[reg] |=
+                (uint8_t)(trace_deps_bytes(deps->control_uses[reg], false) &
+                          (include_clean ? natural_mask : aux->reg_taint[reg]) & natural_mask);
     }
     if (aux->has_mem_read || aux->has_mem_write || register_relevant)
         frontier->special |= deps->special_address_uses;
@@ -4860,12 +5904,552 @@ static bool dse_dependency_frontier_apply(DseDependencyFrontier *frontier, const
     if (exact_string && aux->string_summary.kind == DSE_STRING_STOS) {
         excluded_value_mask |= 1U << REG_RAX;
     }
-    dse_add_deps_value_inputs(deps, aux, excluded_value_mask, forced_value_mask, frontier->regs,
-                              natural_mask);
+    dse_add_deps_value_inputs(deps, include_clean ? NULL : aux, excluded_value_mask,
+                              forced_value_mask, frontier->regs, natural_mask);
 
-    if (!exact_string && aux->has_mem_read && !dse_mem_need_add_aux_reads(frontier->memory, aux)) {
+    if (!exact_string && aux->has_mem_read &&
+        !dse_mem_need_add_aux_reads(frontier->memory, aux, include_clean)) {
         return false;
     }
+    /* memfd's string is consumed by the kernel, not an x86 load callback.
+     * Preserve all its writers for replay, including the terminating NUL. */
+    const DseSyscallObservation *s = aux->syscall;
+    if (s && s->number == 4 && s->write_valid && s->write_size <= DSE_SYSCALL_WRITE_BYTES &&
+        s->result <= s->write_size &&
+        (uint64_t)s->args[1] + s->result <= (UINT64_C(1) << 32)) {
+        /* The kernel reads this returned prefix without ordinary load
+         * callbacks. Preserve every producer, including clean source bytes. */
+        for (uint32_t i = 0; i < s->result; ++i)
+            if (!dse_mem_need_add(frontier->memory, (uint64_t)s->args[1] + i))
+                return false;
+    }
+    if (s && s->number == 90 && s->mmap_args_valid && s->mmap_args_observed &&
+        (uint64_t)s->args[0] + 24 <= (UINT64_C(1) << 32)) {
+        for (unsigned i = 0; i < 24; ++i)
+            if (!dse_mem_need_add(frontier->memory, (uint64_t)s->args[0] + i))
+                return false;
+    }
+    if (s && s->number == 356 && s->name_observed && s->name_size &&
+        s->name_size <= DSE_MEMFD_NAME_BYTES &&
+        (uint64_t)s->args[0] + s->name_size <= (UINT64_C(1) << 32)) {
+        for (uint16_t i = 0; i < s->name_size; ++i)
+            if (!dse_mem_need_add(frontier->memory, (uint64_t)s->args[0] + i))
+                return false;
+    }
+    return true;
+}
+
+static uint32_t dse_control_evidence(const TraceBuffer *tb, const TraceEntry *entry,
+                                     const InsnMeta *meta, const InsnAux *aux) {
+    InsnOccurrence occ;
+    if (!trace_occurrence_archive_find(tb, entry->seq_id, &occ) || !occ.branch_event_valid ||
+        !occ.branch_event_id)
+        return DSE_CONTROL_EVENT_MISSING;
+    if (occ.seq_id != entry->seq_id || occ.vcpu_index != entry->vcpu_index || occ.pc != entry->pc ||
+        occ.meta_id != entry->meta_id || occ.desc_id != entry->insn_desc_id ||
+        occ.code_generation != entry->code_generation || occ.bytes_hash != entry->bytes_hash ||
+        !aux || !aux->execution_complete || !aux->next_pc_valid || !occ.execution_complete ||
+        !occ.next_pc_valid || occ.next_pc != aux->next_pc ||
+        occ.observed_branch_target != occ.next_pc ||
+        (occ.incomplete_reasons & TRACE_OCCURRENCE_BRANCH_MISMATCH) || !meta->direct_target_valid ||
+        (occ.branch_outcome != BRANCH_OUTCOME_TAKEN &&
+         occ.branch_outcome != BRANCH_OUTCOME_NOT_TAKEN))
+        return DSE_CONTROL_EVENT_CONFLICT;
+    uint64_t next = occ.branch_outcome == BRANCH_OUTCOME_TAKEN
+                        ? (uint32_t)meta->direct_target
+                        : (uint32_t)(entry->pc + entry->size);
+    return next == occ.next_pc ? 0 : DSE_CONTROL_EVENT_CONFLICT;
+}
+
+typedef struct {
+    DcfgRegionNode nodes[DCFG_REGION_MAX_NODES + 1U];
+    TraceEntry identities[DCFG_REGION_MAX_NODES + 1U];
+    uint64_t targets[DCFG_REGION_MAX_NODES + 1U][2];
+    TraceBranchKind branch_kinds[DCFG_REGION_MAX_NODES + 1U];
+    bool memory_reads[DCFG_REGION_MAX_NODES + 1U];
+    DseCfgResolveReason unresolved[DCFG_REGION_MAX_NODES + 1U][2];
+    DseCfgBuildStop stop;
+    TraceEntry identity_conflict;
+    uint64_t first_seq, last_seq;
+    uint32_t count, issues;
+} DseControlRegion;
+
+static uint32_t dse_region_find(const DseControlRegion *r, uint64_t pc) {
+    for (uint32_t i = 1; i <= r->count; ++i)
+        if (r->identities[i].pc == pc)
+            return i;
+    return 0;
+}
+
+static bool dse_region_same_code(const TraceEntry *a, const TraceEntry *b) {
+    return a->pc == b->pc && a->insn_desc_id == b->insn_desc_id && a->meta_id == b->meta_id &&
+           a->code_generation == b->code_generation && a->bytes_hash == b->bytes_hash &&
+           a->vcpu_index == b->vcpu_index;
+}
+
+/* Only total scalar operations in flat IA-32. Memory accesses, calls, system
+ * state and unsupported effects cannot certify an unexecuted continuation. */
+static bool dse_region_scalar(const InsnDesc *d) {
+    if ((d->effects.quality_flags & ~TRACE_EFFECT_NEEDS_FULL_LIFT) || d->effects.may_read_memory ||
+        d->effects.may_write_memory)
+        return false;
+    uint32_t p = d->bytes[0] == 0x66 ? 1U : 0U;
+    if (p >= d->size)
+        return false;
+    uint8_t opcode = d->bytes[p];
+    switch (opcode) {
+    case 0x26:
+    case 0x2e:
+    case 0x36:
+    case 0x3e:
+    case 0x64:
+    case 0x65:
+    case 0x66:
+    case 0x67:
+    case 0xf0:
+    case 0xf2:
+    case 0xf3:
+        return false;
+    default:
+        break;
+    }
+    if (d->effects.branch_kind == TRACE_BRANCH_CONDITIONAL)
+        return !p && d->effects.direct_target_valid && !d->effects.register_defs &&
+               !d->effects.special_defs &&
+               ((opcode >= 0x70 && opcode <= 0x7f) ||
+                (opcode == 0x0f && d->size > 1 && d->bytes[1] >= 0x80 && d->bytes[1] <= 0x8f));
+    if (d->effects.branch_kind == TRACE_BRANCH_JUMP_DIRECT)
+        return !p && d->effects.direct_target_valid && (opcode == 0xe9 || opcode == 0xeb);
+    if (d->native_insn_id == X86_INS_IMUL) {
+        uint32_t modrm = p + 1U;
+        if (opcode == 0x0f && modrm < d->size && d->bytes[modrm] == 0xaf)
+            ++modrm;
+        else if (opcode != 0x69 && opcode != 0x6b)
+            return false;
+        return modrm < d->size && d->bytes[modrm] >= 0xc0;
+    }
+    if ((d->effects.quality_flags & TRACE_EFFECT_NEEDS_FULL_LIFT) &&
+        d->native_insn_id != X86_INS_NOP)
+        return false;
+    switch (d->native_insn_id) {
+    case X86_INS_MOV:
+        return (opcode >= 0xb0 && opcode <= 0xbf) ||
+               ((opcode == 0x88 || opcode == 0x89 || opcode == 0x8a || opcode == 0x8b ||
+                 opcode == 0xc6 || opcode == 0xc7) &&
+                p + 1 < d->size && d->bytes[p + 1] >= 0xc0);
+    case X86_INS_NOP:
+    case X86_INS_MOVZX:
+    case X86_INS_MOVSX:
+    case X86_INS_LEA:
+    case X86_INS_ADD:
+    case X86_INS_ADC:
+    case X86_INS_SUB:
+    case X86_INS_SBB:
+    case X86_INS_AND:
+    case X86_INS_OR:
+    case X86_INS_XOR:
+    case X86_INS_CMP:
+    case X86_INS_TEST:
+    case X86_INS_INC:
+    case X86_INS_DEC:
+    case X86_INS_NOT:
+    case X86_INS_NEG:
+    case X86_INS_SHL:
+    case X86_INS_SAL:
+    case X86_INS_SHR:
+    case X86_INS_SAR:
+    case X86_INS_ROL:
+    case X86_INS_ROR:
+    case X86_INS_RCL:
+    case X86_INS_RCR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* These reads do not invalidate collected code. They remain opaque to the
+ * proof: an alternate address can fault or observe different memory. */
+static bool dse_region_read(const InsnDesc *d) {
+    if (d->effects.quality_flags || !d->effects.may_read_memory || d->effects.may_write_memory ||
+        d->effects.branch_kind != TRACE_BRANCH_NONE)
+        return false;
+    uint32_t p = d->bytes[0] == 0x66 ? 1U : 0U;
+    if (p >= d->size)
+        return false;
+    uint8_t opcode = d->bytes[p];
+    switch (d->native_insn_id) {
+    case X86_INS_MOV:
+        return opcode == 0x8a || opcode == 0x8b || opcode == 0xa0 || opcode == 0xa1;
+    case X86_INS_MOVSX:
+    case X86_INS_MOVZX:
+        return opcode == 0x0f && p + 1 < d->size &&
+               (d->bytes[p + 1] == 0xbe || d->bytes[p + 1] == 0xbf || d->bytes[p + 1] == 0xb6 ||
+                d->bytes[p + 1] == 0xb7);
+    case X86_INS_CMP:
+        return opcode == 0x38 || opcode == 0x39 || opcode == 0x3a || opcode == 0x3b ||
+               opcode == 0x80 || opcode == 0x81 || opcode == 0x83;
+    case X86_INS_TEST:
+        return opcode == 0x84 || opcode == 0x85 || opcode == 0xf6 || opcode == 0xf7;
+    default:
+        return false;
+    }
+}
+
+static void dse_region_stop(DseControlRegion *r, DseCfgStopReason reason, const TraceEntry *site,
+                            const TraceEntry *next, const InsnAux *aux) {
+    r->stop.reason = reason;
+    if (site) {
+        r->stop.site_present = true;
+        r->stop.site = *site;
+    }
+    if (next) {
+        r->stop.expected_next_valid = true;
+        r->stop.expected_next_pc = next->pc;
+    }
+    if (aux && aux->next_pc_valid) {
+        r->stop.observed_next_valid = true;
+        r->stop.observed_next_pc = aux->next_pc;
+    }
+}
+
+static uint32_t dse_region_add(DseControlRegion *r, const TraceEntry *e, const InsnDesc *d) {
+    uint32_t id = ++r->count;
+    r->identities[id] = *e;
+    r->branch_kinds[id] = d->effects.branch_kind;
+    r->memory_reads[id] = dse_region_read(d);
+    DcfgRegionNode *n = &r->nodes[id];
+    n->opaque = !dse_region_scalar(d);
+    n->register_writes = d->effects.register_defs;
+    n->special_writes = d->effects.special_defs;
+    n->successor_count = 1;
+    r->targets[id][0] = (uint32_t)(e->pc + e->size);
+    if (d->effects.branch_kind == TRACE_BRANCH_JUMP_DIRECT) {
+        r->targets[id][0] = (uint32_t)d->effects.direct_target;
+    } else if (d->effects.branch_kind == TRACE_BRANCH_CONDITIONAL) {
+        n->successor_count = 2;
+        r->targets[id][1] = (uint32_t)d->effects.direct_target;
+    } else if (d->effects.branch_kind != TRACE_BRANCH_NONE) {
+        n->opaque = true;
+    }
+    return id;
+}
+
+static void dse_region_build(DseControlRegion *r, const TraceBuffer *tb, const DseAuxRing *ring,
+                             const TraceEntry *boundary, uint32_t back_index, uint32_t end_index,
+                             DseControlStats *stats) {
+    memset(r, 0, sizeof(*r));
+    r->first_seq = r->last_seq = boundary->seq_id;
+    ++stats->cfg_regions;
+    const TraceEntry *next = boundary;
+    uint32_t back;
+    for (back = back_index; back < end_index; ++back) {
+        if (stats->cfg_scanned == DSE_MAX_CONTROL_SCAN) {
+            r->issues |= DCFG_REGION_BUDGET;
+            dse_region_stop(r, DSE_CFG_STOP_SCAN_BUDGET, trace_get_last(tb, back), NULL, NULL);
+            break;
+        }
+        ++stats->cfg_scanned;
+        const TraceEntry *e = trace_get_last(tb, back);
+        DseCfgStopReason reason = DSE_CFG_STOP_NONE;
+        if (!e || !e->seq_id)
+            reason = DSE_CFG_STOP_TRACE_MISSING;
+        else if (e->vcpu_index != boundary->vcpu_index)
+            reason = DSE_CFG_STOP_VCPU_CHANGE;
+        else if (back != back_index && e->seq_id != next->seq_id - 1)
+            reason = DSE_CFG_STOP_SEQUENCE_GAP;
+        if (reason) {
+            dse_region_stop(r, reason, e, NULL, NULL);
+            break;
+        }
+        const InsnDesc *d = trace_insn_desc_get(tb, e->insn_desc_id);
+        const InsnMeta *m = meta_lookup_id(e->meta_id);
+        const InsnAux *a = dse_aux_for(ring, tb, e);
+        if (!d || !m)
+            reason = DSE_CFG_STOP_METADATA_MISSING;
+        else if (d->arch != TRACE_ARCH_X86 || d->mode != TRACE_MODE_32)
+            reason = DSE_CFG_STOP_UNSUPPORTED_MODE;
+        else if (d->pc != e->pc || d->meta_id != e->meta_id ||
+                 d->code_generation != e->code_generation || d->bytes_hash != e->bytes_hash ||
+                 !d->size || d->size > MAX_INSN_BYTES || d->size != e->size || d->size != m->size ||
+                 e->pc > UINT32_MAX || memcmp(d->bytes, m->instr_bytes, d->size))
+            reason = DSE_CFG_STOP_CODE_IDENTITY;
+        else if (!a)
+            reason = DSE_CFG_STOP_AUX_MISSING;
+        else if (!a->execution_complete)
+            reason = DSE_CFG_STOP_EXEC_INCOMPLETE;
+        else if (back != back_index && !a->next_pc_valid)
+            reason = DSE_CFG_STOP_NEXT_PC_MISSING;
+        else if (back != back_index && a->next_pc != next->pc)
+            reason = DSE_CFG_STOP_NEXT_PC_MISMATCH;
+        if (reason) {
+            dse_region_stop(r, reason, e, back != back_index ? next : NULL, a);
+            break;
+        }
+        bool scalar = dse_region_scalar(d);
+        bool memory_read = dse_region_read(d);
+        /* Do not reuse old bytes across a possible code write or unknown code
+         * effects. Even a data store is a barrier here; no alias guess. */
+        if (back != back_index && !scalar && !memory_read) {
+            reason = d->effects.branch_kind == TRACE_BRANCH_RETURN ? DSE_CFG_STOP_RETURN
+                     : d->effects.branch_kind == TRACE_BRANCH_CALL_DIRECT ||
+                             d->effects.branch_kind == TRACE_BRANCH_CALL_INDIRECT
+                         ? DSE_CFG_STOP_CALL
+                     : d->effects.branch_kind == TRACE_BRANCH_JUMP_INDIRECT ? DSE_CFG_STOP_INDIRECT
+                     : d->effects.may_read_memory && d->effects.may_write_memory
+                         ? DSE_CFG_STOP_MEMORY_RMW
+                     : d->effects.may_read_memory  ? DSE_CFG_STOP_MEMORY_READ
+                     : d->effects.may_write_memory ? DSE_CFG_STOP_MEMORY_WRITE
+                                                   : DSE_CFG_STOP_OPAQUE;
+            dse_region_stop(r, reason, e, next, a);
+            break;
+        }
+        r->first_seq = e->seq_id;
+        next = e;
+        uint32_t id = dse_region_find(r, e->pc);
+        if (id) {
+            if (!dse_region_same_code(&r->identities[id], e)) {
+                r->nodes[id].opaque = true;
+                r->issues |= DCFG_REGION_INVALID;
+                if (!r->identity_conflict.seq_id)
+                    r->identity_conflict = *e;
+            }
+            continue;
+        }
+        if (r->count == DCFG_REGION_MAX_NODES) {
+            r->issues |= DCFG_REGION_BUDGET;
+            dse_region_stop(r, DSE_CFG_STOP_NODE_BUDGET, e, NULL, a);
+            break;
+        }
+        id = dse_region_add(r, e, d);
+        if (d->effects.branch_kind == TRACE_BRANCH_CONDITIONAL && dse_control_evidence(tb, e, m, a))
+            r->nodes[id].opaque = true;
+    }
+    if (back == end_index && end_index < tb->counter)
+        r->issues |= DCFG_REGION_BUDGET;
+    if (!r->stop.reason)
+        dse_region_stop(r,
+                        end_index < tb->counter ? DSE_CFG_STOP_SCAN_WINDOW
+                        : next->seq_id == 1     ? DSE_CFG_STOP_TRACE_START
+                                                : DSE_CFG_STOP_TRACE_BOUNDARY,
+                        next, NULL, NULL);
+    ++stats->cfg_stops[r->stop.reason];
+    for (uint32_t i = 1; i <= r->count; ++i) {
+        for (uint32_t j = 0; j < r->nodes[i].successor_count; ++j) {
+            uint32_t target = dse_region_find(r, r->targets[i][j]);
+            if (target && r->identities[target].code_generation == r->identities[i].code_generation)
+                r->nodes[i].successors[j] = target;
+        }
+    }
+    stats->cfg_nodes = MAX(stats->cfg_nodes, r->count);
+}
+
+static DseCfgResolveReason dse_region_resolve(DseControlRegion *r, const TraceBuffer *tb,
+                                              uint32_t source, uint32_t slot, uint32_t *target,
+                                              DseControlStats *stats) {
+    const TraceEntry *from = &r->identities[source];
+    uint64_t pc = r->targets[source][slot];
+    uint32_t page_size = from->code_page_size;
+    if (!page_size || (page_size & (page_size - 1U)) || !from->code_history_start ||
+        from->code_page_generation == UINT32_MAX)
+        return DSE_CFG_RESOLVE_VERSION_MISSING;
+    if (from->code_generation != from->code_page_generation)
+        return DSE_CFG_RESOLVE_STALE;
+    uint64_t page = from->pc & ~((uint64_t)page_size - 1U);
+    if (pc < page || pc - page >= page_size || from->pc - page + from->size > page_size)
+        return DSE_CFG_RESOLVE_PAGE_BOUNDARY;
+    const InsnDesc *d = NULL;
+    ++stats->cfg_resolve_lookups;
+    TraceDescLookup found = trace_insn_desc_find(tb, TRACE_ARCH_X86, TRACE_MODE_32, pc,
+                                                 from->code_generation, r->first_seq, &d);
+    if (found != TRACE_DESC_FOUND)
+        return found == TRACE_DESC_AMBIGUOUS ? DSE_CFG_RESOLVE_AMBIGUOUS
+               : found == TRACE_DESC_FUTURE  ? DSE_CFG_RESOLVE_FUTURE
+                                             : DSE_CFG_RESOLVE_NOT_DECODED;
+    if (d->available_seq < from->code_history_start)
+        return DSE_CFG_RESOLVE_HISTORY;
+    const InsnMeta *m = meta_lookup_id(d->meta_id);
+    if (!m || !d->size || d->size > MAX_INSN_BYTES || m->pc != pc || m->size != d->size ||
+        m->insn_id != d->native_insn_id || memcmp(m->instr_bytes, d->bytes, d->size) ||
+        d->bytes_hash != trace_instruction_bytes_hash(d->bytes, d->size))
+        return DSE_CFG_RESOLVE_INVALID;
+    if (pc - page + d->size > page_size)
+        return DSE_CFG_RESOLVE_PAGE_BOUNDARY;
+    TraceEntry e = {.pc = pc,
+                    .vcpu_index = from->vcpu_index,
+                    .insn_desc_id = d->desc_id,
+                    .meta_id = d->meta_id,
+                    .code_generation = d->code_generation,
+                    .code_page_generation = from->code_page_generation,
+                    .code_page_size = page_size,
+                    .code_history_start = from->code_history_start,
+                    .bytes_hash = d->bytes_hash,
+                    .size = d->size};
+    memcpy(e.instr_bytes, d->bytes, d->size);
+    *target = dse_region_add(r, &e, d);
+    return DSE_CFG_RESOLVE_NONE;
+}
+
+/* Complete only paths needed by this query. Descriptor nodes have no occurrence
+ * or replay state; their exhaustive direct successors and effects serve the CFG proof. */
+static void dse_region_complete(DseControlRegion *r, const TraceBuffer *tb, uint32_t from,
+                                uint32_t boundary, DseControlStats *stats) {
+    uint32_t queue[DCFG_REGION_MAX_NODES + 1U] = {from}, count = 1;
+    bool seen[DCFG_REGION_MAX_NODES + 1U] = {false};
+    seen[from] = true;
+    for (uint32_t q = 0; q < count; ++q) {
+        uint32_t id = queue[q];
+        DcfgRegionNode *n = &r->nodes[id];
+        if (id == boundary || (n->opaque && !r->memory_reads[id]))
+            continue;
+        for (uint32_t slot = 0; slot < n->successor_count; ++slot) {
+            uint32_t target = dse_region_find(r, r->targets[id][slot]);
+            if (target) {
+                if (r->identities[id].code_generation != r->identities[target].code_generation)
+                    continue;
+            } else if (r->unresolved[id][slot]) {
+                continue;
+            } else {
+                DseCfgResolveReason reason = DSE_CFG_RESOLVE_BUDGET;
+                if (stats->cfg_resolve_lookups < DSE_MAX_CONTROL_SCAN &&
+                    r->count < DCFG_REGION_MAX_NODES)
+                    reason = dse_region_resolve(r, tb, id, slot, &target, stats);
+                ++stats->cfg_resolve_attempts;
+                if (reason) {
+                    r->unresolved[id][slot] = reason;
+                    ++stats->cfg_resolve_failures[reason];
+                    if (reason == DSE_CFG_RESOLVE_BUDGET)
+                        stats->cfg_issues |= DCFG_REGION_BUDGET;
+                    continue;
+                }
+                ++stats->cfg_resolve_added;
+            }
+            n->successors[slot] = target;
+            if (!seen[target]) {
+                seen[target] = true;
+                queue[count++] = target;
+            }
+        }
+    }
+    stats->cfg_nodes = MAX(stats->cfg_nodes, r->count);
+}
+
+static void dse_region_unknown(const DseControlRegion *r, const TraceEntry *branch,
+                               const TraceEntry *boundary, DseCfgFailureReason reason,
+                               const TraceEntry *at, uint32_t node, uint32_t successor,
+                               DseControlStats *stats) {
+    ++stats->cfg_unknown;
+    ++stats->cfg_failures[reason];
+    DseCfgExample example = {.reason = reason,
+                             .count = 1,
+                             .branch = *branch,
+                             .boundary = *boundary,
+                             .build_stop = r->stop};
+    if (at) {
+        example.at_present = true;
+        example.at = *at;
+    }
+    if (reason == DSE_CFG_FAILURE_SUCCESSOR && node && node <= r->count &&
+        successor < r->nodes[node].successor_count) {
+        example.at_present = true;
+        example.at = r->identities[node];
+        example.target_pc = r->targets[node][successor];
+        example.edge_kind = r->branch_kinds[node];
+        example.successor_index = successor;
+        example.resolution = r->unresolved[node][successor];
+        uint32_t target = dse_region_find(r, example.target_pc);
+        example.edge_issue = target ? DSE_CFG_EDGE_GENERATION : DSE_CFG_EDGE_ABSENT;
+        if (target)
+            example.target_generation = r->identities[target].code_generation;
+    }
+    for (uint32_t i = 0; i < stats->cfg_example_count; ++i) {
+        DseCfgExample *old = &stats->cfg_examples[i];
+        if (old->reason == example.reason && old->build_stop.reason == example.build_stop.reason &&
+            old->edge_issue == example.edge_issue && old->edge_kind == example.edge_kind &&
+            old->successor_index == example.successor_index &&
+            old->resolution == example.resolution) {
+            ++old->count;
+            return;
+        }
+    }
+    if (stats->cfg_example_count < DSE_CFG_MAX_EXAMPLES)
+        stats->cfg_examples[stats->cfg_example_count++] = example;
+    else
+        ++stats->cfg_examples_omitted;
+}
+
+static bool dse_region_can_prune(DseControlRegion *r, const TraceBuffer *tb,
+                                 const TraceEntry *branch, const TraceEntry *boundary,
+                                 const DseDependencyFrontier *live, const uint8_t *address_roots,
+                                 uint64_t address_regs, DseControlStats *stats) {
+    if (!r)
+        return false;
+    ++stats->cfg_queries;
+    uint32_t from = dse_region_find(r, branch->pc);
+    uint32_t to = dse_region_find(r, boundary->pc);
+    if (r->issues || branch->seq_id < r->first_seq || boundary->seq_id > r->last_seq ||
+        branch->seq_id >= boundary->seq_id || !from || !to || from == to ||
+        !dse_region_same_code(&r->identities[from], branch) ||
+        !dse_region_same_code(&r->identities[to], boundary)) {
+        DseCfgFailureReason reason;
+        const TraceEntry *at = branch;
+        if (r->issues & DCFG_REGION_BUDGET) {
+            reason = DSE_CFG_FAILURE_REGION_BUDGET;
+            at = r->stop.site_present ? &r->stop.site : NULL;
+        } else if (r->issues) {
+            reason = DSE_CFG_FAILURE_REGION_IDENTITY;
+            at = r->identity_conflict.seq_id ? &r->identity_conflict : NULL;
+        } else if (branch->seq_id < r->first_seq) {
+            reason = DSE_CFG_FAILURE_BRANCH_OUTSIDE;
+        } else if (boundary->seq_id > r->last_seq) {
+            reason = DSE_CFG_FAILURE_BOUNDARY_OUTSIDE;
+            at = boundary;
+        } else if (branch->seq_id >= boundary->seq_id) {
+            reason = DSE_CFG_FAILURE_ORDER;
+        } else if (!from) {
+            reason = DSE_CFG_FAILURE_BRANCH_MISSING;
+        } else if (!to) {
+            reason = DSE_CFG_FAILURE_BOUNDARY_MISSING;
+            at = boundary;
+        } else if (from == to) {
+            reason = DSE_CFG_FAILURE_SAME_NODE;
+        } else {
+            reason = DSE_CFG_FAILURE_IDENTITY;
+            at = dse_region_same_code(&r->identities[from], branch) ? boundary : branch;
+        }
+        dse_region_unknown(r, branch, boundary, reason, at, 0, UINT32_MAX, stats);
+        stats->cfg_issues |= r->issues ? r->issues : DCFG_REGION_OPEN;
+        return false;
+    }
+    dse_region_complete(r, tb, from, to, stats);
+    DcfgRegionResult q = dcfg_region_analyze(r->nodes, r->count, from, to, DCFG_REGION_MAX_NODES);
+    stats->cfg_issues |= q.issues;
+    if (q.postdominates != DCFG_REGION_YES) {
+        DseCfgFailureReason reason =
+            q.witness_issue == DCFG_REGION_OPEN      ? DSE_CFG_FAILURE_SUCCESSOR
+            : q.witness_issue == DCFG_REGION_OPAQUE  ? DSE_CFG_FAILURE_OPAQUE
+            : q.witness_issue == DCFG_REGION_CYCLE   ? DSE_CFG_FAILURE_CYCLE
+            : q.witness_issue == DCFG_REGION_BUDGET  ? DSE_CFG_FAILURE_QUERY_BUDGET
+            : q.witness_issue == DCFG_REGION_INVALID ? DSE_CFG_FAILURE_INVALID
+                                                     : DSE_CFG_FAILURE_NOT_POSTDOMINATING;
+        if (reason == DSE_CFG_FAILURE_OPAQUE && q.witness_node && q.witness_node <= r->count &&
+            r->memory_reads[q.witness_node])
+            reason = DSE_CFG_FAILURE_MEMORY_READ;
+        const TraceEntry *at =
+            q.witness_node && q.witness_node <= r->count ? &r->identities[q.witness_node] : NULL;
+        dse_region_unknown(r, branch, boundary, reason, at, q.witness_node, q.witness_successor,
+                           stats);
+        return false;
+    }
+    uint64_t needed = address_regs;
+    for (unsigned i = 0; i < REG_COUNT; ++i)
+        if (live->regs[i] || address_roots[i])
+            needed |= UINT64_C(1) << i;
+    if ((needed & q.register_writes) || (live->special & q.special_writes)) {
+        ++stats->cfg_effect_conflicts;
+        return false;
+    }
+    ++stats->cfg_pruned;
     return true;
 }
 
@@ -4881,6 +6465,7 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
     uint8_t natural_mask = dse_natural_reg_mask();
     uint8_t data_address_roots[REG_COUNT] = {0};
     uint8_t replay_address_roots[REG_COUNT] = {0};
+    uint64_t control_address_regs = 0;
     bool *dependency_is_data = NULL;
     const TraceEntry *trigger = NULL;
     uint32_t trigger_back_index = 0;
@@ -4890,8 +6475,10 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
     bool path_budget_exhausted = false;
     bool path_budget_reported = false;
     bool path_tracking_active = true;
+    bool control_scan_open = true;
     bool success = false;
     DseRelevanceSelection *relevance_selection = NULL;
+    DseControlRegion *control_region = NULL;
 
     if (!tb || !ring || !out_slice || max_len < 2 || trigger_seq_id == 0 || natural_mask == 0 ||
         (plan && max_len > MAX_SLICE)) {
@@ -4925,6 +6512,11 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
         result.status = DSE_SLICE_TRIGGER_MISSING;
         goto cleanup;
     }
+    result.control.first_seq = result.control.trigger_seq = trigger_seq_id;
+    result.control.vcpu = trigger->vcpu_index;
+    const TraceEntry *oldest = trace_get_last(tb, tb->counter - 1U);
+    if (!oldest || oldest->seq_id != 1)
+        result.control.issues |= DSE_CONTROL_OPEN_BOUNDARY;
     relevance_selection = dse_relevance_selection_create(tb, trigger_seq_id, relevance);
     if (relevance_selection) {
         result.relevance = relevance_selection->stats;
@@ -4973,10 +6565,11 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
     }
     dse_add_address_inputs(trigger_address_mask, trigger_aux, data_address_roots, natural_mask);
     dse_add_address_inputs(trigger_address_mask, trigger_aux, replay_address_roots, natural_mask);
+    control_address_regs = trigger_deps.address_regs;
     if (seed_kind == DSE_SLICE_SEED_REGISTER) {
         uint8_t seed = (uint8_t)(trigger_aux->reg_taint[target_reg] & natural_mask);
         data_frontier.regs[target_reg] = seed;
-        replay_frontier.regs[target_reg] = seed;
+        replay_frontier.regs[target_reg] = natural_mask;
     } else {
         DseMemRead target_read;
         if (!dse_find_mem_read(trigger_aux, target_addr, target_size, &target_read)) {
@@ -4985,36 +6578,66 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
             goto cleanup;
         }
         for (uint8_t byte = 0; byte < target_size; byte++) {
-            if ((target_read.taint & (uint8_t)(1U << byte)) == 0) {
-                continue;
-            }
             uint64_t address = target_addr + byte;
-            if (!dse_mem_need_add(data_frontier.memory, address) ||
+            bool tainted = (target_read.taint & (uint8_t)(1U << byte)) != 0;
+            if ((tainted && !dse_mem_need_add(data_frontier.memory, address)) ||
                 !dse_mem_need_add(replay_frontier.memory, address)) {
                 result.status = DSE_SLICE_INVALID_INPUT;
                 goto cleanup;
             }
         }
     }
+    if (g_dse_control_pruning)
+        control_region = g_try_new0(DseControlRegion, 1);
+    uint32_t control_boundary_back_index = trigger_back_index;
+    uint32_t control_end_index =
+        trigger_back_index + MIN(tb->counter - trigger_back_index, DSE_MAX_CONTROL_SCAN + 1U);
+    uint64_t previous_seq = trigger_seq_id;
+    const TraceEntry *next_on_vcpu = trigger;
     for (uint32_t i = trigger_back_index + 1;
-         i < tb->counter && !(path_tracking_active ? dse_dependency_frontier_empty(&replay_frontier)
-                                                   : dse_dependency_frontier_empty(&data_frontier));
+         i < tb->counter &&
+         (control_scan_open ||
+          !(path_tracking_active ? dse_dependency_frontier_empty(&replay_frontier)
+                                 : dse_dependency_frontier_empty(&data_frontier)));
          i++) {
-        bool path_window_open = !dse_dependency_frontier_empty(&data_frontier);
+        if (control_scan_open && result.control.scanned == DSE_MAX_CONTROL_SCAN) {
+            result.control.issues |= DSE_CONTROL_SCAN_LIMIT;
+            control_scan_open = false;
+            if (dse_dependency_frontier_empty(&replay_frontier))
+                break;
+        }
+        bool path_window_open = control_scan_open;
         const TraceEntry *entry = trace_get_last(tb, i);
+        if (control_scan_open) {
+            ++result.control.scanned;
+            if (!entry || entry->seq_id == 0 || entry->seq_id >= previous_seq)
+                result.control.issues |= DSE_CONTROL_ORDER_CONFLICT;
+            else if (entry->seq_id != previous_seq - 1)
+                result.control.issues |= DSE_CONTROL_OPEN_BOUNDARY;
+            if (entry) {
+                previous_seq = entry->seq_id;
+                result.control.first_seq = entry->seq_id;
+            }
+        }
         if (!entry || entry->vcpu_index != trigger->vcpu_index) {
             continue;
         }
         scanned_entries++;
         const InsnMeta *meta = meta_lookup_id(entry->meta_id);
         if (!meta) {
+            result.control.issues |= DSE_CONTROL_METADATA_MISSING;
             result.status = DSE_SLICE_META_MISSING;
             result.meta_missing++;
             goto cleanup;
         }
         const InsnAux *aux = dse_aux_for(ring, tb, entry);
+        if (path_window_open && (!aux || !aux->next_pc_valid || aux->next_pc != next_on_vcpu->pc))
+            result.control.issues |= DSE_CONTROL_ORDER_CONFLICT;
+        next_on_vcpu = entry;
         TraceDeps deps;
         dse_entry_deps(tb, ring, entry, meta, aux, &deps);
+        if (path_window_open && deps.incomplete_reasons)
+            result.control.issues |= DSE_CONTROL_METADATA_MISSING;
         bool data_register_relevant = dse_deps_writes_needed(&deps, data_frontier.regs);
         bool replay_register_relevant = dse_deps_writes_needed(&deps, replay_frontier.regs);
         bool data_flag_relevant = (deps.special_may_write & data_frontier.special) != 0;
@@ -5037,14 +6660,44 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
         DcfgRelevance branch_relevance =
             dse_relevance_selection_get(relevance_selection, entry->seq_id);
         bool path_relevant = false;
+        bool environment_relevant = path_tracking_active && path_window_open &&
+                                    dse_syscall_instruction(meta);
+        replay_register_relevant |= environment_relevant;
+        bool control_pruned = false;
+        if (path_window_open && meta->is_conditional_branch) {
+            ++result.control.branches;
+            uint32_t evidence = dse_control_evidence(tb, entry, meta, aux);
+            if (!evidence && path_tracking_active && control_region &&
+                !(result.control.issues & ~(DSE_CONTROL_PARTIAL_CFG | DSE_CONTROL_OPEN_BOUNDARY))) {
+                const TraceEntry *boundary = result.len ? out_slice[result.len - 1] : trigger;
+                /* Local proofs may stop at a retained memory operation, but never cross it.
+                 * Missing prefix history still prevents the final path proof below. */
+                if (control_region->last_seq != boundary->seq_id &&
+                    (!control_region->count || entry->seq_id < control_region->first_seq ||
+                     boundary->seq_id > control_region->last_seq))
+                    dse_region_build(control_region, tb, ring, boundary,
+                                     control_boundary_back_index, control_end_index,
+                                     &result.control);
+                control_pruned = dse_region_can_prune(control_region, tb, entry, boundary,
+                                                      &replay_frontier, replay_address_roots,
+                                                      control_address_regs, &result.control);
+            }
+            if (!control_pruned) {
+                result.control.issues |= DSE_CONTROL_PARTIAL_CFG | evidence;
+                if (!result.control.first_unknown.seq_id)
+                    result.control.first_unknown = *entry;
+            }
+        }
         if (path_tracking_active && path_window_open && meta->is_conditional_branch &&
-            branch_relevance != DCFG_RELEVANCE_IRRELEVANT) {
+            !control_pruned) {
             if (result.path_constraints_expected < DSE_MAX_PATH_CONSTRAINTS) {
                 path_relevant = true;
             } else {
                 uint32_t old_slice_len = result.len;
                 path_budget_exhausted = true;
                 path_tracking_active = false;
+                result.control.issues |= DSE_CONTROL_SLICE_LIMIT;
+                result.control.retained = result.control.disjoint_retained = 0;
                 if (!path_budget_reported) {
                     DSE_DIAGNOSTIC(
                         stderr,
@@ -5069,13 +6722,15 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
             }
         }
         if (!replay_register_relevant && !replay_memory_relevant && !replay_flag_relevant &&
-            !path_relevant) {
+            !path_relevant && !environment_relevant) {
             continue;
         }
         if (result.len >= max_len - 1 && path_tracking_active) {
             uint32_t old_slice_len = result.len;
             path_budget_exhausted = true;
             path_tracking_active = false;
+            result.control.issues |= DSE_CONTROL_SLICE_LIMIT;
+            result.control.retained = result.control.disjoint_retained = 0;
             path_relevant = false;
             if (!dse_fallback_to_data_only(&result, out_slice, dependency_is_data, &replay_frontier,
                                            &data_frontier, replay_address_roots, data_address_roots,
@@ -5121,7 +6776,9 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
         bool exact_string = dse_aux_has_usable_exact_string(aux);
         bool read_access_unmodeled = aux->mem_read_overflow &&
                                      !(exact_string && aux->string_summary.kind == DSE_STRING_MOVS);
-        bool relevant_write_unmodeled = replay_memory_relevant && !exact_string &&
+        uint64_t mmap_base, mmap_end;
+        bool mmap_output = dse_old_mmap_range(aux, &mmap_base, &mmap_end);
+        bool relevant_write_unmodeled = replay_memory_relevant && !exact_string && !mmap_output &&
                                         (aux->mem_write_overflow || aux->mem_write_count != 1);
         if (read_access_unmodeled || relevant_write_unmodeled) {
             result.status = DSE_SLICE_MEM_ACCESS_UNMODELED;
@@ -5147,6 +6804,7 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
             goto cleanup;
         }
         dependency_is_data[appended_index] = data_relevant;
+        control_boundary_back_index = i;
         if (plan) {
             plan->seq_id[appended_index] = entry->seq_id;
             plan->data_all_memory_writes[appended_index] = false;
@@ -5180,15 +6838,17 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
             trace_deps_x86_forced_value_regs(meta, replay_needed_before, natural_mask);
         dse_add_address_inputs(observed_address_mask & ~replay_forced_value_mask, aux,
                                replay_address_roots, natural_mask);
+        control_address_regs |= deps.address_regs;
         if (data_relevant) {
             uint64_t data_forced_value_mask =
                 trace_deps_x86_forced_value_regs(meta, data_needed_before, natural_mask);
             dse_add_address_inputs(observed_address_mask & ~data_forced_value_mask, aux,
                                    data_address_roots, natural_mask);
         }
-        if (data_relevant && !dse_dependency_frontier_apply(
-                                 &data_frontier, &deps, meta, aux, data_register_relevant,
-                                 data_memory_relevant, data_flag_relevant, false, natural_mask)) {
+        if (data_relevant &&
+            !dse_dependency_frontier_apply(&data_frontier, &deps, meta, aux, data_register_relevant,
+                                           data_memory_relevant, data_flag_relevant, false,
+                                           natural_mask, false)) {
             result.status = DSE_SLICE_MEM_ACCESS_UNMODELED;
             dse_log_mem_access_failure(
                 "data-read-source-unmodeled", entry, aux,
@@ -5196,9 +6856,9 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
                 data_memory_relevant);
             goto cleanup;
         }
-        if (!dse_dependency_frontier_apply(&replay_frontier, &deps, meta, aux,
-                                           replay_register_relevant, replay_memory_relevant,
-                                           replay_flag_relevant, path_relevant, natural_mask)) {
+        if (!dse_dependency_frontier_apply(
+                &replay_frontier, &deps, meta, aux, replay_register_relevant,
+                replay_memory_relevant, replay_flag_relevant, path_relevant, natural_mask, true)) {
             result.status = DSE_SLICE_MEM_ACCESS_UNMODELED;
             dse_log_mem_access_failure(
                 "replay-read-source-unmodeled", entry, aux,
@@ -5208,6 +6868,9 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
         }
         if (path_relevant && result.path_constraints_expected != UINT32_MAX) {
             result.path_constraints_expected++;
+            result.control.retained++;
+            if (branch_relevance == DCFG_RELEVANCE_IRRELEVANT)
+                result.control.disjoint_retained++;
         }
     }
     dse_copy_reg_worklist(result.boundary_reg_bytes, replay_frontier.regs);
@@ -5244,7 +6907,8 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
     }
     result.status = DSE_SLICE_OK;
     result.data_complete = true;
-    result.path_complete = !path_budget_exhausted;
+    result.path_complete =
+        !path_budget_exhausted && !(result.control.issues & ~DSE_CONTROL_PARTIAL_CFG);
     result.complete = result.data_complete && result.path_complete;
     success = true;
 cleanup:
@@ -5260,6 +6924,7 @@ cleanup:
         result.relevance = relevance_selection->stats;
     }
     dse_relevance_selection_destroy(relevance_selection);
+    g_free(control_region);
     g_free(dependency_is_data);
     return result;
 }
@@ -5277,6 +6942,23 @@ DseSliceResult dse_build_mem_slice(const TraceBuffer *tb, const DseAuxRing *ring
                                    uint32_t max_len) {
     return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_MEMORY, REG_INVALID,
                                  target_addr, target_size, out_slice, max_len, NULL, NULL);
+}
+
+DseSliceResult dse_build_reg_slice_with_relevance(const TraceBuffer *tb, const DseAuxRing *ring,
+                                                  uint64_t trigger_seq_id, RegId target_reg,
+                                                  const TraceEntry **out_slice, uint32_t max_len,
+                                                  const DseRelevanceContext *relevance) {
+    return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_REGISTER, target_reg, 0,
+                                 0, out_slice, max_len, NULL, relevance);
+}
+
+DseSliceResult dse_build_mem_slice_with_relevance(const TraceBuffer *tb, const DseAuxRing *ring,
+                                                  uint64_t trigger_seq_id, uint64_t target_addr,
+                                                  uint8_t target_size, const TraceEntry **out_slice,
+                                                  uint32_t max_len,
+                                                  const DseRelevanceContext *relevance) {
+    return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_MEMORY, REG_INVALID,
+                                 target_addr, target_size, out_slice, max_len, NULL, relevance);
 }
 
 static DseSliceResult dse_build_reg_slice_planned(const TraceBuffer *tb, const DseAuxRing *ring,
@@ -5300,10 +6982,14 @@ static DseSliceResult dse_build_mem_slice_planned(const TraceBuffer *tb, const D
 static ReplayInput *dse_capture_slice_input(const TraceBuffer *tb, const DseAuxRing *ring,
                                             const TraceEntry *const *slice, uint32_t count,
                                             uint64_t trigger_seq_id, DseVerifyResult *result) {
-    uint64_t seq_ids[MAX_SLICE];
     if (count == 0 || count > MAX_SLICE || !slice[count - 1U] ||
         slice[count - 1U]->seq_id != trigger_seq_id) {
         result->reason = DSE_REASON_INVALID_INPUT;
+        return NULL;
+    }
+    uint64_t *seq_ids = g_try_new(uint64_t, count);
+    if (!seq_ids) {
+        result->reason = DSE_REASON_RESOURCE_LIMIT;
         return NULL;
     }
     for (uint32_t i = 0; i < count; i++) {
@@ -5313,7 +6999,8 @@ static ReplayInput *dse_capture_slice_input(const TraceBuffer *tb, const DseAuxR
     /* Existing slices include the trigger as their last instruction. The
 	 * owned input stores it separately as the observation point. */
     ReplayInput *input = replay_input_capture(tb, ring, seq_ids, count - 1U, trigger_seq_id,
-                                              DSE_MAX_STRING_TRACE_BYTES, &status);
+                                              DSE_MAX_REPLAY_BYTES, &status);
+    g_free(seq_ids);
     if (status == REPLAY_INPUT_READY)
         return input;
     uint32_t issues = replay_input_issues(input);
@@ -5330,6 +7017,26 @@ static ReplayInput *dse_capture_slice_input(const TraceBuffer *tb, const DseAuxR
                    (unsigned long)trigger_seq_id, (unsigned int)status, issues);
     replay_input_destroy(input);
     return NULL;
+}
+
+/* DF is part of the fixed initial machine environment for a replay from
+ * process entry. This does not import DF across an open control boundary:
+ * all retained definitions are still lifted and every use is replay-checked. */
+static void dse_seed_entry_direction(DSECtx *ctx, const TraceBuffer *tb,
+                                      const DseAuxRing *ring, const DseSliceResult *slice) {
+    if (!ctx || !slice || !slice->path_complete || slice->control.first_seq != 1 ||
+        !g_arch || g_arch->natural_width != 32 || g_arch->big_endian)
+        return;
+    const TraceEntry *entry = trace_find_seq(tb, 1, NULL);
+    const InsnAux *aux = entry ? dse_aux_for(ring, tb, entry) : NULL;
+    const InsnDesc *desc = entry ? trace_insn_desc_get(tb, entry->insn_desc_id) : NULL;
+    if (!entry || entry->vcpu_index != 0 || !aux || !aux->eflags_valid || !desc ||
+        desc->arch != TRACE_ARCH_X86 || desc->mode != TRACE_MODE_32)
+        return;
+    unsigned value = (aux->eflags_before >> 10) & 1U;
+    ctx->state.x86_flags[DSE_FLAG_SLOT_DF] = sym_expr_const(value, 1);
+    DSE_DIAGNOSTIC(stderr, "[DSE-DF-ENTRY] seq=1 pc=0x%" PRIx64
+                   " value=%u scope=fixed_initial_machine_state\n", entry->pc, value);
 }
 
 DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const DseAuxRing *ring,
@@ -5349,13 +7056,15 @@ DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const D
         return result;
     }
     g_tb = tb;
-    const TraceEntry *slice[MAX_SLICE];
+    const TraceEntry **slice = plan.entries;
     DseSliceResult slice_result = dse_build_reg_slice_planned(tb, ring, trigger_seq_id, target_reg,
                                                               slice, MAX_SLICE, &plan, relevance);
     dse_capture_relevance_metrics(&result, &slice_result.relevance);
+    result.control = slice_result.control;
     result.data_slice_complete = slice_result.data_complete;
     result.slice_complete = slice_result.complete;
-    result.boundary_flag_bits = (uint32_t)__builtin_popcountll(slice_result.boundary_special);
+    result.boundary_flag_bits = (uint32_t)__builtin_popcountll(slice_result.boundary_special &
+        (trace_special_state_bit(X86_SPECIAL_STATE_ES) - 1U));
     result.path_constraints_expected = slice_result.path_constraints_expected;
     result.string_summaries_expected = slice_result.string_summaries;
     result.slice_len = slice_result.len;
@@ -5383,6 +7092,7 @@ DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const D
         return result;
     }
     dse_lift_begin(&ctx);
+    dse_seed_entry_direction(&ctx, tb, ring, &slice_result);
     if (!slice_result.path_complete) {
         ctx.path_model_complete = false;
         if (ctx.path_failures != UINT32_MAX) {
@@ -5390,7 +7100,7 @@ DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const D
         }
     }
     uint32_t meta_missing = 0;
-    bool use_replay_demands = slice_result.path_complete;
+    bool use_replay_demands = !(slice_result.control.issues & DSE_CONTROL_SLICE_LIMIT);
     for (uint32_t i = 0; i < slice_result.len; i++) {
         if (ctx.resource_limit_hit)
             break;
@@ -5407,7 +7117,19 @@ DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const D
             g_concretized++;
             continue;
         }
-        (void)dse_lift_replay_step(&ctx, input, i, cs_handle);
+        bool lifted = dse_lift_replay_step(&ctx, input, i, cs_handle);
+        if (!lifted && dse_syscall_instruction(meta)) {
+            /* No downstream replay or target check after an unmodeled external
+             * state transition: those would only create secondary mismatches. */
+            dse_slice_plan_deactivate(&ctx);
+            dse_capture_verify_metrics(&result, &ctx, slice_result.len, meta_missing);
+            result.reason = ctx.replay_mismatch ? DSE_REASON_REPLAY_MISMATCH
+                                                : DSE_REASON_UNSUPPORTED_INSN;
+            dse_ctx_free(&ctx);
+            replay_input_destroy(input);
+            dse_slice_plan_destroy(&plan);
+            return result;
+        }
     }
     dse_slice_plan_deactivate(&ctx);
     if (ctx.path_constraints < slice_result.path_constraints_expected) {
@@ -5478,14 +7200,16 @@ DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, con
         return result;
     }
     g_tb = tb;
-    const TraceEntry *slice[MAX_SLICE];
+    const TraceEntry **slice = plan.entries;
     uint8_t target_size = (uint8_t)(g_arch->natural_width / 8);
     DseSliceResult slice_result = dse_build_mem_slice_planned(
         tb, ring, trigger_seq_id, target_addr, target_size, slice, MAX_SLICE, &plan, relevance);
     dse_capture_relevance_metrics(&result, &slice_result.relevance);
+    result.control = slice_result.control;
     result.data_slice_complete = slice_result.data_complete;
     result.slice_complete = slice_result.complete;
-    result.boundary_flag_bits = (uint32_t)__builtin_popcountll(slice_result.boundary_special);
+    result.boundary_flag_bits = (uint32_t)__builtin_popcountll(slice_result.boundary_special &
+        (trace_special_state_bit(X86_SPECIAL_STATE_ES) - 1U));
     result.path_constraints_expected = slice_result.path_constraints_expected;
     result.string_summaries_expected = slice_result.string_summaries;
     result.slice_len = slice_result.len;
@@ -5513,6 +7237,7 @@ DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, con
         return result;
     }
     dse_lift_begin(&ctx);
+    dse_seed_entry_direction(&ctx, tb, ring, &slice_result);
     if (!slice_result.path_complete) {
         ctx.path_model_complete = false;
         if (ctx.path_failures != UINT32_MAX) {
@@ -5520,7 +7245,7 @@ DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, con
         }
     }
     uint32_t meta_missing = 0;
-    bool use_replay_demands = slice_result.path_complete;
+    bool use_replay_demands = !(slice_result.control.issues & DSE_CONTROL_SLICE_LIMIT);
     for (uint32_t i = 0; i < slice_result.len; i++) {
         if (ctx.resource_limit_hit)
             break;
@@ -5537,7 +7262,19 @@ DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, con
             g_concretized++;
             continue;
         }
-        (void)dse_lift_replay_step(&ctx, input, i, cs_handle);
+        bool lifted = dse_lift_replay_step(&ctx, input, i, cs_handle);
+        if (!lifted && dse_syscall_instruction(meta)) {
+            /* No downstream replay or target check after an unmodeled external
+             * state transition: those would only create secondary mismatches. */
+            dse_slice_plan_deactivate(&ctx);
+            dse_capture_verify_metrics(&result, &ctx, slice_result.len, meta_missing);
+            result.reason = ctx.replay_mismatch ? DSE_REASON_REPLAY_MISMATCH
+                                                : DSE_REASON_UNSUPPORTED_INSN;
+            dse_ctx_free(&ctx);
+            replay_input_destroy(input);
+            dse_slice_plan_destroy(&plan);
+            return result;
+        }
     }
     dse_slice_plan_deactivate(&ctx);
     if (ctx.path_constraints < slice_result.path_constraints_expected) {

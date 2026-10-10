@@ -110,6 +110,8 @@ typedef enum {
      * mathematical LOAD/STORE do not model those effects themselves. */
     IR_OP_GUARD,
     IR_OP_BARRIER,
+    /* A fully defined, immutable zero byte array over the whole MEM domain. */
+    IR_OP_ZERO_MEMORY,
     IR_OP_COUNT
 } IrOpcode;
 
@@ -201,6 +203,40 @@ typedef struct {
     IrInstId instruction;
     const char *message; /* Static string. */
 } IrDiagnostic;
+
+/* Construction counters are emission history, not active post-SSA counts.
+ * Phases are exclusive; nested helpers restore their caller's phase. */
+typedef enum {
+    IR_BUILD_OTHER, IR_BUILD_SETUP, IR_BUILD_X86, IR_BUILD_REGISTERS,
+    IR_BUILD_ARITHMETIC_FLAGS, IR_BUILD_MEMORY, IR_BUILD_ENVIRONMENT,
+    IR_BUILD_OBSERVATIONS, IR_BUILD_CONTROL, IR_BUILD_FLAG_DEFINEDNESS,
+    IR_BUILD_FETCH, IR_BUILD_PHASE_COUNT
+} IrBuildPhase;
+typedef enum {
+    IR_BUDGET_NONE, IR_BUDGET_INSTRUCTIONS, IR_BUDGET_VALUES, IR_BUDGET_BLOCKS,
+    IR_BUDGET_STATES, IR_BUDGET_OUTPUTS, IR_BUDGET_STEPS, IR_BUDGET_OBSERVATIONS,
+    IR_BUDGET_MEMORY_BYTES, IR_BUDGET_REPEAT_ITERATIONS
+} IrBudgetKind;
+typedef struct {
+    IrBudgetKind kind;
+    uint64_t used, limit, requested; /* requested is the required total. */
+    IrOrigin origin;
+    IrBuildPhase phase;
+} IrBudgetFailure;
+typedef struct {
+    IrLimits records, limits;
+    size_t allocated_bytes;
+    IrStatus status;
+    IrBudgetFailure failure;
+    uint64_t opcodes[IR_OP_COUNT], phases[IR_BUILD_PHASE_COUNT];
+} IrBuildMetrics;
+IrBuildPhase ir_module_build_phase(IrModule *module, IrBuildPhase phase);
+void ir_module_build_origin(IrModule *module, IrOrigin origin);
+IrBuildMetrics ir_module_build_metrics(const IrModule *module);
+const char *ir_budget_kind_name(IrBudgetKind kind);
+const char *ir_build_phase_name(IrBuildPhase phase);
+bool ir_budget_report_json(FILE *stream, const IrBudgetFailure *failure);
+bool ir_build_report_json(FILE *stream, const IrBuildMetrics *metrics);
 
 IrLimits ir_default_limits(void);
 IrModule *ir_module_create(const IrLimits *limits);

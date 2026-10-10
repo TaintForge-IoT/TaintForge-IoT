@@ -86,7 +86,8 @@ typedef enum {
     X86_SPECIAL_STATE_SF = 4,
     X86_SPECIAL_STATE_OF = 5,
     X86_SPECIAL_STATE_DF = 6,
-    X86_SPECIAL_STATE_COUNT = 7
+    X86_SPECIAL_STATE_ES = 7,
+    X86_SPECIAL_STATE_COUNT = 8
 } X86SpecialStateId;
 
 typedef enum {
@@ -145,6 +146,8 @@ typedef struct {
 
     uint8_t flags_read_mask;
     uint8_t flags_write_mask;
+    bool writes_df;
+    bool writes_es;
     X86ConditionCode condition_code;
     bool is_conditional_branch;
     bool direct_target_valid;
@@ -152,6 +155,12 @@ typedef struct {
     bool has_rep_prefix;
     uint8_t string_element_size;
 } InsnMeta;
+
+/* Narrow DSE contract; other SCAS widths/prefixes keep opaque effects. */
+static inline bool insn_meta_is_plain_scasd(const InsnMeta *meta) {
+    return meta && meta->insn_id == X86_INS_SCASD && meta->size == 1 &&
+           meta->instr_bytes[0] == 0xaf;
+}
 
 ShadowMemory *shadow_create(uint8_t guest_bits);
 ShadowMemory *shadow_create_with_registry(uint8_t guest_bits, ProvRegistry *registry);
