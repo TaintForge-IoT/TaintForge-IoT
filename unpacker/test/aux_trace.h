@@ -290,6 +290,10 @@ bool dse_aux_record_sources(DseAuxRing *ring, InsnAux *aux, const DseSourceObser
 void dse_aux_destroy(DseAuxRing *r);
 InsnAux *dse_aux_record(DseAuxRing *r, const TraceBuffer *tb, const TraceEntry *entry,
                         const InsnAux *aux);
+/* Release a slot when its instruction is replaced without a concrete aux.
+ * The new entry must belong to this trace ring. Other slots/source history
+ * are preserved; the discarded slot is invalid and owns no dynamic bytes. */
+bool dse_aux_discard(DseAuxRing *ring, const TraceBuffer *trace, const TraceEntry *entry);
 // support for get_slice
 void dse_aux_prepare_string(InsnAux *aux, const InsnMeta *meta);
 bool dse_aux_capture_string_read(DseAuxRing *ring, InsnAux *aux, uint64_t address, uint64_t value,

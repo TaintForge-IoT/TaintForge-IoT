@@ -1,6 +1,13 @@
 #ifndef TAINTFORGE_PROVENANCE_H
 #define TAINTFORGE_PROVENANCE_H
 
+#ifndef TF_CAPTURE_FASTPATH
+#define TF_CAPTURE_FASTPATH 1
+#endif
+#if TF_CAPTURE_FASTPATH != 0 && TF_CAPTURE_FASTPATH != 1
+#error "TF_CAPTURE_FASTPATH must be zero or one"
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,6 +31,10 @@ typedef uint32_t ProvOpenFileDescriptionId;
 #define PROV_OFD_ID_INVALID ((ProvOpenFileDescriptionId)0)
 
 #define PROV_DEFAULT_MAX_ROOTS_PER_SET UINT32_C(4096)
+
+#ifndef TF_PROV_FASTPATH
+#define TF_PROV_FASTPATH 1
+#endif
 
 typedef enum {
     PROV_RESOURCE_INVALID = 0,
@@ -127,6 +138,25 @@ typedef struct {
     uint64_t root_set_union_requests;
     uint64_t root_set_union_cache_hits;
     uint64_t root_set_truncations;
+    uint32_t max_roots_per_set;
+    bool union_fastpath_enabled;
+    uint64_t union_cache_entries;
+    uint64_t union_cache_capacity;
+    uint64_t union_temp_allocations;
+    uint64_t union_merge_iterations;
+    uint64_t union_retained_prefix_hits;
+    uint64_t registry_semantic_digest;
+    uint64_t resource_records_bytes;
+    uint64_t root_records_bytes;
+    uint64_t root_set_records_bytes;
+    uint64_t label_records_bytes;
+    uint64_t index_bytes;
+    uint64_t union_cache_bytes;
+    uint64_t root_set_payload_bytes;
+    uint64_t resource_name_bytes;
+    uint64_t union_scratch_bytes;
+    /* Requested live allocations only: excludes malloc overhead, QEMU and DTA. */
+    uint64_t registry_accounted_bytes;
 } ProvRegistryStats;
 
 typedef struct ProvRegistry ProvRegistry;
@@ -170,6 +200,9 @@ bool prov_label_has_known_roots(ProvRegistry *registry, ProvLabelId label_id);
 bool prov_label_channel_may_be_tainted(ProvRegistry *registry, ProvLabelId label_id,
                                        ProvChannel channel);
 bool prov_label_may_be_tainted(ProvRegistry *registry, ProvLabelId label_id);
+/* CLEAN is the unique complete label with no roots. All other IDs, including
+ * invalid IDs, and unavailable registries are conservatively tainted. */
+bool prov_label_may_be_tainted_conservative(ProvRegistry *registry, ProvLabelId label_id);
 bool prov_label_is_complete(ProvRegistry *registry, ProvLabelId label_id, uint8_t channels);
 
 typedef struct {

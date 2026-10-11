@@ -2,12 +2,20 @@
 
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define PROV_INITIAL_BUCKET_COUNT ((size_t)16)
 #define PROV_LOAD_NUMERATOR ((size_t)7)
 #define PROV_LOAD_DENOMINATOR ((size_t)10)
+
+#ifndef TF_PROV_FASTPATH
+#define TF_PROV_FASTPATH 1
+#endif
+#if TF_PROV_FASTPATH != 0 && TF_PROV_FASTPATH != 1
+#error "TF_PROV_FASTPATH must be zero or one"
+#endif
 
 typedef struct {
     ProvResourceKey key;
@@ -62,6 +70,9 @@ struct ProvRegistry {
 
     ProvLabelRecord *labels;
     size_t label_count;
+    /* IDs and label views never change after interning. Readers of this
+     * release-published bound do not access the reallocating label array. */
+    _Atomic uint32_t published_label_count;
     size_t label_capacity;
     uint32_t *label_buckets;
     size_t label_bucket_count;
@@ -74,6 +85,13 @@ struct ProvRegistry {
     uint64_t union_requests;
     uint64_t union_cache_hits;
     uint64_t root_set_truncations;
+    uint64_t union_temp_allocations;
+    uint64_t union_merge_iterations;
+    uint64_t union_retained_prefix_hits;
+    uint64_t semantic_digest;
+    uint64_t root_set_payload_bytes;
+    uint64_t resource_name_bytes;
+    ProvRootId *union_scratch;
 };
 
 typedef struct {
@@ -433,6 +451,10 @@ static ProvRootSetId prov_root_set_intern_sorted_locked(ProvRegistry *registry,
     record->count = count;
     record->hash = hash;
 
+    registry->root_set_payload_bytes += allocation_size;
+    registry->semantic_digest = prov_hash_combine(registry->semantic_digest,
+        prov_hash_combine(UINT64_C(0x726f6f74736574) ^ id, hash));
+
     size_t mask = registry->root_set_bucket_count - 1;
     size_t slot = (size_t)hash & mask;
     while (registry->root_set_buckets[slot] != 0)
@@ -477,12 +499,16 @@ static ProvLabelId prov_label_intern_locked(ProvRegistry *registry, const ProvLa
     ProvLabelId id = (ProvLabelId)registry->label_count;
     registry->labels[registry->label_count].view = label;
     registry->labels[registry->label_count].hash = hash;
+    registry->semantic_digest = prov_hash_combine(registry->semantic_digest,
+        prov_hash_combine(UINT64_C(0x6c6162656c) ^ id, hash));
     registry->label_count++;
     size_t mask = registry->label_bucket_count - 1;
     size_t slot = (size_t)hash & mask;
     while (registry->label_buckets[slot] != 0)
         slot = (slot + 1) & mask;
     registry->label_buckets[slot] = id + 1;
+    atomic_store_explicit(&registry->published_label_count,
+                          (uint32_t)registry->label_count, memory_order_release);
     return id;
 }
 
@@ -540,6 +566,36 @@ static const ProvRootSetRecord *prov_root_set_record_locked(const ProvRegistry *
     return &registry->root_sets[set_id - 1];
 }
 
+#if TF_PROV_FASTPATH
+static bool prov_small_union_retains_large(const ProvRootSetRecord *small,
+                                           const ProvRootSetRecord *large,
+                                           uint32_t limit, bool *out_truncated) {
+    *out_truncated = false;
+    if (small->count > 32 || (uint64_t)small->count * 8 > large->count)
+        return false;
+    for (uint32_t index = 0; index < small->count; index++) {
+        uint32_t low = 0, high = large->count;
+        ProvRootId root = small->roots[index];
+        if (large->count == limit && root > large->roots[large->count - 1]) {
+            /* This value is beyond the full retained prefix. It changes the
+             * truncation flag, but cannot change any stored member. */
+            *out_truncated = true;
+            continue;
+        }
+        while (low < high) {
+            uint32_t middle = low + (high - low) / 2;
+            if (large->roots[middle] < root)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        if (low == large->count || large->roots[low] != root)
+            return false;
+    }
+    return true;
+}
+#endif
+
 static ProvRootSetId prov_root_set_union_locked(ProvRegistry *registry, ProvRootSetId left,
                                                 ProvRootSetId right, bool *out_truncated) {
     if (out_truncated)
@@ -570,8 +626,44 @@ static ProvRootSetId prov_root_set_union_locked(ProvRegistry *registry, ProvRoot
     const ProvRootSetRecord *right_record = prov_root_set_record_locked(registry, right);
     if (!left_record || !right_record)
         return PROV_ROOT_SET_ID_INVALID;
+#if TF_PROV_FASTPATH
+    /* Check whether a small operand leaves the retained large set unchanged.
+     * Preserve discarded-root evidence, the pair cache and result ID. */
+    ProvRootSetId containing = PROV_ROOT_SET_EMPTY;
+    bool retained_truncated = false;
+    if (prov_small_union_retains_large(right_record, left_record, registry->max_roots_per_set,
+                                       &retained_truncated))
+        containing = left;
+    else if (prov_small_union_retains_large(left_record, right_record, registry->max_roots_per_set,
+                                            &retained_truncated))
+        containing = right;
+    if (containing != PROV_ROOT_SET_EMPTY) {
+        registry->union_retained_prefix_hits++;
+        if (retained_truncated)
+            registry->root_set_truncations++;
+        prov_union_cache_insert_locked(registry, cache_key, containing, retained_truncated);
+        if (out_truncated)
+            *out_truncated = retained_truncated;
+        return containing;
+    }
+#endif
     uint32_t limit = registry->max_roots_per_set;
-    ProvRootId *merged = malloc((size_t)limit * sizeof(*merged));
+    size_t scratch_size = 0;
+    if (!prov_size_multiply(limit, sizeof(ProvRootId), &scratch_size))
+        return PROV_ROOT_SET_ID_INVALID;
+#if TF_PROV_FASTPATH
+    /* All callers hold the registry mutex; intern_sorted copies the result. */
+    if (!registry->union_scratch) {
+        registry->union_scratch = malloc(scratch_size);
+        if (registry->union_scratch)
+            registry->union_temp_allocations++;
+    }
+    ProvRootId *merged = registry->union_scratch;
+#else
+    ProvRootId *merged = malloc(scratch_size);
+    if (merged)
+        registry->union_temp_allocations++;
+#endif
     if (!merged)
         return PROV_ROOT_SET_ID_INVALID;
     uint32_t left_index = 0;
@@ -580,6 +672,7 @@ static ProvRootSetId prov_root_set_union_locked(ProvRegistry *registry, ProvRoot
     uint32_t stored_count = 0;
 
     while (left_index < left_record->count || right_index < right_record->count) {
+        registry->union_merge_iterations++;
         ProvRootId value;
         if (right_index >= right_record->count ||
             (left_index < left_record->count &&
@@ -596,13 +689,21 @@ static ProvRootSetId prov_root_set_union_locked(ProvRegistry *registry, ProvRoot
         if (stored_count < limit)
             merged[stored_count++] = value;
         unique_count++;
+#if TF_PROV_FASTPATH
+        /* Sorted, unique inputs: the first limit+1 distinct values establish
+         * truncation and the exact retained prefix. No later value can change it. */
+        if (unique_count > limit)
+            break;
+#endif
     }
 
     bool truncated = unique_count > limit;
     if (truncated)
         registry->root_set_truncations++;
     ProvRootSetId result = prov_root_set_intern_sorted_locked(registry, merged, stored_count);
+#if !TF_PROV_FASTPATH
     free(merged);
+#endif
     if (result != PROV_ROOT_SET_ID_INVALID) {
         prov_union_cache_insert_locked(registry, cache_key, result, truncated);
     }
@@ -627,6 +728,7 @@ ProvRegistry *prov_registry_create(const ProvRegistryConfig *config) {
     ProvRegistry *registry = calloc(1, sizeof(*registry));
     if (!registry)
         return NULL;
+    atomic_init(&registry->published_label_count, 0);
     pthread_mutex_lock(&prov_instance_lock);
     if (prov_last_instance != UINT64_MAX)
         registry->instance = ++prov_last_instance;
@@ -689,6 +791,7 @@ void prov_registry_destroy(ProvRegistry *registry) {
     free(registry->labels);
     free(registry->label_buckets);
     free(registry->union_cache);
+    free(registry->union_scratch);
     pthread_mutex_unlock(&registry->lock);
     pthread_mutex_destroy(&registry->lock);
     free(registry);
@@ -705,6 +808,31 @@ void prov_registry_get_stats(ProvRegistry *registry, ProvRegistryStats *out_stat
     out_stats->root_set_union_requests = registry->union_requests;
     out_stats->root_set_union_cache_hits = registry->union_cache_hits;
     out_stats->root_set_truncations = registry->root_set_truncations;
+    out_stats->max_roots_per_set = registry->max_roots_per_set;
+    out_stats->union_fastpath_enabled = TF_PROV_FASTPATH != 0;
+    out_stats->union_cache_entries = registry->union_cache_count;
+    out_stats->union_cache_capacity = registry->union_cache_capacity;
+    out_stats->union_temp_allocations = registry->union_temp_allocations;
+    out_stats->union_merge_iterations = registry->union_merge_iterations;
+    out_stats->union_retained_prefix_hits = registry->union_retained_prefix_hits;
+    out_stats->registry_semantic_digest = registry->semantic_digest;
+    out_stats->resource_records_bytes = registry->resource_capacity * sizeof(*registry->resources);
+    out_stats->root_records_bytes = registry->root_capacity * sizeof(*registry->roots);
+    out_stats->root_set_records_bytes = registry->root_set_capacity * sizeof(*registry->root_sets);
+    out_stats->label_records_bytes = registry->label_capacity * sizeof(*registry->labels);
+    out_stats->index_bytes = (registry->resource_bucket_count + registry->root_bucket_count +
+                              registry->root_set_bucket_count + registry->label_bucket_count) *
+                             sizeof(uint32_t);
+    out_stats->union_cache_bytes = registry->union_cache_capacity * sizeof(*registry->union_cache);
+    out_stats->root_set_payload_bytes = registry->root_set_payload_bytes;
+    out_stats->resource_name_bytes = registry->resource_name_bytes;
+    out_stats->union_scratch_bytes = registry->union_scratch
+                                        ? (uint64_t)registry->max_roots_per_set * sizeof(ProvRootId) : 0;
+    out_stats->registry_accounted_bytes = sizeof(*registry) + out_stats->resource_records_bytes +
+        out_stats->root_records_bytes + out_stats->root_set_records_bytes +
+        out_stats->label_records_bytes + out_stats->index_bytes + out_stats->union_cache_bytes +
+        out_stats->root_set_payload_bytes + out_stats->resource_name_bytes +
+        out_stats->union_scratch_bytes;
     pthread_mutex_unlock(&registry->lock);
 }
 
@@ -721,6 +849,8 @@ ProvResourceId prov_resource_intern(ProvRegistry *registry, const ProvResourceKe
         record->roles |= roles;
         if (!record->display_name && display_name) {
             record->display_name = prov_strdup(display_name);
+            if (record->display_name)
+                registry->resource_name_bytes += strlen(record->display_name) + 1;
         }
         pthread_mutex_unlock(&registry->lock);
         return existing;
@@ -753,6 +883,8 @@ ProvResourceId prov_resource_intern(ProvRegistry *registry, const ProvResourceKe
     record->key = *key;
     record->roles = roles;
     record->display_name = name_copy;
+    if (name_copy)
+        registry->resource_name_bytes += strlen(name_copy) + 1;
     size_t mask = registry->resource_bucket_count - 1;
     size_t slot = (size_t)hash & mask;
     while (registry->resource_buckets[slot] != 0)
@@ -1030,6 +1162,15 @@ static ProvLabelId prov_label_join_locked(ProvRegistry *registry, ProvLabelId le
     }
     if (left == right)
         return left;
+#if TF_CAPTURE_FASTPATH
+    /* CLEAN is the canonical complete, empty label. Validate both operands
+     * above before applying this identity, including invalid IDs. Joining it
+     * cannot allocate a set/label or change incompleteness. */
+    if (left == PROV_LABEL_CLEAN)
+        return right;
+    if (right == PROV_LABEL_CLEAN)
+        return left;
+#endif
     ProvLabelView a = registry->labels[left].view;
     ProvLabelView b = registry->labels[right].view;
     bool data_truncated = false;
@@ -1054,6 +1195,16 @@ static ProvLabelId prov_label_join_locked(ProvRegistry *registry, ProvLabelId le
 ProvLabelId prov_label_join(ProvRegistry *registry, ProvLabelId left, ProvLabelId right) {
     if (!registry)
         return PROV_LABEL_ID_INVALID;
+#if TF_CAPTURE_FASTPATH
+    if (left == right || left == PROV_LABEL_CLEAN || right == PROV_LABEL_CLEAN) {
+        uint32_t count = atomic_load_explicit(&registry->published_label_count,
+                                               memory_order_acquire);
+        if (left < count && right < count)
+            return left == PROV_LABEL_CLEAN ? right : left;
+        /* A concurrent interning operation may publish the missing ID before
+         * the lock is acquired. Let the ordinary validation decide. */
+    }
+#endif
     pthread_mutex_lock(&registry->lock);
     ProvLabelId result = prov_label_join_locked(registry, left, right);
     pthread_mutex_unlock(&registry->lock);
@@ -1064,6 +1215,22 @@ ProvLabelId prov_label_join_many(ProvRegistry *registry, const ProvLabelId *labe
                                  uint32_t count) {
     if (!registry || (count != 0 && !labels))
         return PROV_LABEL_ID_INVALID;
+#if TF_CAPTURE_FASTPATH
+    uint32_t published = atomic_load_explicit(&registry->published_label_count,
+                                               memory_order_acquire);
+    ProvLabelId single = PROV_LABEL_CLEAN;
+    uint32_t index = 0;
+    for (; index < count; index++) {
+        ProvLabelId id = labels[index];
+        if (id >= published ||
+            (single != PROV_LABEL_CLEAN && id != PROV_LABEL_CLEAN && id != single))
+            break;
+        if (id != PROV_LABEL_CLEAN)
+            single = id;
+    }
+    if (index == count)
+        return single;
+#endif
     pthread_mutex_lock(&registry->lock);
     ProvLabelId result = PROV_LABEL_CLEAN;
     for (uint32_t index = 0; index < count; index++) {
@@ -1078,6 +1245,10 @@ ProvLabelId prov_label_join_many(ProvRegistry *registry, const ProvLabelId *labe
 ProvLabelId prov_label_as_address_dependency(ProvRegistry *registry, ProvLabelId label_id) {
     if (!registry)
         return PROV_LABEL_ID_INVALID;
+#if TF_CAPTURE_FASTPATH
+    if (label_id == PROV_LABEL_CLEAN)
+        return PROV_LABEL_CLEAN;
+#endif
     pthread_mutex_lock(&registry->lock);
     if (!prov_label_id_valid_locked(registry, label_id)) {
         pthread_mutex_unlock(&registry->lock);
@@ -1145,10 +1316,15 @@ bool prov_label_get(ProvRegistry *registry, ProvLabelId label_id, ProvLabelView 
 bool prov_label_is_valid(ProvRegistry *registry, ProvLabelId label_id) {
     if (!registry)
         return false;
+#if TF_CAPTURE_FASTPATH
+    return label_id < atomic_load_explicit(&registry->published_label_count,
+                                            memory_order_acquire);
+#else
     pthread_mutex_lock(&registry->lock);
     bool valid = prov_label_id_valid_locked(registry, label_id);
     pthread_mutex_unlock(&registry->lock);
     return valid;
+#endif
 }
 
 bool prov_label_has_known_roots(ProvRegistry *registry, ProvLabelId label_id) {
@@ -1174,10 +1350,24 @@ bool prov_label_channel_may_be_tainted(ProvRegistry *registry, ProvLabelId label
 }
 
 bool prov_label_may_be_tainted(ProvRegistry *registry, ProvLabelId label_id) {
+#if TF_CAPTURE_FASTPATH
+    /* Interning normalizes every complete, root-free view to CLEAN. Preserve
+     * the exact API's false result for invalid IDs (the conservative API has
+     * a deliberately different invalid-ID contract). */
+    return label_id != PROV_LABEL_CLEAN && prov_label_is_valid(registry, label_id);
+#else
     ProvLabelView label;
     return prov_label_get(registry, label_id, &label) &&
            (label.data_roots != PROV_ROOT_SET_EMPTY || label.address_roots != PROV_ROOT_SET_EMPTY ||
             label.complete_mask != PROV_COMPLETE_ALL);
+#endif
+}
+
+bool prov_label_may_be_tainted_conservative(ProvRegistry *registry, ProvLabelId label_id) {
+    /* Registry creation establishes CLEAN==0. Label interning normalizes and
+     * deduplicates every complete, root-free view back to this immutable tag.
+     * Invalid nonzero IDs must also stay tainted, so no table lookup is needed. */
+    return !registry || label_id != PROV_LABEL_CLEAN;
 }
 
 bool prov_label_is_complete(ProvRegistry *registry, ProvLabelId label_id, uint8_t channels) {

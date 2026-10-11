@@ -21,6 +21,8 @@ typedef enum {
     TF_PHASE_SYSCALL_RETURN,
     TF_PHASE_CONTROL_FLOW,
     TF_PHASE_REG_SNAPSHOT,
+    TF_PHASE_ES_SNAPSHOT,
+    TF_PHASE_AUX_RECORD,
     TF_PHASE_ARCHIVE,
     TF_PHASE_TRACE_CAPTURE,
     TF_PHASE_REGISTER_DTA,
@@ -43,12 +45,14 @@ typedef struct {
     TfRuntimeLog log;
     bool profile;
     uint64_t progress_interval;
+    uint64_t profile_interval;
 } TfRuntimeDiagOptions;
 
 typedef struct {
     TfRuntimeDiagOptions options;
     uint64_t start_us;
     uint64_t next_progress;
+    uint64_t next_profile;
     TfRuntimeMetric phases[TF_PHASE_COUNT];
 } TfRuntimeDiag;
 
@@ -66,6 +70,9 @@ const char *tf_runtime_phase_name(TfRuntimePhase phase);
 void tf_runtime_scope_end(TfRuntimeScope *scope);
 /* Metrics are inclusive wall times; nested phases must not be added together. */
 bool tf_runtime_profile_json(FILE *out, const TfRuntimeDiag *diag);
+bool tf_runtime_profile_snapshot_json(FILE *out, const TfRuntimeDiag *diag,
+                                      const char *stage, uint64_t instructions);
+bool tf_runtime_profile_due(TfRuntimeDiag *diag, uint64_t instructions);
 /* Claims one progress interval atomically; zero disables progress. */
 bool tf_runtime_progress_due(TfRuntimeDiag *diag, uint64_t instructions);
 

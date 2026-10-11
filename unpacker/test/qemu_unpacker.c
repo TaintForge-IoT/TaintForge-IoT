@@ -489,6 +489,8 @@ static InsnExecCtx *insn_exec_context_create(uint64_t pc, const uint8_t *bytes, 
     return ctx;
 }
 
+static bool capture_sparse_auxiliary(void);
+
 static void runtime_scale_snapshot(const char *stage, uint64_t instructions) {
     if (!g_dta_shadow_stats)
         return;
@@ -511,13 +513,40 @@ static void runtime_scale_snapshot(const char *stage, uint64_t instructions) {
             ",\"branch_occurrences\":%" PRIu64 ",\"instruction_contexts\":%u"
             ",\"context_payload_bytes\":%zu,\"instruction_descriptors\":%" PRIu64
             ",\"trace_ring_records\":%u,\"trace_archive_records\":%" PRIu64
-            ",\"candidate_count\":%" PRIu64 "}\n",
+            ",\"candidate_count\":%" PRIu64,
             stage, instructions, shadow.page_count, shadow.page_bytes,
             shadow.knowledge_valid ? "true" : "false", provenance.root_count,
             provenance.root_set_count, provenance.label_count, provenance.root_set_truncations,
             graph.node_count, graph.edge_count, graph.branch_occurrence_count, contexts,
             (size_t)contexts * sizeof(InsnExecCtx), trace_insn_desc_count(g_trace),
             g_trace ? g_trace->counter : 0, trace_occurrence_archive_count(g_trace), g_candidate_count);
+    fprintf(stderr,
+            ",\"provenance_root_cap\":%u,\"provenance_union_fastpath\":%s"
+            ",\"provenance_union_requests\":%" PRIu64 ",\"provenance_union_cache_hits\":%" PRIu64
+            ",\"provenance_union_cache_entries\":%" PRIu64 ",\"provenance_union_cache_capacity\":%" PRIu64
+            ",\"provenance_union_temp_allocations\":%" PRIu64 ",\"provenance_union_merge_iterations\":%" PRIu64
+            ",\"provenance_union_retained_prefix_hits\":%" PRIu64
+            ",\"provenance_registry_digest\":\"%016" PRIx64 "\""
+            ",\"provenance_resource_records_bytes\":%" PRIu64 ",\"provenance_root_records_bytes\":%" PRIu64
+            ",\"provenance_root_set_records_bytes\":%" PRIu64 ",\"provenance_label_records_bytes\":%" PRIu64
+            ",\"provenance_index_bytes\":%" PRIu64 ",\"provenance_union_cache_bytes\":%" PRIu64
+            ",\"provenance_root_set_payload_bytes\":%" PRIu64 ",\"provenance_resource_name_bytes\":%" PRIu64
+            ",\"provenance_union_scratch_bytes\":%" PRIu64 ",\"provenance_registry_accounted_bytes\":%" PRIu64
+            ",\"capture_fastpath\":%s,\"capture_sparse_auxiliary\":%s}\n",
+            provenance.max_roots_per_set, provenance.union_fastpath_enabled ? "true" : "false",
+            provenance.root_set_union_requests, provenance.root_set_union_cache_hits,
+            provenance.union_cache_entries, provenance.union_cache_capacity,
+            provenance.union_temp_allocations, provenance.union_merge_iterations,
+            provenance.union_retained_prefix_hits,
+            provenance.registry_semantic_digest,
+            provenance.resource_records_bytes, provenance.root_records_bytes,
+            provenance.root_set_records_bytes, provenance.label_records_bytes,
+            provenance.index_bytes, provenance.union_cache_bytes, provenance.root_set_payload_bytes,
+            provenance.resource_name_bytes, provenance.union_scratch_bytes,
+            provenance.registry_accounted_bytes,
+            TF_CAPTURE_FASTPATH ? "true" : "false",
+            capture_sparse_auxiliary() ? "true" : "false");
+    fflush(stderr);
 }
 
 //auxv read for threshold and determine precise page size
@@ -2212,6 +2241,9 @@ static uint8_t shadow_load_taint_mask(uint64_t vaddr, uint32_t size) {
 }
 
 static bool plugin_label_may_be_tainted(ProvLabelId label) {
+#if TF_PROV_FASTPATH
+    return prov_label_may_be_tainted_conservative(g_prov_registry, label);
+#else
     if (!g_prov_registry) {
         return true;
     }
@@ -2219,6 +2251,7 @@ static bool plugin_label_may_be_tainted(ProvLabelId label) {
         return true;
     }
     return prov_label_may_be_tainted(g_prov_registry, label);
+#endif
 }
 
 static uint8_t label_array_taint_mask(const ProvLabelId *labels, uint32_t count) {
@@ -3701,6 +3734,8 @@ static void write_report(void) {
             g_candidate_capture_bytes, g_dse_check_enabled ? "true" : "false",
             trace_archive_enabled() ? "true" : "false", g_main_known ? "true" : "false",
             g_trace_capacity);
+    fprintf(f_json, "  \"concrete_auxiliary_policy\":\"%s\",\n",
+            capture_sparse_auxiliary() ? "syscall_boundaries" : "every_instruction");
     if (g_phase1.enabled)
         fprintf(f_json,
                 "  \"session_id\":\"%s\",\n  \"attempt_id\":\"%s\",\n"
@@ -4218,7 +4253,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     tf_runtime_scope_end(&shutdown_scope);
     if (g_runtime_diag.options.profile) {
         fputs("[RUNTIME-PROFILE] ", stderr);
-        if (!tf_runtime_profile_json(stderr, &g_runtime_diag))
+        if (!tf_runtime_profile_snapshot_json(stderr, &g_runtime_diag, "exit", g_icount))
             fprintf(stderr, "[RUNTIME] profile write failed\n");
     }
     if (g_capture_gaps) {
@@ -4249,6 +4284,28 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
     return false;
 }
 
+static bool capture_sparse_auxiliary(void) {
+#if TF_CAPTURE_FASTPATH
+    /* DTA, instruction/branch history and candidate capture still observe
+     * every instruction. Only concrete replay auxiliaries are sparse in this
+     * bounded entry-capture mode, which does not run DSE/IR or archive replay. */
+    return is_i386 && g_phase1.enabled && g_phase1.capture_at_entry &&
+           !g_dse_check_enabled && !g_ir_enabled && !g_concolic &&
+           !trace_archive_enabled();
+#else
+    return false;
+#endif
+}
+
+static bool capture_auxiliary_required(const InsnMeta *meta) {
+    if (!capture_sparse_auxiliary() || !meta)
+        return true;
+    /* Preserve full entry/post register and flag observations for syscall
+     * mapping/FD contracts. Unknown decode also keeps the ordinary path. */
+    return meta->insn_id == X86_INS_INT || meta->insn_id == X86_INS_SYSENTER ||
+           meta->insn_id == X86_INS_SYSCALL;
+}
+
 static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     if (!tf_phase1_active(&g_phase1))
         return;
@@ -4277,7 +4334,9 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     bool current_eflags_valid = false;
     InsnAux *previous_aux = vcpu_state->current_aux;
     uint64_t previous_aux_seq_id = vcpu_state->current_aux_seq_id;
-    bool need_dse_snapshot = previous_aux != NULL || (g_trace != NULL && g_aux != NULL);
+    bool need_current_aux = capture_auxiliary_required(meta);
+    bool need_dse_snapshot = previous_aux != NULL ||
+                             (need_current_aux && g_trace != NULL && g_aux != NULL);
     if (need_dse_snapshot) {
         TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_REG_SNAPSHOT);
         current_reg_value_valid_mask = dse_read_register_snapshot(current_reg_vals);
@@ -4398,6 +4457,12 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     g_icount++;
     if (g_dta_shadow_stats && (g_icount == 1 || g_icount % UINT64_C(100000) == 0))
         runtime_scale_snapshot("periodic", g_icount);
+    if (tf_runtime_profile_due(&g_runtime_diag, g_icount)) {
+        fputs("[RUNTIME-PROFILE] ", stderr);
+        if (!tf_runtime_profile_snapshot_json(stderr, &g_runtime_diag, "periodic", g_icount))
+            fprintf(stderr, "[RUNTIME] profile write failed\n");
+        fflush(stderr);
+    }
     if (tf_runtime_progress_due(&g_runtime_diag, g_icount)) {
         uint64_t now = (uint64_t)g_get_monotonic_time();
         fprintf(stderr,
@@ -4441,7 +4506,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         if (stored_entry) {
             current_trace_seq_id = stored_entry->seq_id;
         }
-        if (stored_entry && g_aux) {
+        if (stored_entry && g_aux && need_current_aux) {
             InsnAux aux;
             DseSourceObservation source_snapshot;
             memset(&aux, 0, sizeof(aux));
@@ -4453,7 +4518,10 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
             }
             dse_aux_set_eflags(&aux, current_eflags, current_eflags_valid, g_x86_flags_verified);
             if (is_i386) {
-                dse_read_es_snapshot(&aux);
+                {
+                    TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_ES_SNAPSHOT);
+                    dse_read_es_snapshot(&aux);
+                }
                 dse_aux_carry_x86_es(&aux, stored_entry, g_trace,
                     previous_aux && previous_aux->seq_id == previous_aux_seq_id ? previous_aux : NULL);
                 if (g_x86_es_verified && stored_entry->seq_id == 1)
@@ -4472,21 +4540,27 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 dse_aux_carry_x86_df(&aux, stored_entry, g_trace, previous_aux);
             if (g_ir_enabled && is_i386 && g_ir_runtime.options.replay.x86.tls32_ram)
                 dse_read_tls_snapshot(&aux);
-            for (int reg = 0; reg < REG_COUNT; reg++) {
-                uint8_t taint_mask = 0;
-                for (uint8_t byte = 0; byte < 4; byte++) {
-                    if (plugin_label_may_be_tainted(regs->bytes[reg][byte])) {
-                        taint_mask |= (uint8_t)(UINT32_C(1) << byte);
+            {
+                TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_AUX_RECORD);
+                for (int reg = 0; reg < REG_COUNT; reg++) {
+                    uint8_t taint_mask = 0;
+                    for (uint8_t byte = 0; byte < 4; byte++) {
+                        if (plugin_label_may_be_tainted(regs->bytes[reg][byte])) {
+                            taint_mask |= (uint8_t)(UINT32_C(1) << byte);
+                        }
                     }
+                    aux.reg_taint[reg] = taint_mask;
                 }
-                aux.reg_taint[reg] = taint_mask;
+                g_cur_aux = dse_aux_record(g_aux, g_trace, stored_entry, &aux);
+                if (g_cur_aux)
+                    dse_aux_prepare_string(g_cur_aux, meta);
             }
-            g_cur_aux = dse_aux_record(g_aux, g_trace, stored_entry, &aux);
-            if (g_cur_aux)
-                dse_aux_prepare_string(g_cur_aux, meta);
             vcpu_state->current_aux = g_cur_aux;
             vcpu_state->current_aux_seq_id = g_cur_aux ? g_cur_aux->seq_id : 0;
         } else {
+            if (stored_entry && g_aux && !need_current_aux &&
+                !dse_aux_discard(g_aux, g_trace, stored_entry))
+                tf_phase1_profile_lost(&g_phase1, "auxiliary_slot_discard_failed");
             g_cur_aux = NULL;
             vcpu_state->current_aux = NULL;
             vcpu_state->current_aux_seq_id = 0;
@@ -4858,6 +4932,13 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         PluginVcpuState *state = plugin_vcpu_state_get(vcpu_idx);
         const TraceEntry *entry =
             state ? trace_find_seq(g_trace, state->current_aux_seq_id, NULL) : NULL;
+        if (capture_sparse_auxiliary() &&
+            (!state || !entry || !state->current_aux || entry->vcpu_index != vcpu_idx)) {
+            /* A syscall reached through an unrecognized instruction cannot
+             * silently bypass entry/post mapping contracts in sparse mode. */
+            tf_phase1_profile_lost(&g_phase1, "syscall_auxiliary_unavailable");
+            return;
+        }
         if (state && entry && entry->vcpu_index == vcpu_idx &&
             num >= 0 && (uint64_t)num <= UINT32_MAX) {
             InsnAux *aux = state->current_aux;

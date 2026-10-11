@@ -868,6 +868,19 @@ InsnAux *dse_aux_record(DseAuxRing *r, const TraceBuffer *tb, const TraceEntry *
     return stored;
 }
 
+bool dse_aux_discard(DseAuxRing *ring, const TraceBuffer *trace, const TraceEntry *entry) {
+    uint32_t index;
+    if (!ring || !ring->entries || !entry || !entry->seq_id ||
+        !trace_entry_index(trace, entry, &index) || index >= ring->capacity)
+        return false;
+    InsnAux *stored = &ring->entries[index];
+    if (stored->valid) {
+        dse_aux_release_string(ring, stored);
+        memset(stored, 0, sizeof(*stored));
+    }
+    return true;
+}
+
 static bool df_preserving_instruction(const InsnMeta *meta) {
     if (!meta || meta->writes_df)
         return false;

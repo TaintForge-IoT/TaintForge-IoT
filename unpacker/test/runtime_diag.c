@@ -13,6 +13,8 @@ static const char *const phase_names[TF_PHASE_COUNT] = {"instruction_callback",
                                                         "syscall_return_callback",
                                                         "control_flow",
                                                         "register_snapshot",
+                                                        "es_snapshot",
+                                                        "aux_record",
                                                         "archive",
                                                         "trace_capture",
                                                         "register_dta",
@@ -87,6 +89,9 @@ bool tf_runtime_diag_options(TfRuntimeDiag *diag, int argc, char **argv, FILE *e
         } else if (!strncmp(arg, "runtime-progress=", 17)) {
             if (!parse_count(arg + 17, &options.progress_interval))
                 goto invalid;
+        } else if (!strncmp(arg, "runtime-profile-interval=", 25)) {
+            if (!parse_count(arg + 25, &options.profile_interval))
+                goto invalid;
         } else {
             goto invalid;
         }
@@ -98,6 +103,7 @@ bool tf_runtime_diag_options(TfRuntimeDiag *diag, int argc, char **argv, FILE *e
     }
     diag->options = options;
     diag->next_progress = options.progress_interval;
+    diag->next_profile = options.profile_interval ? 1 : 0;
     return true;
 }
 
@@ -141,14 +147,34 @@ bool tf_runtime_progress_due(TfRuntimeDiag *diag, uint64_t instructions) {
     return false;
 }
 
-bool tf_runtime_profile_json(FILE *out, const TfRuntimeDiag *diag) {
+bool tf_runtime_profile_due(TfRuntimeDiag *diag, uint64_t instructions) {
+    if (!diag || !diag->options.profile || !diag->options.profile_interval)
+        return false;
+    uint64_t next = __atomic_load_n(&diag->next_profile, __ATOMIC_RELAXED);
+    while (next && instructions >= next) {
+        uint64_t future = diag->options.profile_interval > UINT64_MAX - instructions
+                              ? 0
+                              : instructions + diag->options.profile_interval;
+        if (__atomic_compare_exchange_n(&diag->next_profile, &next, future, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return true;
+    }
+    return false;
+}
+
+bool tf_runtime_profile_snapshot_json(FILE *out, const TfRuntimeDiag *diag,
+                                      const char *stage, uint64_t instructions) {
     if (!out || !diag)
+        return false;
+    if (!stage || (strcmp(stage, "periodic") && strcmp(stage, "exit")))
         return false;
     uint64_t now = (uint64_t)g_get_monotonic_time();
     fprintf(out,
             "{\"schema\":1,\"event\":\"runtime_profile\",\"enabled\":%s,"
+            "\"stage\":\"%s\",\"instructions\":%" PRIu64 ","
             "\"timing\":\"inclusive_wall_us\",\"log\":\"%s\",\"wall_us\":%" PRIu64,
-            diag->options.profile ? "true" : "false", tf_runtime_log_name(diag->options.log),
+            diag->options.profile ? "true" : "false", stage, instructions,
+            tf_runtime_log_name(diag->options.log),
             now >= diag->start_us ? now - diag->start_us : 0);
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
@@ -170,4 +196,8 @@ bool tf_runtime_profile_json(FILE *out, const TfRuntimeDiag *diag) {
     }
     fputs("}}\n", out);
     return !ferror(out);
+}
+
+bool tf_runtime_profile_json(FILE *out, const TfRuntimeDiag *diag) {
+    return tf_runtime_profile_snapshot_json(out, diag, "exit", 0);
 }
