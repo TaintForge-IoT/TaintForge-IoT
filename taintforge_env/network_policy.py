@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import socket 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +30,9 @@ class NetworkServicePolicy:
     bind_ip: str
     bind_port: int
     protocol_hint: Optional[str] = None
+    upstream_ip: Optional[str] = None
+    upstream_port: Optional[int] = None
+    dns_records: dict[str, list[str]] | None = None
 
 
 
@@ -40,14 +43,18 @@ class NetworkPolicy:
     allow_internet: bool = False
     services: list[NetworkServicePolicy] = field(default_factory=list)
     catch_all: CatchAllPolicy = field(default_factory=CatchAllPolicy)
+    recording: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "mode": self.mode,
             "allow_internet": self.allow_internet,
             "services": [asdict(service) for service in self.services],
             "catch_all": asdict(self.catch_all),
         }
+        if self.recording is not None:
+            result["recording"] = self.recording
+        return result
 
 
 def is_tcp_port_available(host: str, port: int) -> bool:
@@ -77,6 +84,22 @@ def choose_tcp_bind_port(host: str, preferred_port: Optional[int], check_availab
         sock.bind((host, 0))
         return int(sock.getsockname()[1])
 
+
+def choose_udp_bind_port(host: str, preferred_port: Optional[int], check_availability: bool = True) -> int:
+    if not check_availability:
+        if preferred_port is None:
+            raise ValueError("preferred_port is required when check_availability = False")
+        return preferred_port
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        if preferred_port is not None:
+            try:
+                sock.bind((host, preferred_port))
+                return int(sock.getsockname()[1])
+            except OSError:
+                pass
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
 def build_network_policy(
     taint: TaintLog,
     mode: str = "local_test",
@@ -95,32 +118,44 @@ def build_network_policy(
     unknown_policy="transparent_redirect_and_log",)
     )
 
+    seen = set()
     for dep in taint.network_dependencies:
         service = build_service_policy(dep=dep, default_bind_ip=default_bind_ip, check_bind_availability=check_bind_availability)
 
         if service is not None:
-            policy.services.append(service)
+            transports = ("udp", "tcp") if service.protocol_hint == "dns" else (service.service_type,)
+            for transport in transports:
+                key = transport, service.remote_ip, service.remote_port
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidate = replace(service, service_type=transport)
+                if transport != service.service_type:
+                    chooser = choose_udp_bind_port if transport == "udp" else choose_tcp_bind_port
+                    candidate.bind_port = chooser(default_bind_ip, service.remote_port, check_bind_availability)
+                policy.services.append(candidate)
 
     return policy
 
 
 def build_service_policy(dep: NetworkDependency, default_bind_ip: str, check_bind_availability: bool = True) -> Optional[NetworkServicePolicy]:
-    if dep.transport() != "tcp": #other protocols later
+    if dep.transport() not in {"tcp", "udp"}:
         return None
 
     remote_port = dep.effective_remote_port()
 
-    bind_port = choose_tcp_bind_port(host=default_bind_ip, preferred_port=remote_port, check_availability=check_bind_availability)
+    chooser = choose_udp_bind_port if dep.transport() == "udp" else choose_tcp_bind_port
+    bind_port = chooser(host=default_bind_ip, preferred_port=remote_port, check_availability=check_bind_availability)
 
     return NetworkServicePolicy(
-        service_type="tcp",
+        service_type=dep.transport(),
         role=dep.type,
         remote_ip=dep.effective_remote_ip(),
         remote_port=remote_port,
         domain=None,
         bind_ip=default_bind_ip,
         bind_port=bind_port,
-        protocol_hint=dep.type,
+        protocol_hint="dns" if dep.is_dns() else dep.type,
     )
 
 def save_network_policy(policy: NetworkPolicy, path: str | Path) -> None:
@@ -152,4 +187,4 @@ def load_network_policy(path: str | Path) -> NetworkPolicy:
     )
     )
 
-    return NetworkPolicy(mode=raw.get("mode", "local_test"), allow_internet=bool(raw.get("allow_internet", False)), services=services, catch_all=catch_all)   
+    return NetworkPolicy(mode=raw.get("mode", "local_test"), allow_internet=bool(raw.get("allow_internet", False)), services=services, catch_all=catch_all, recording=raw.get("recording"))

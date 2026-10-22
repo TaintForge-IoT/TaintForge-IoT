@@ -10,6 +10,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterable
 
+from .syscall_result import normalize_syscall_event
+
 
 class TargetStateError(RuntimeError):
     """Raised when a target-state specification or evidence is invalid."""
@@ -216,7 +218,7 @@ class TargetStateEvaluation:
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "schema_version": 1,
-            "oracle_version": 1,
+            "oracle_version": 2,
             "generated_at_utc": self.generated_at_utc,
             "goal_id": self.goal_id,
             "description": self.description,
@@ -305,6 +307,8 @@ class TargetStateOracle:
         minimum = int(rule.parameters["min_count"])
         where = dict(rule.parameters["where"])
         events = _read_jsonl_optional(path)
+        if rule.source == "syscall":
+            events = [normalize_syscall_event(event) for event in events]
         if rule.source == "syscall" and "execution_context" not in where:
             where["execution_context"] = "guest"
         matches = [event for event in events if _matches(event, where)]
@@ -329,7 +333,8 @@ class TargetStateOracle:
         path = _source_path(root, _EVENT_SOURCES, rule.source)
         events = list(_read_jsonl_optional(path))
         if rule.source == "syscall":
-            events = [event for event in events if event.get("execution_context") == "guest"]
+            events = [normalize_syscall_event(event) for event in events
+                      if event.get("execution_context") == "guest"]
         sequence = list(rule.parameters["sequence"])
         minimum = int(rule.parameters["min_repeats"])
         max_gap = int(rule.parameters["max_gap"])
@@ -531,7 +536,11 @@ def _find_match(
 
 
 def _matches(event: dict[str, Any], where: dict[str, Any]) -> bool:
-    return all(event.get(key) == value for key, value in where.items())
+    # JSON true/false must not match Python's numerically equal 1/0.
+    return all(
+        (event.get(key) is value if isinstance(value, bool) else event.get(key) == value)
+        for key, value in where.items()
+    )
 
 
 def _source_path(root: Path, mapping: dict[str, str], source: str) -> Path:
@@ -574,7 +583,12 @@ def _evidence_event(index: int, event: dict[str, Any]) -> dict[str, Any]:
         "execution_context",
         "syscall",
         "success",
+        "return_value",
+        "result",
         "errno",
+        "source_file",
+        "line_number",
+        "pid",
         "path",
         "remote_ip",
         "remote_port",

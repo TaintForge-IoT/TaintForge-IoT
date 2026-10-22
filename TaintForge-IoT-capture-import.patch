@@ -1,0 +1,1423 @@
+From c065880f5febff14728661718844a39cf47f2785 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 11 Sep 2026 11:34:37 +0200
+Subject: [PATCH] Import completed C2 captures into ReplayStore and verify
+ offline replay
+
+---
+ README.md                           |  72 ++++++
+ samples/c2_record_client.c          |  87 ++++---
+ scripts/replay_store.py             |  17 ++
+ scripts/run_c2_replay_local_e2e.py  | 285 +++++++++++++++++++++++
+ taintforge_env/capture_importer.py  | 343 ++++++++++++++++++++++++++++
+ tests/capture_fixture.py            |  67 ++++++
+ tests/test_capture_importer.py      | 252 ++++++++++++++++++++
+ tests/test_capture_replay_e2e.py    |  48 ++++
+ tests/test_parser_runtime_compat.py |  35 ++-
+ 9 files changed, 1161 insertions(+), 45 deletions(-)
+ create mode 100644 scripts/run_c2_replay_local_e2e.py
+ create mode 100644 taintforge_env/capture_importer.py
+ create mode 100644 tests/capture_fixture.py
+ create mode 100644 tests/test_capture_importer.py
+ create mode 100644 tests/test_capture_replay_e2e.py
+
+diff --git a/README.md b/README.md
+index 9992839..136f3bd 100644
+--- a/README.md
++++ b/README.md
+@@ -632,12 +632,84 @@ This implementation uses synthesis binding version 6. A session bound to an
+ older loop or analysis-code version requires a new session directory; editing
+ the old binding to bypass verification is not a migration.
+ 
++#### Import a recorded C2 transaction
++
++Import one **completed session directory** produced by `C2RecordBroker`:
++
++```bash
++PYTHONPATH=. python scripts/replay_store.py import-capture \
++  --session-dir workdir/record/captures/RUN/SESSION \
++  --store workdir/c2_replay_store \
++  --protocol-hint c2_binary
++PYTHONPATH=. python scripts/replay_store.py validate --store workdir/c2_replay_store
++```
++
++The destination must be new or an initialized ReplayStore. Import from an
++archived session with no active writer, and use one store writer at a time.
++Use the protocol hint from the template's `network_policy.json`; it is part
++of the request fingerprint. The importer always uses the **original** IPv4
++endpoint recorded in the session, even if the recording upstream was local.
++
++Importer v1 joins consecutive client chunks into one request and consecutive
++server chunks into one response. It requires non-empty streams, a clean session
++finish and upstream EOF. Server-first traffic, interleaved/multi-round traffic,
++timeouts, limit failures, incomplete logs, and inconsistent hashes/counts are
++rejected. It checks every chunk against its event and aggregate stream. File
++reads are bounded (1 MiB request, 16 MiB response, 64 KiB summary, 8 MiB event
++log, 16,384 events); non-canonical paths, symlinks and non-regular payloads fail.
++These stream turns do not infer application protocol framing or session state.
++
++The imported response uses `delay_ms=0` and `close_after_send=true`. Capture
++timing and TCP segmentation are not replayed. Identical imports return
++`already_present` without changing the store; a different response or close/
++delay policy for the same fingerprint exits with code 3. Invalid captures and
++request-prefix ambiguity fail before adding an entry (exit code 1). There is
++no automatic replacement. As with manual store writes, the index is published
++atomically; an interrupted write can leave unreferenced blobs for inspection.
++
++The command prints a JSON receipt. Provenance is retained in the existing
++`source_run_id` field and `notes` (JSON containing `capture_import`), including the
++session ID and hashes of `session.json`, `events.jsonl`, and both streams.
++The hashed event log also identifies every chunk and its hash. On an identical
++exchange from another capture, the entry keeps its first attribution and the
++command returns the current capture's receipt. Save that receipt if both sources
++are needed. Provenance does not change the store's semantic replay digest.
++
++Run the complete transport scenario on Linux x86-64 with Python 3.11+, GCC
++and the static C runtime development files installed:
++
++```bash
++PYTHONPATH=. python scripts/run_c2_replay_local_e2e.py \
++  --out workdir/c2_replay_e2e
++```
++
++The output directory must not exist. This compiles the benign C client, records
++a deliberately split `world` response, stops the local mock, imports through
++the public CLI, and runs the client against offline replay. It also checks a
++replay miss, corrupt-capture rejection, idempotent import, synthesis binding
++and prebuilt validation. See `report.json`, `import_receipt.json`, captures,
++client stdout and replay events in the output directory.
++
++On a development VM configured for the existing privileged prebuilt runner
++(`sudo -n`, namespaces, `ip`, `iptables`, `strace` and its other dependencies),
++also execute the prepared iteration at the client's original destination:
++
++```bash
++PYTHONPATH=. python scripts/run_c2_replay_local_e2e.py \
++  --out workdir/c2_replay_vm_e2e --sandbox
++```
++
++This additionally checks guest exit 0, `world` on stdout, a replay hit and the
++attempt's private store digest. The default loopback scenario does not claim
++namespace/firewall acceptance; `report.json` records `sandbox_executed=false`.
++
+ Run the replay regression tests from the repository root with Python 3.11+:
+ 
+ ```bash
+ PYTHONPATH="$PWD:$PWD/tests" python -m compileall -q taintforge_env scripts tests
+ PYTHONPATH="$PWD:$PWD/tests" python -m unittest -v \
+   test_replay_store test_network_replay test_replay_cli \
++  test_capture_importer test_capture_replay_e2e \
+   test_controlled_network_backend test_prebuilt_runner test_synthesis_loop
+ ```
+ 
+diff --git a/samples/c2_record_client.c b/samples/c2_record_client.c
+index 1c19994..f749492 100644
+--- a/samples/c2_record_client.c
++++ b/samples/c2_record_client.c
+@@ -3,8 +3,10 @@
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/socket.h>
++#include <sys/time.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+@@ -47,9 +49,27 @@ static int send_all(
+     return 0;
+ }
+ 
+-int main(void) {
++int main(int argc, char **argv) {
+     const unsigned char request[] = "hello";
+-    unsigned char response[64];
++    /* One extra byte detects overlong responses as well as short reads. */
++    unsigned char response[sizeof(EXPECTED_RESPONSE)];
++    const char *target_ip = TARGET_IP;
++    long target_port = TARGET_PORT;
++
++    if (argc == 3) {
++        char *end = NULL;
++        errno = 0;
++        target_ip = argv[1];
++        target_port = strtol(argv[2], &end, 10);
++        if (errno != 0 || end == argv[2] || *end != '\0'
++            || target_port < 1 || target_port > 65535) {
++            fprintf(stderr, "invalid port\n");
++            return 2;
++        }
++    } else if (argc != 1) {
++        fprintf(stderr, "usage: %s [IPv4 PORT]\n", argv[0]);
++        return 2;
++    }
+ 
+     int fd = socket(AF_INET, SOCK_STREAM, 0);
+ 
+@@ -58,16 +78,24 @@ int main(void) {
+         return 10;
+     }
+ 
++    struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
++    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0
++        || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
++        perror("setsockopt");
++        close(fd);
++        return 10;
++    }
++
+     struct sockaddr_in address;
+     memset(&address, 0, sizeof(address));
+ 
+     address.sin_family = AF_INET;
+-    address.sin_port = htons(TARGET_PORT);
++    address.sin_port = htons((unsigned short)target_port);
+ 
+     if (
+         inet_pton(
+             AF_INET,
+-            TARGET_IP,
++            target_ip,
+             &address.sin_addr
+         )
+         != 1
+@@ -103,8 +131,7 @@ int main(void) {
+     }
+ 
+     /*
+-     * The local mock C2 reads until client EOF before replying.
+-     * We close only the write half of the TCP connection.
++     * Mark the complete request while keeping the read half open for the reply.
+      */
+     if (shutdown(fd, SHUT_WR) < 0) {
+         perror("shutdown");
+@@ -112,43 +139,31 @@ int main(void) {
+         return 14;
+     }
+ 
+-    ssize_t received = recv(
+-        fd,
+-        response,
+-        sizeof(response),
+-        0
+-    );
+-
+-    if (received < 0) {
+-        perror("recv");
+-        close(fd);
+-        return 15;
+-    }
+-
+-    if (received > 0) {
+-        ssize_t stdout_written = write(
+-            STDOUT_FILENO,
+-            response,
+-            (size_t)received
+-        );
+-
+-        if (stdout_written != received) {
+-            perror("write");
++    size_t received = 0;
++    while (received < sizeof(response)) {
++        ssize_t chunk = recv(fd, response + received, sizeof(response) - received, 0);
++        if (chunk < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            perror("recv");
+             close(fd);
+-            return 16;
++            return 15;
+         }
+-
+-        (void)write(STDOUT_FILENO, "\n", 1);
++        if (chunk == 0) {
++            break;
++        }
++        received += (size_t)chunk;
+     }
+ 
+     close(fd);
+ 
+     if (
+-        received != 5
++        received != sizeof(EXPECTED_RESPONSE) - 1
+         || memcmp(
+             response,
+             EXPECTED_RESPONSE,
+-            5
++            sizeof(EXPECTED_RESPONSE) - 1
+         )
+         != 0
+     ) {
+@@ -156,5 +171,11 @@ int main(void) {
+         return 17;
+     }
+ 
++    if (fwrite(response, 1, received, stdout) != received
++        || fputc('\n', stdout) == EOF || fflush(stdout) == EOF) {
++        perror("write");
++        return 16;
++    }
++
+     return 0;
+ }
+diff --git a/scripts/replay_store.py b/scripts/replay_store.py
+index c164ce4..d377a92 100644
+--- a/scripts/replay_store.py
++++ b/scripts/replay_store.py
+@@ -4,6 +4,7 @@ import argparse
+ import json
+ from pathlib import Path
+ 
++from taintforge_env.capture_importer import import_capture
+ from taintforge_env.replay_store import (
+     ReplayEntryExistsError,
+     ReplayStore,
+@@ -34,6 +35,17 @@ def build_parser() -> argparse.ArgumentParser:
+     add_parser.add_argument("--keep-open", action="store_true")
+     add_parser.add_argument("--replace", action="store_true")
+ 
++    import_parser = subparsers.add_parser(
++        "import-capture",
++        help="Import one completed broker TCP transaction; print a JSON source receipt",
++    )
++    import_parser.add_argument("--store", required=True)
++    import_parser.add_argument(
++        "--session-dir", required=True,
++        help="One archived capture directory containing session.json and events.jsonl",
++    )
++    import_parser.add_argument("--protocol-hint")
++
+     list_parser = subparsers.add_parser("list")
+     list_parser.add_argument("--store", required=True)
+ 
+@@ -104,6 +116,11 @@ def main() -> None:
+                 )
+             return
+ 
++        if args.command == "import-capture":
++            result = import_capture(args.session_dir, store, protocol_hint=args.protocol_hint)
++            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
++            return
++
+         if args.command == "lookup":
+             request_bytes = Path(args.request).read_bytes()
+             result = store.lookup(
+diff --git a/scripts/run_c2_replay_local_e2e.py b/scripts/run_c2_replay_local_e2e.py
+new file mode 100644
+index 0000000..625ca34
+--- /dev/null
++++ b/scripts/run_c2_replay_local_e2e.py
+@@ -0,0 +1,285 @@
++#!/usr/bin/env python3
++"""Exercise the real broker, import CLI, replay service and benign C client.
++
++Recording uses ephemeral loopback ports. Replay runs locally and validates a
++prepared synthesis iteration. --sandbox additionally executes that iteration
++through the privileged prebuilt runner on a Linux x86-64 development VM.
++"""
++from __future__ import annotations
++
++import argparse
++import asyncio
++import json
++import os
++import platform
++import shutil
++import sys
++from pathlib import Path
++
++from taintforge_env.c2_record_broker import C2RecordBroker
++from taintforge_env.c2_record_policy import parse_c2_record_policy
++from taintforge_env.iteration_controller import IterationController
++from taintforge_env.network_policy import NetworkServicePolicy
++from taintforge_env.network_replay import TCPReplayService
++from taintforge_env.replay_store import ReplayStore, sha256_bytes
++
++
++PROJECT_ROOT = Path(__file__).resolve().parents[1]
++
++
++def check(condition: bool, message: str) -> None:
++    if not condition:
++        raise RuntimeError(message)
++
++
++async def command(*args: str, expected: int = 0, timeout: float = 30) -> bytes:
++    env = dict(os.environ, PYTHONPATH=str(PROJECT_ROOT), PYTHONDONTWRITEBYTECODE="1")
++    process = await asyncio.create_subprocess_exec(
++        *args, cwd=PROJECT_ROOT, env=env,
++        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
++    try:
++        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
++    except BaseException:
++        if process.returncode is None:
++            process.kill()
++        await process.wait()
++        raise
++    check(process.returncode == expected,
++          f"command exited {process.returncode}, expected {expected}: {args!r}\n"
++          f"{stdout.decode(errors='replace')}{stderr.decode(errors='replace')}")
++    return stdout
++
++
++async def prepare_prebuilt(out: Path, client: Path, *, sandbox: bool) -> dict:
++    """Bind a real static test ELF and the imported store to the public runner."""
++    template = out / "template"
++    rootfs = template / "rootfs"
++    config = template / "config"
++    for name in ("bin", "proc", "tmp", "dev"):
++        (rootfs / name).mkdir(parents=True)
++    config.mkdir()
++    shutil.copy2(client, rootfs / "bin/unpacked.elf")
++    (config / "runtime.json").write_text(json.dumps({
++        "arch": "x86_64", "host_binary": str(client), "guest_binary": "/bin/unpacked.elf",
++        "qemu_required": False, "rootfs": str(rootfs),
++    }, indent=2) + "\n")
++    (config / "network_policy.json").write_text(json.dumps({
++        "mode": "replay", "allow_internet": False, "catch_all": {"enabled": False},
++        "services": [{"service_type": "tcp", "role": "c2", "remote_ip": "198.51.100.10",
++                      "remote_port": 48101, "domain": None, "bind_ip": "127.0.0.1",
++                      "bind_port": 48101, "protocol_hint": "c2_binary"}],
++    }, indent=2) + "\n")
++    session = out / "synthesis_session"
++    store = out / "replay_store"
++    log = await command(
++        sys.executable, str(PROJECT_ROOT / "scripts/run_synthesis_loop.py"), "run",
++        "--session-dir", str(session), "--template-run-dir", str(template),
++        "--project-root", str(PROJECT_ROOT), "--seed-rootfs", str(rootfs),
++        "--snapshot-store", str(out / "snapshots"), "--network", "replay",
++        "--replay-store", str(store), "--initialize-only")
++    (out / "synthesis_initialize.stdout").write_bytes(log)
++    binding = json.loads((session / "synthesis_loop.json").read_text())
++    check(binding["replay_store_sha256"] == ReplayStore(store).validate()["store_sha256"],
++          "synthesis binding does not match imported store")
++    IterationController(session).prepare_next()
++    runner_args = ("--session-dir", str(session), "--iteration", "0",
++                   "--template-run-dir", str(template), "--project-root", str(PROJECT_ROOT),
++                   "--network", "replay", "--replay-store", str(store), "--timeout", "15")
++    log = await command(sys.executable, str(PROJECT_ROOT / "scripts/run_prebuilt_iteration.py"),
++                        "validate", *runner_args)
++    (out / "prebuilt_validate.stdout").write_bytes(log)
++    if sandbox:
++        log = await command(sys.executable, str(PROJECT_ROOT / "scripts/run_prebuilt_iteration.py"),
++                            "run", *runner_args, timeout=90)
++        (out / "prebuilt_run.stdout").write_bytes(log)
++        run_dir = session / "iterations/0000/run"
++        execution = json.loads((run_dir / "config/prebuilt_execution.json").read_text())
++        check(execution["guest_exit_code"] == 0 and not execution["timed_out"],
++              "sandbox client failed or timed out")
++        check((run_dir / "logs/runtime_stdout.log").read_bytes() == b"world\n",
++              "sandbox replay output mismatch")
++        events = [json.loads(line) for path in (run_dir / "logs").rglob("network_events.jsonl")
++                  for line in path.read_text().splitlines()]
++        check(any(e.get("event") == "replay_hit" for e in events), "sandbox replay hit missing")
++        copied = ReplayStore(run_dir / "config/replay_store").validate()
++        check(copied["store_sha256"] == binding["replay_store_sha256"], "attempt store digest mismatch")
++    verification = json.loads(await command(
++        sys.executable, str(PROJECT_ROOT / "scripts/run_synthesis_loop.py"), "verify",
++        "--session-dir", str(session)))
++    check(verification["binding_verified"], "synthesis verification failed")
++    return {"prebuilt_validated": True, "synthesis_binding_verified": True,
++            "sandbox_executed": sandbox}
++
++
++async def run(out: Path, *, sandbox: bool = False) -> dict:
++    check(platform.system() == "Linux" and platform.machine() in ("x86_64", "amd64"),
++          "this static C-client scenario requires Linux x86-64")
++    out.mkdir(parents=True, exist_ok=False)
++    client = out / "c2_record_client"
++    await command("gcc", "-static", "-O2", "-Wall", "-Wextra", "-Werror",
++                  str(PROJECT_ROOT / "samples/c2_record_client.c"), "-o", str(client))
++    mock_done = asyncio.get_running_loop().create_future()
++    mock_connections = 0
++
++    async def mock(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++        nonlocal mock_connections
++        mock_connections += 1
++        try:
++            request = await asyncio.wait_for(reader.readexactly(5), 5)
++            check(request == b"hello", "mock received an unexpected request")
++            check(await asyncio.wait_for(reader.read(1), 5) == b"", "request has extra data")
++            # Deliberately split the response to exercise short recv() reads.
++            writer.write(b"wo")
++            await writer.drain()
++            # Wait for the broker to record the first chunk instead of assuming
++            # that a fixed delay always produces separate reads on a busy host.
++            async with asyncio.timeout(2):
++                while not list((out / "captures").glob(
++                        "*/chunks/000001_server_to_client.bin")):
++                    await asyncio.sleep(0.01)
++            writer.write(b"rld")
++            await writer.drain()
++        except Exception as exc:
++            if not mock_done.done():
++                mock_done.set_exception(exc)
++        else:
++            if not mock_done.done():
++                mock_done.set_result(None)
++        finally:
++            writer.close()
++            await writer.wait_closed()
++
++    upstream = await asyncio.start_server(mock, "127.0.0.1", 0)
++    upstream_port = int(upstream.sockets[0].getsockname()[1])
++    policy = parse_c2_record_policy({
++        "schema_version": 1, "mode": "brokered_record", "capture_kind": "local_test",
++        "default_action": "deny", "listen_port": 41000,
++        "target": {"original_ip": "198.51.100.10", "original_port": 48101,
++                   "upstream_ip": "127.0.0.1", "upstream_port": upstream_port},
++        "limits": {"max_connections": 1, "connect_timeout_seconds": 2,
++                   "session_timeout_seconds": 10, "idle_timeout_seconds": 2,
++                   "max_client_bytes": 1024, "max_server_bytes": 1024},
++    })
++    broker = C2RecordBroker(policy=policy, bind_ip="127.0.0.1", capture_root=out / "captures",
++                            run_id="local-c2-replay-e2e", listen_port_override=0)
++    try:
++        await broker.start()
++        recorded = await command(str(client), "127.0.0.1", str(broker.bound_port))
++        check(recorded == b"world\n", "record client output mismatch")
++        (out / "record_client.stdout").write_bytes(recorded)
++        await asyncio.wait_for(mock_done, 5)
++        async with asyncio.timeout(5):
++            while broker.active_sessions:
++                await asyncio.sleep(0.01)
++    finally:
++        await broker.close()
++        upstream.close()
++        await upstream.wait_closed()
++
++    # Prove the source responder is gone before starting replay.
++    try:
++        _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", upstream_port), 2)
++    except ConnectionRefusedError:
++        pass
++    else:
++        writer.close()
++        await writer.wait_closed()
++        raise RuntimeError("upstream is still accepting connections")
++
++    sessions = list((out / "captures").glob("*/session.json"))
++    check(len(sessions) == 1, "expected exactly one captured session")
++    session_dir = sessions[0].parent
++    summary = json.loads(sessions[0].read_text())
++    check(summary["server_to_client"]["chunks"] >= 2, "split response was not captured")
++    store_path = out / "replay_store"
++    import_args = (sys.executable, str(PROJECT_ROOT / "scripts/replay_store.py"),
++                   "import-capture", "--session-dir", str(session_dir),
++                   "--store", str(store_path), "--protocol-hint", "c2_binary")
++    receipt = json.loads(await command(*import_args))
++    check(receipt["status"] == "imported", "first import did not create an entry")
++    (out / "import_receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
++    index_before = (store_path / "index.json").read_bytes()
++    second = json.loads(await command(*import_args))
++    check(second["status"] == "already_present" and second["entry_id"] == receipt["entry_id"],
++          "repeat import was not idempotent")
++    check((store_path / "index.json").read_bytes() == index_before, "repeat import modified index")
++    store = ReplayStore(store_path)
++    validation = store.validate()
++    service = TCPReplayService(
++        service=NetworkServicePolicy(service_type="tcp", role="c2",
++                                     remote_ip="198.51.100.10", remote_port=48101,
++                                     domain=None, bind_ip="127.0.0.1", bind_port=0,
++                                     protocol_hint="c2_binary"),
++        store=store, log_dir=out / "replay_logs")
++    replay = await service.start()
++    replay_port = int(replay.sockets[0].getsockname()[1])
++    try:
++        replayed = await command(str(client), "127.0.0.1", str(replay_port))
++        check(replayed == recorded, "offline replay differs from the recorded response")
++        (out / "replay_client.stdout").write_bytes(replayed)
++        reader, writer = await asyncio.open_connection("127.0.0.1", replay_port)
++        try:
++            writer.write(b"unknown")
++            await writer.drain()
++            check(await asyncio.wait_for(reader.read(), 2) == b"", "replay miss returned data")
++        finally:
++            writer.close()
++            await writer.wait_closed()
++    finally:
++        replay.close()
++        await replay.wait_closed()
++
++    events = [json.loads(line) for line in
++              (out / "replay_logs/network_events.jsonl").read_text().splitlines()]
++    hits = [event for event in events if event["event"] == "replay_hit"]
++    misses = [event for event in events if event["event"] == "replay_miss"]
++    check(len(hits) == 1 and hits[0]["entry_id"] == receipt["entry_id"], "missing exact replay hit")
++    check(len(misses) == 1, "missing replay miss evidence")
++    check(mock_connections == 1, "unexpected upstream traffic")
++
++    damaged = out / "damaged_capture"
++    shutil.copytree(session_dir, damaged)
++    chunk = next((damaged / "chunks").glob("*_server_to_client.bin"))
++    chunk.write_bytes(b"corrupted")
++    rejected = await command(
++        sys.executable, str(PROJECT_ROOT / "scripts/replay_store.py"), "import-capture",
++        "--session-dir", str(damaged), "--store", str(store_path),
++        "--protocol-hint", "c2_binary", expected=1)
++    (out / "corrupt_import.stdout").write_bytes(rejected)
++    check((store_path / "index.json").read_bytes() == index_before, "failed import modified index")
++    check(store.validate() == validation, "replay store changed during validation/replay")
++
++    prebuilt = await prepare_prebuilt(out, client, sandbox=sandbox)
++    report = {
++        "status": "passed", "scope": "loopback record/import/replay and prebuilt validation",
++        "record_exit_code": 0, "replay_exit_code": 0,
++        "response_sha256": sha256_bytes(b"world"),
++        "upstream_stopped_before_replay": True, "upstream_connections": mock_connections,
++        "response_capture_chunks": summary["server_to_client"]["chunks"],
++        "entry_id": receipt["entry_id"], "replay_hits": len(hits), "replay_misses": len(misses),
++        "repeat_import": second["status"], "corrupt_capture_rejected": True,
++        "store_sha256": validation["store_sha256"],
++        **prebuilt,
++    }
++    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
++    return report
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--out", type=Path, required=True, help="New output directory; never overwritten")
++    parser.add_argument("--sandbox", action="store_true",
++                        help="Also execute the prepared replay iteration on a privileged development VM")
++    args = parser.parse_args()
++    os.umask(0o077)
++    try:
++        report = asyncio.run(run(args.out.absolute(), sandbox=args.sandbox))
++    except (OSError, RuntimeError, TimeoutError) as exc:
++        print(f"C2 record/import/replay failed: {exc}", file=sys.stderr)
++        return 1
++    print(json.dumps(report, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/taintforge_env/capture_importer.py b/taintforge_env/capture_importer.py
+new file mode 100644
+index 0000000..e95a892
+--- /dev/null
++++ b/taintforge_env/capture_importer.py
+@@ -0,0 +1,343 @@
++"""Import one completed C2RecordBroker TCP transaction without guessing framing.
++
++This is an offline, single-writer operation. Validate an archived session before
++publishing its exchange through ReplayStore's atomic index update. TCP packet and
++recv boundaries are not message boundaries: consecutive chunks in each direction
++are joined, but server-first and interleaved conversations are rejected.
++"""
++from __future__ import annotations
++
++import ipaddress
++import json
++import math
++import os
++import stat
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any
++
++from .replay_store import (
++    DEFAULT_MAX_REQUEST_BYTES,
++    DEFAULT_MAX_RESPONSE_BYTES,
++    ReplayEntry,
++    ReplayEntryExistsError,
++    ReplayStore,
++    ReplayStoreValidationError,
++    normalize_protocol_hint,
++    sha256_bytes,
++)
++
++
++MAX_SESSION_BYTES = 64 * 1024
++MAX_EVENTS_BYTES = 8 * 1024 * 1024
++MAX_EVENTS = 16384
++MAX_CHUNK_BYTES = 65536
++DIRECTIONS = ("client_to_server", "server_to_client")
++CLEAN_CLOSE_REASONS = ("upstream_closed", "client_closed", "completed")
++
++
++class CaptureImportError(ReplayStoreValidationError):
++    pass
++
++
++@dataclass(frozen=True)
++class CaptureTransaction:
++    remote_ip: str
++    remote_port: int
++    request_bytes: bytes
++    response_bytes: bytes
++    provenance: dict[str, Any]
++
++
++@dataclass(frozen=True)
++class CaptureImportResult:
++    entry: ReplayEntry
++    created: bool
++    provenance: dict[str, Any]
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "status": "imported" if self.created else "already_present",
++            "entry_id": self.entry.entry_id,
++            "source": self.provenance,
++        }
++
++
++def _require(condition: bool, message: str) -> None:
++    if not condition:
++        raise CaptureImportError(message)
++
++
++def _integer(value: Any, label: str, minimum: int, maximum: int) -> int:
++    _require(type(value) is int and minimum <= value <= maximum,
++             f"{label} must be an integer in [{minimum}, {maximum}]")
++    return value
++
++
++def _number(value: Any, label: str) -> float:
++    _require(type(value) in (int, float), f"{label} must be a number")
++    try:
++        result = float(value)
++    except OverflowError as exc:
++        raise CaptureImportError(f"{label} is too large") from exc
++    _require(math.isfinite(result) and result >= 0,
++             f"{label} must be a finite non-negative number")
++    return result
++
++
++def _string(value: Any, label: str) -> str:
++    _require(isinstance(value, str) and bool(value.strip()) and len(value) <= 256,
++             f"{label} must be a non-empty string of at most 256 characters")
++    return value
++
++
++def _object(value: Any, label: str) -> dict[str, Any]:
++    _require(isinstance(value, dict), f"{label} must be an object")
++    return value
++
++
++def _json_object(data: bytes, label: str) -> dict[str, Any]:
++    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
++        result: dict[str, Any] = {}
++        for key, value in items:
++            _require(key not in result, f"{label}: duplicate JSON key {key!r}")
++            result[key] = value
++        return result
++
++    def invalid_constant(value: str) -> None:
++        raise CaptureImportError(f"{label}: invalid JSON constant {value}")
++
++    try:
++        value = json.loads(data, object_pairs_hook=pairs,
++                           parse_constant=invalid_constant)
++    except (ValueError, UnicodeError, RecursionError) as exc:
++        raise CaptureImportError(f"{label}: invalid JSON: {exc}") from exc
++    return _object(value, label)
++
++
++def _no_symlinks(path: Path) -> None:
++    for component in (path, *path.absolute().parents):
++        _require(not component.is_symlink(),
++                 f"capture path must not contain a symlink: {component}")
++
++
++def _read_file(path: Path, limit: int) -> bytes:
++    _no_symlinks(path)
++    # O_NONBLOCK avoids hanging on a FIFO before fstat can reject it.
++    try:
++        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++        with os.fdopen(fd, "rb") as handle:
++            metadata = os.fstat(handle.fileno())
++            _require(stat.S_ISREG(metadata.st_mode),
++                     f"capture file must be regular: {path}")
++            _require(metadata.st_size <= limit, f"capture file exceeds limit: {path}")
++            data = handle.read(limit + 1)
++            _require(len(data) <= limit, f"capture file exceeds limit: {path}")
++            return data
++    except OSError as exc:
++        raise CaptureImportError(f"cannot read capture file {path}: {exc}") from exc
++
++
++def _check_digest(data: bytes, expected: Any, label: str) -> None:
++    _require(isinstance(expected, str) and sha256_bytes(data) == expected,
++             f"{label}: SHA-256 mismatch")
++
++
++def _timestamp(value: Any, label: str) -> datetime:
++    try:
++        parsed = datetime.fromisoformat(_string(value, label))
++    except ValueError as exc:
++        raise CaptureImportError(f"{label}: invalid timestamp") from exc
++    _require(parsed.utcoffset() is not None, f"{label}: timezone is required")
++    return parsed
++
++
++def load_capture_transaction(
++    session_dir: str | Path,
++    *,
++    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
++    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
++) -> CaptureTransaction:
++    """Verify broker schema v1, completion, ordering, and every payload byte."""
++    root = Path(session_dir)
++    _no_symlinks(root)
++    summary_bytes = _read_file(root / "session.json", MAX_SESSION_BYTES)
++    summary = _json_object(summary_bytes, "session.json")
++    _integer(summary.get("schema_version"), "schema_version", 1, 1)
++    run_id = _string(summary.get("run_id"), "run_id")
++    session_id = _string(summary.get("session_id"), "session_id")
++    _require(summary.get("capture_kind") in ("local_test", "live"),
++             "unsupported capture_kind")
++    _require(summary.get("transport", "tcp") == "tcp", "only TCP is supported")
++    _require(summary.get("close_reason") in CLEAN_CLOSE_REASONS,
++             "capture did not close cleanly (timeout, error, or incomplete session)")
++    _require("error" in summary and summary["error"] is None,
++             "capture contains an error")
++    started = _timestamp(summary.get("started_at_utc"), "started_at_utc")
++    finished = _timestamp(summary.get("finished_at_utc"), "finished_at_utc")
++    _require(finished >= started, "session finishes before it starts")
++    duration = _number(summary.get("duration_seconds"), "duration_seconds")
++    try:
++        remote_ip = str(ipaddress.IPv4Address(
++            _string(summary.get("original_remote_ip"), "original_remote_ip")))
++        ipaddress.ip_address(_string(summary.get("upstream_ip"), "upstream_ip"))
++    except ValueError as exc:
++        raise CaptureImportError("invalid endpoint; replay requires original IPv4") from exc
++    remote_port = _integer(summary.get("original_remote_port"),
++                           "original_remote_port", 1, 65535)
++    _integer(summary.get("upstream_port"), "upstream_port", 1, 65535)
++
++    limits = _object(summary.get("limits"), "limits")
++    payloads: dict[str, bytes] = {}
++    stream_metadata: dict[str, dict[str, Any]] = {}
++    source_files = {
++        "session.json": sha256_bytes(summary_bytes),
++    }
++    for direction, maximum, limit_key in (
++        (DIRECTIONS[0], min(max_request_bytes, DEFAULT_MAX_REQUEST_BYTES), "max_client_bytes"),
++        (DIRECTIONS[1], min(max_response_bytes, DEFAULT_MAX_RESPONSE_BYTES), "max_server_bytes"),
++    ):
++        metadata = _object(summary.get(direction), direction)
++        expected_path = f"{direction}.bin"
++        _require(metadata.get("path") == expected_path,
++                 f"{direction}: non-canonical payload path")
++        size = _integer(metadata.get("bytes"), f"{direction}.bytes", 1, maximum)
++        limit = _integer(limits.get(limit_key), limit_key, 1, DEFAULT_MAX_RESPONSE_BYTES)
++        _require(size <= limit, f"{direction}: recorded byte limit exceeded")
++        _integer(metadata.get("chunks"), f"{direction}.chunks", 1, MAX_EVENTS)
++        payload = _read_file(root / expected_path, maximum)
++        _require(len(payload) == size, f"{direction}: size mismatch")
++        _check_digest(payload, metadata.get("sha256"), direction)
++        payloads[direction] = payload
++        stream_metadata[direction] = metadata
++        source_files[expected_path] = sha256_bytes(payload)
++
++    events_bytes = _read_file(root / "events.jsonl", MAX_EVENTS_BYTES)
++    _require(events_bytes.endswith(b"\n"), "events.jsonl is truncated")
++    lines = events_bytes.splitlines()
++    _require(5 <= len(lines) <= MAX_EVENTS, "events.jsonl: invalid event count")
++    events = [_json_object(line, f"events.jsonl:{i}") for i, line in enumerate(lines, 1)]
++    _require(events[0].get("event") == "session_started", "missing session_started")
++    _require(events[1].get("event") == "upstream_connected", "missing upstream_connected")
++    _require(events[-1].get("event") == "session_finished", "missing session_finished")
++    for key in ("original_remote_ip", "original_remote_port", "upstream_ip",
++                "upstream_port", "capture_kind"):
++        _require(type(events[0].get(key)) is type(summary[key])
++                 and events[0][key] == summary[key], f"session_started: {key} mismatch")
++    for key in ("upstream_ip", "upstream_port"):
++        _require(type(events[1].get(key)) is type(summary[key])
++                 and events[1][key] == summary[key], f"upstream_connected: {key} mismatch")
++    final = events[-1]
++    _require(final.get("close_reason") == summary["close_reason"]
++             and "error" in final and final["error"] is None,
++             "session_finished disagrees with summary")
++    for key, direction in (("client_bytes", DIRECTIONS[0]), ("server_bytes", DIRECTIONS[1])):
++        size = _integer(final.get(key), f"session_finished.{key}", 1, DEFAULT_MAX_RESPONSE_BYTES)
++        _require(size == len(payloads[direction]), f"session_finished: {key} mismatch")
++    for event in events:
++        _require(event.get("session_id") == session_id, "event session_id mismatch")
++        _timestamp(event.get("timestamp_utc"), "event.timestamp_utc")
++
++    offsets = dict.fromkeys(DIRECTIONS, 0)
++    counts = dict.fromkeys(DIRECTIONS, 0)
++    eof: set[str] = set()
++    chunk_names: set[str] = set()
++    response_started = False
++    last_elapsed = 0.0
++    for event in events[2:-1]:
++        kind = event.get("event")
++        _require(kind in ("stream_chunk", "stream_eof"), f"unexpected capture event: {kind}")
++        direction = event.get("direction")
++        _require(direction in DIRECTIONS, "invalid stream direction")
++        _require(direction not in eof, f"{direction}: data or duplicate EOF after EOF")
++        if kind == "stream_eof":
++            eof.add(direction)
++            continue
++        if direction == DIRECTIONS[0]:
++            _require(not response_started, "interleaved/multi-round capture is unsupported")
++        else:
++            _require(offsets[DIRECTIONS[0]] > 0, "server-first capture is unsupported")
++            response_started = True
++        index = _integer(event.get("chunk_index"), "chunk_index", 1, MAX_EVENTS)
++        _require(index == counts[direction] + 1, "missing or reordered chunk index")
++        size = _integer(event.get("size"), "chunk.size", 1, MAX_CHUNK_BYTES)
++        elapsed = _number(event.get("elapsed_seconds"), "elapsed_seconds")
++        _require(last_elapsed <= elapsed <= duration, "chunk elapsed time is out of order/range")
++        last_elapsed = elapsed
++        name = f"{index:06d}_{direction}.bin"
++        _require(event.get("payload_file") == f"chunks/{name}", "non-canonical chunk path")
++        chunk = _read_file(root / "chunks" / name, MAX_CHUNK_BYTES)
++        _require(len(chunk) == size, "chunk size mismatch")
++        _check_digest(chunk, event.get("sha256"), name)
++        offset = offsets[direction]
++        _require(payloads[direction][offset:offset + size] == chunk,
++                 f"{direction}: chunks disagree with aggregate stream")
++        offsets[direction] += size
++        counts[direction] += 1
++        chunk_names.add(name)
++    _require(DIRECTIONS[1] in eof, "response is incomplete: missing upstream EOF")
++    for direction in DIRECTIONS:
++        _require(offsets[direction] == len(payloads[direction])
++                 and counts[direction] == stream_metadata[direction]["chunks"],
++                 f"{direction}: missing chunks or count mismatch")
++    _no_symlinks(root / "chunks")
++    with os.scandir(root / "chunks") as entries:
++        for item in entries:
++            _require(item.name in chunk_names, f"unreferenced capture chunk: {item.name}")
++    source_files["events.jsonl"] = sha256_bytes(events_bytes)
++    provenance = {
++        "schema_version": 1,
++        "importer": "c2-capture-single-transaction-v1",
++        "run_id": run_id,
++        "session_id": session_id,
++        "capture_kind": summary["capture_kind"],
++        "source_files_sha256": source_files,
++        "close_reason": summary["close_reason"],
++        "replay_policy": {"close_after_send": True, "delay_ms": 0},
++    }
++    return CaptureTransaction(remote_ip, remote_port, payloads[DIRECTIONS[0]],
++                              payloads[DIRECTIONS[1]], provenance)
++
++
++def import_capture(
++    session_dir: str | Path,
++    store: ReplayStore,
++    *,
++    protocol_hint: str | None = None,
++) -> CaptureImportResult:
++    """Validate first; identical imports are no-ops and conflicting ones fail.
++
++    Provenance uses the existing notes/source_run_id fields, so ReplayStore v1
++    remains compatible. A repeated import returns its own source receipt while
++    retaining the existing entry's original attribution. No concurrent writers.
++    """
++    capture = load_capture_transaction(
++        session_dir, max_request_bytes=store.max_request_bytes,
++        max_response_bytes=store.max_response_bytes)
++    hint = normalize_protocol_hint(protocol_hint)
++    # Do not initialize (or modify) a store until all validation has succeeded.
++    if store.root.exists() or store.root.is_symlink():
++        store.validate()
++        exchanges = store.exchanges_for_endpoint(
++            transport="tcp", remote_ip=capture.remote_ip,
++            remote_port=capture.remote_port, protocol_hint=hint)
++        for exchange in exchanges:
++            if exchange.request_bytes == capture.request_bytes:
++                response = exchange.entry.response
++                if (exchange.response_bytes != capture.response_bytes
++                        or not response.close_after_send or response.delay_ms != 0):
++                    raise ReplayEntryExistsError(
++                        f"capture conflicts with existing response/policy: {exchange.entry.entry_id}")
++                return CaptureImportResult(exchange.entry, False, capture.provenance)
++            if (exchange.request_bytes.startswith(capture.request_bytes)
++                    or capture.request_bytes.startswith(exchange.request_bytes)):
++                raise CaptureImportError("capture would introduce TCP request prefix ambiguity")
++    entry = store.add(
++        transport="tcp", remote_ip=capture.remote_ip, remote_port=capture.remote_port,
++        request_bytes=capture.request_bytes, response_bytes=capture.response_bytes,
++        protocol_hint=hint, close_after_send=True, delay_ms=0,
++        source_run_id=capture.provenance["run_id"],
++        notes=json.dumps({"capture_import": capture.provenance}, sort_keys=True),
++    )
++    return CaptureImportResult(entry, True, capture.provenance)
+diff --git a/tests/capture_fixture.py b/tests/capture_fixture.py
+new file mode 100644
+index 0000000..6157136
+--- /dev/null
++++ b/tests/capture_fixture.py
+@@ -0,0 +1,67 @@
++"""Small broker-schema captures with explicit stream ordering for regressions."""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++
++
++CLIENT = "client_to_server"
++SERVER = "server_to_client"
++STAMP = "2026-09-11T00:00:00+00:00"
++
++
++def write_capture(
++    root: Path,
++    chunks: tuple[tuple[str, bytes], ...] = ((CLIENT, b"he"), (CLIENT, b"llo"),
++                                            (SERVER, b"wo"), (SERVER, b"rld")),
++) -> Path:
++    (root / "chunks").mkdir(parents=True)
++    endpoint = {"original_remote_ip": "198.51.100.10", "original_remote_port": 48101,
++                "upstream_ip": "127.0.0.1", "upstream_port": 49001}
++    summary = {
++        "schema_version": 1, "run_id": "fixture-run", "session_id": "fixture-session",
++        "capture_kind": "local_test", "started_at_utc": STAMP, "finished_at_utc": STAMP,
++        "duration_seconds": 1.0, "close_reason": "upstream_closed", "error": None,
++        **endpoint,
++        "limits": {"max_client_bytes": 65536, "max_server_bytes": 1048576},
++    }
++    events = [
++        {"event": "session_started", "capture_kind": "local_test", **endpoint},
++        {"event": "upstream_connected", "upstream_ip": "127.0.0.1", "upstream_port": 49001},
++    ]
++    payloads = {CLIENT: bytearray(), SERVER: bytearray()}
++    counts = {CLIENT: 0, SERVER: 0}
++    for i, (direction, data) in enumerate(chunks, 1):
++        counts[direction] += 1
++        payloads[direction].extend(data)
++        path = f"chunks/{counts[direction]:06d}_{direction}.bin"
++        (root / path).write_bytes(data)
++        events.append({"event": "stream_chunk", "direction": direction,
++                       "chunk_index": counts[direction], "size": len(data),
++                       "sha256": hashlib.sha256(data).hexdigest(),
++                       "elapsed_seconds": i / 100, "payload_file": path})
++    for direction in (CLIENT, SERVER):
++        events.append({"event": "stream_eof", "direction": direction})
++        data = bytes(payloads[direction])
++        (root / f"{direction}.bin").write_bytes(data)
++        summary[direction] = {"bytes": len(data), "chunks": counts[direction],
++                              "sha256": hashlib.sha256(data).hexdigest(),
++                              "path": f"{direction}.bin"}
++    events.append({"event": "session_finished", "close_reason": "upstream_closed",
++                   "client_bytes": len(payloads[CLIENT]), "server_bytes": len(payloads[SERVER]),
++                   "error": None})
++    for event in events:
++        event.update(session_id=summary["session_id"], timestamp_utc=STAMP)
++    (root / "session.json").write_text(json.dumps(summary) + "\n", encoding="utf-8")
++    write_events(root, events)
++    return root
++
++
++def read_events(root: Path) -> list[dict]:
++    return [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
++
++
++def write_events(root: Path, events: list[dict]) -> None:
++    (root / "events.jsonl").write_text(
++        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+diff --git a/tests/test_capture_importer.py b/tests/test_capture_importer.py
+new file mode 100644
+index 0000000..8d4d414
+--- /dev/null
++++ b/tests/test_capture_importer.py
+@@ -0,0 +1,252 @@
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++import unittest
++from pathlib import Path
++
++from taintforge_env.capture_importer import (
++    CaptureImportError,
++    import_capture,
++    load_capture_transaction,
++)
++from taintforge_env.replay_store import ReplayEntryExistsError, ReplayStore, sha256_bytes
++from tests.capture_fixture import CLIENT, SERVER, read_events, write_capture, write_events
++
++
++class CaptureImporterTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.capture = write_capture(self.root / "capture")
++        self.store = ReplayStore(self.root / "store")
++
++    def _summary(self, mutate) -> None:
++        path = self.capture / "session.json"
++        summary = json.loads(path.read_text())
++        mutate(summary)
++        path.write_text(json.dumps(summary) + "\n")
++
++    def _snapshot(self) -> dict[str, bytes]:
++        return {str(path.relative_to(self.store.root)): path.read_bytes()
++                for path in self.store.root.rglob("*") if path.is_file()}
++
++    def _reject(self) -> None:
++        before = self._snapshot()
++        existed = self.store.root.exists()
++        with self.assertRaises(CaptureImportError):
++            import_capture(self.capture, self.store)
++        self.assertEqual(self._snapshot(), before)
++        self.assertEqual(self.store.root.exists(), existed)
++
++    def test_segmented_transaction_and_provenance(self) -> None:
++        result = import_capture(self.capture, self.store, protocol_hint="C2_BINARY")
++        self.assertTrue(result.created)
++        self.assertEqual(result.entry.request.remote_ip, "198.51.100.10")
++        self.assertEqual(result.entry.request.remote_port, 48101)
++        self.assertEqual(result.entry.request.protocol_hint, "c2_binary")
++        exchange = self.store.load_exchange(result.entry)
++        self.assertEqual((exchange.request_bytes, exchange.response_bytes), (b"hello", b"world"))
++        self.assertTrue(result.entry.response.close_after_send)
++        self.assertEqual(result.entry.response.delay_ms, 0)
++        self.assertEqual(result.entry.source_run_id, "fixture-run")
++        stored = self.store.load_entries()[0]
++        provenance = json.loads(stored.notes)["capture_import"]
++        self.assertEqual(provenance, result.provenance)
++        self.assertEqual(provenance["session_id"], "fixture-session")
++        for name, digest in provenance["source_files_sha256"].items():
++            self.assertEqual(digest, sha256_bytes((self.capture / name).read_bytes()))
++        self.assertEqual(self.store.validate()["entries"], 1)
++
++    def test_identical_import_is_byte_for_byte_noop(self) -> None:
++        first = import_capture(self.capture, self.store)
++        before = self._snapshot()
++        digest = self.store.validate()["store_sha256"]
++        second = import_capture(self.capture, self.store)
++        self.assertFalse(second.created)
++        self.assertEqual(first.entry, second.entry)
++        self.assertEqual(second.to_dict()["status"], "already_present")
++        self.assertEqual(self._snapshot(), before)
++        self.assertEqual(self.store.validate()["store_sha256"], digest)
++
++    def test_identical_exchange_from_another_source_returns_current_receipt(self) -> None:
++        first = import_capture(self.capture, self.store)
++        self._summary(lambda raw: raw.update(run_id="another-run"))
++        before = self._snapshot()
++        second = import_capture(self.capture, self.store)
++        self.assertFalse(second.created)
++        self.assertEqual(first.entry, second.entry)
++        self.assertEqual(second.provenance["run_id"], "another-run")
++        self.assertEqual(self._snapshot(), before)
++
++    def test_conflicting_response_or_replay_policy_never_replaces(self) -> None:
++        for response, close, delay in ((b"other", True, 0), (b"world", False, 0),
++                                       (b"world", True, 1)):
++            with self.subTest(response=response, close=close, delay=delay):
++                self.store.add(transport="tcp", remote_ip="198.51.100.10", remote_port=48101,
++                               request_bytes=b"hello", response_bytes=response,
++                               close_after_send=close, delay_ms=delay, replace=True)
++                before = self._snapshot()
++                with self.assertRaises(ReplayEntryExistsError):
++                    import_capture(self.capture, self.store)
++                self.assertEqual(self._snapshot(), before)
++
++    def test_both_prefix_directions_rejected_before_any_store_write(self) -> None:
++        for i, request in enumerate((b"he", b"hello!")):
++            with self.subTest(request=request):
++                self.store = ReplayStore(self.root / f"prefix-{i}")
++                self.store.add(transport="tcp", remote_ip="198.51.100.10", remote_port=48101,
++                               request_bytes=request, response_bytes=b"existing")
++                self._reject()
++
++    def test_other_endpoint_and_protocol_hint_do_not_conflict(self) -> None:
++        self.store.add(transport="tcp", remote_ip="198.51.100.11", remote_port=48101,
++                       request_bytes=b"he", response_bytes=b"other")
++        self.store.add(transport="tcp", remote_ip="198.51.100.10", remote_port=48101,
++                       request_bytes=b"hello", response_bytes=b"other", protocol_hint="other")
++        self.assertTrue(import_capture(self.capture, self.store).created)
++        self.assertEqual(self.store.validate()["entries"], 3)
++
++    def test_server_first_and_multiround_captures_are_rejected(self) -> None:
++        for i, chunks in enumerate((((SERVER, b"banner"), (CLIENT, b"hello")),
++                                    ((CLIENT, b"one"), (SERVER, b"1"),
++                                     (CLIENT, b"two"), (SERVER, b"2")))):
++            with self.subTest(chunks=chunks):
++                self.capture = write_capture(self.root / f"ordered-{i}", chunks)
++                self._reject()
++
++    def test_unfinished_timeout_error_and_invalid_summary_rejected(self) -> None:
++        original = (self.capture / "session.json").read_bytes()
++        cases = [
++            lambda s: s.update(close_reason="idle_timeout"),
++            lambda s: s.update(close_reason="session_timeout"),
++            lambda s: s.update(close_reason="client_to_server_limit_exceeded"),
++            lambda s: s.update(close_reason="unknown"),
++            lambda s: s.update(close_reason=[]),
++            lambda s: s.update(error="ConnectionResetError"),
++            lambda s: s.pop("error"),
++            lambda s: s.update(schema_version=True),
++            lambda s: s.update(original_remote_port=True),
++            lambda s: s.update(original_remote_ip="::1"),
++            lambda s: s.update(transport="udp"),
++            lambda s: s.update(run_id=""),
++            lambda s: s.update(finished_at_utc=None),
++            lambda s: s.update(duration_seconds=float("nan")),
++            lambda s: s.update(duration_seconds=10 ** 400),
++            lambda s: s[CLIENT].update(bytes=True),
++            lambda s: s[CLIENT].update(bytes=0),
++            lambda s: s[SERVER].update(bytes=0),
++            lambda s: s[CLIENT].update(bytes=6),
++            lambda s: s[CLIENT].update(chunks=3),
++            lambda s: s[CLIENT].update(sha256="0" * 64),
++            lambda s: s["limits"].update(max_client_bytes=4),
++        ]
++        for i, mutate in enumerate(cases):
++            with self.subTest(case=i):
++                (self.capture / "session.json").write_bytes(original)
++                self._summary(mutate)
++                self._reject()
++
++    def test_bad_events_rejected_without_store_mutation(self) -> None:
++        original = read_events(self.capture)
++        cases = [
++            lambda e: e.pop(),
++            lambda e: e.pop(1),
++            lambda e: e.pop(2),
++            lambda e: e.insert(3, e[2].copy()),
++            lambda e: e[2].update(session_id="other"),
++            lambda e: e[0].update(original_remote_port=80),
++            lambda e: e[1].update(upstream_port=True),
++            lambda e: e[-1].update(client_bytes=9),
++            lambda e: e[-1].update(error="reset"),
++            lambda e: e[2].update(chunk_index=True),
++            lambda e: e[2].update(direction="unknown"),
++            lambda e: e[2].update(size=99),
++            lambda e: e[2].update(sha256="0" * 64),
++            lambda e: e[2].update(elapsed_seconds=10),
++            lambda e: e[3].update(elapsed_seconds=0),
++            lambda e: e[2].update(event="relay_error"),
++            lambda e: e.pop(-2),  # no upstream EOF
++            lambda e: e.insert(2, {"event": "stream_eof", "direction": CLIENT,
++                                   "session_id": "fixture-session", "timestamp_utc": e[0]["timestamp_utc"]}),
++        ]
++        self.store.initialize()
++        for i, mutate in enumerate(cases):
++            with self.subTest(case=i):
++                events = json.loads(json.dumps(original))
++                mutate(events)
++                write_events(self.capture, events)
++                self._reject()
++
++    def test_corrupt_missing_extra_and_disagreeing_payloads_rejected(self) -> None:
++        chunk = self.capture / "chunks/000001_client_to_server.bin"
++        chunk.write_bytes(b"XX")
++        self._reject()
++        # Even mutually consistent chunk bytes and event hashes cannot override
++        # a different aggregate stream with its own valid summary hash.
++        events = read_events(self.capture)
++        events[2]["sha256"] = sha256_bytes(b"XX")
++        write_events(self.capture, events)
++        self._reject()
++        chunk.unlink()
++        self._reject()
++
++    def test_unreferenced_chunk_rejected(self) -> None:
++        (self.capture / "chunks/extra.bin").write_bytes(b"orphan")
++        self._reject()
++
++    def test_payload_paths_cannot_escape_capture(self) -> None:
++        original = (self.capture / "session.json").read_bytes()
++        for path in ("../secret", "/etc/passwd", "chunks/../client_to_server.bin"):
++            with self.subTest(path=path):
++                (self.capture / "session.json").write_bytes(original)
++                self._summary(lambda s: s[CLIENT].update(path=path))
++                self._reject()
++        (self.capture / "session.json").write_bytes(original)
++        events = read_events(self.capture)
++        events[2]["payload_file"] = "../secret"
++        write_events(self.capture, events)
++        self._reject()
++
++    def test_symlinks_and_fifo_rejected(self) -> None:
++        chunk = self.capture / "chunks/000001_client_to_server.bin"
++        outside = self.root / "outside"
++        outside.write_bytes(chunk.read_bytes())
++        chunk.unlink()
++        chunk.symlink_to(outside)
++        self._reject()
++        chunk.unlink()
++        os.mkfifo(chunk)
++        self._reject()
++
++    def test_symlinked_capture_or_chunks_directory_rejected(self) -> None:
++        link = self.root / "capture-link"
++        link.symlink_to(self.capture, target_is_directory=True)
++        with self.assertRaises(CaptureImportError):
++            load_capture_transaction(link)
++        (self.capture / "chunks").rename(self.root / "moved-chunks")
++        (self.capture / "chunks").symlink_to(self.root / "moved-chunks", target_is_directory=True)
++        self._reject()
++
++    def test_duplicate_json_keys_and_truncated_jsonl_rejected(self) -> None:
++        path = self.capture / "session.json"
++        original = path.read_bytes()
++        path.write_bytes(original.replace(b'"schema_version": 1',
++                                         b'"schema_version": 2, "schema_version": 1'))
++        self._reject()
++        path.write_bytes(original)
++        path = self.capture / "events.jsonl"
++        path.write_bytes(path.read_bytes().rstrip(b"\n"))
++        self._reject()
++
++    def test_size_limit_applies_before_import(self) -> None:
++        self.store = ReplayStore(self.root / "limited", max_request_bytes=4)
++        self._reject()
++        self.store = ReplayStore(self.root / "limited", max_response_bytes=4)
++        self._reject()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_capture_replay_e2e.py b/tests/test_capture_replay_e2e.py
+new file mode 100644
+index 0000000..b539e61
+--- /dev/null
++++ b/tests/test_capture_replay_e2e.py
+@@ -0,0 +1,48 @@
++from __future__ import annotations
++
++import json
++import os
++import platform
++import shutil
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++
++PROJECT_ROOT = Path(__file__).resolve().parents[1]
++
++
++@unittest.skipUnless(
++    shutil.which("gcc") and platform.system() == "Linux"
++    and platform.machine() in ("x86_64", "amd64"),
++    "Linux x86-64 and gcc are required for the real C-client E2E",
++)
++class CaptureReplayE2ETests(unittest.TestCase):
++    def test_real_c_client_record_import_offline_replay(self) -> None:
++        import sys
++
++        with tempfile.TemporaryDirectory() as temporary:
++            out = Path(temporary) / "e2e"
++            result = subprocess.run(
++                [sys.executable, str(PROJECT_ROOT / "scripts/run_c2_replay_local_e2e.py"),
++                 "--out", str(out)],
++                cwd=PROJECT_ROOT, env=dict(os.environ, PYTHONPATH=str(PROJECT_ROOT)),
++                capture_output=True, text=True, timeout=45)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++            report = json.loads((out / "report.json").read_text())
++            self.assertEqual(report["status"], "passed")
++            self.assertTrue(report["prebuilt_validated"])
++            self.assertTrue(report["synthesis_binding_verified"])
++            self.assertFalse(report["sandbox_executed"])
++            self.assertTrue(report["upstream_stopped_before_replay"])
++            self.assertEqual(report["upstream_connections"], 1)
++            self.assertEqual(report["replay_hits"], 1)
++            self.assertEqual(report["replay_misses"], 1)
++            self.assertGreaterEqual(report["response_capture_chunks"], 2)
++            self.assertEqual((out / "record_client.stdout").read_bytes(), b"world\n")
++            self.assertEqual((out / "replay_client.stdout").read_bytes(), b"world\n")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_parser_runtime_compat.py b/tests/test_parser_runtime_compat.py
+index e70eb1d..39a42f9 100644
+--- a/tests/test_parser_runtime_compat.py
++++ b/tests/test_parser_runtime_compat.py
+@@ -1,3 +1,4 @@
++import json
+ from pathlib import Path
+ 
+ from taintforge_env.parser import load_taint_log
+@@ -8,12 +9,12 @@ DATA_DIR = Path(__file__).parent / "data"
+ 
+ def test_parse_static_x86_fixture() -> None:
+     taint = load_taint_log(
+-        DATA_DIR / "unpacked_static_x86.json"
++        DATA_DIR / "static.json"
+     )
+ 
+     assert taint.arch == "x86"
+     assert taint.oep == "0x804ae0c"
+-    assert taint.base == "0x804a000"
++    assert taint.base == "0x8048000"
+ 
+     assert len(taint.regions) == 4
+     assert taint.library_dependencies == []
+@@ -50,12 +51,12 @@ def test_parse_static_x86_fixture() -> None:
+ 
+ def test_parse_dynamic_x86_fixture() -> None:
+     taint = load_taint_log(
+-        DATA_DIR / "unpacked_dynamic_x86.json"
++        DATA_DIR / "dynamic.json"
+     )
+ 
+     assert taint.arch == "x86"
+     assert taint.oep == "0x4010fb"
+-    assert taint.base == "0x401000"
++    assert taint.base == "0x400000"
+ 
+     assert len(taint.regions) == 11
+     assert len(taint.library_dependencies) == 2
+@@ -64,15 +65,15 @@ def test_parse_dynamic_x86_fixture() -> None:
+ 
+     assert loader.name == "ld-linux.so.2"
+     assert loader.path == "/lib/ld-linux.so.2"
+-    assert loader.observed_base == "0x4083b000"
+-    assert loader.observed_size == 9400
++    assert loader.observed_base == "0x40805000"
++    assert loader.observed_size == 230584
+ 
+     libc = taint.library_dependencies[1]
+ 
+     assert libc.name == "libc.so.6"
+     assert libc.path == "/usr/lib32/libc.so.6"
+-    assert libc.observed_base == "0x40a9f000"
+-    assert libc.observed_size == 12288
++    assert libc.observed_base == "0x4088e000"
++    assert libc.observed_size == 2179072
+ 
+     assert len(taint.network_events) == 2
+     assert len(taint.network_dependencies) == 1
+@@ -91,14 +92,24 @@ def test_parse_dynamic_x86_fixture() -> None:
+     assert tmp_dependency.write is True
+ 
+ 
+-def test_dynamic_fixture_library_addresses_are_observations() -> None:
+-    taint = load_taint_log(
+-        DATA_DIR / "unpacked_dynamic_x86.json"
+-    )
++def test_dynamic_fixture_library_addresses_are_observations(tmp_path: Path) -> None:
++    # Preserve the original regression: observed library mappings need not be
++    # the first/code mapping. The current fixture records whole-library ranges.
++    raw = json.loads((DATA_DIR / "dynamic.json").read_text(encoding="utf-8"))
++    raw["library_dependencies"][0].update(base="0x4083b000", size=9400)
++    raw["library_dependencies"][1].update(base="0x40a9f000", size=12288)
++    path = tmp_path / "partial_library_observations.json"
++    path.write_text(json.dumps(raw), encoding="utf-8")
++    taint = load_taint_log(path)
+ 
+     loader = taint.library_dependencies[0]
+     libc = taint.library_dependencies[1]
+ 
++    assert loader.observed_base == "0x4083b000"
++    assert loader.observed_size == 9400
++    assert libc.observed_base == "0x40a9f000"
++    assert libc.observed_size == 12288
++
+     region_starts = {
+         int(region.addr, 16)
+         for region in taint.regions
+-- 
+2.51.1
+

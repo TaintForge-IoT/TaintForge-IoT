@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol, Sequence
 
 from .attempt import AttemptContract, AttemptStore, AttemptValidationError
+from .attempt_finalization import AttemptFinalization, write_failure_report
 from .controlled_network_backend import (
     ControlledNetworkBackend,
     ControlledNetworkConfig,
@@ -201,9 +202,9 @@ class PrebuiltRunnerConfig:
         if self.timeout_seconds < 1:
             raise PrebuiltRunnerError("timeout_seconds must be positive")
         self.network_mode = str(self.network_mode).strip().lower()
-        if self.network_mode not in {"none", "controlled", "replay"}:
+        if self.network_mode not in {"none", "controlled", "replay", "record"}:
             raise PrebuiltRunnerError(
-                "network_mode must be one of: none, controlled, replay"
+                "network_mode must be one of: none, controlled, replay, record"
             )
         if self.network_self_test and self.network_mode != "controlled":
             raise PrebuiltRunnerError("network_self_test requires network_mode=controlled")
@@ -219,8 +220,8 @@ class PrebuiltRunnerConfig:
 
 class PrebuiltRootfsRunner:
 
-    ADAPTER_VERSION = 6
-    TEMPLATE_CONFIG_ALLOWLIST = ("library_plan.json","library_resolution.json","network_policy.json")
+    ADAPTER_VERSION = 8
+    TEMPLATE_CONFIG_ALLOWLIST = ("library_plan.json","library_resolution.json","network_policy.json","guest_runtime.json")
 
     def __init__(self,config: PrebuiltRunnerConfig,*,executor: CommandExecutor | None = None,network_backend_factory: NetworkBackendFactory | None = None) -> None:
         self.config = config
@@ -265,8 +266,14 @@ class PrebuiltRootfsRunner:
         template_runtime_path = template_config / "runtime.json"
         runtime = _load_json_object(template_runtime_path, "template runtime")
         template_network_policy_path = template_config / "network_policy.json"
-        if self.config.network_mode in {"controlled", "replay"}:
+        if self.config.network_mode in {"controlled", "replay", "record"}:
             _validate_regular_file(template_network_policy_path,"template network policy")
+            if self.config.network_mode == "record":
+                from .network_record import validate_record_policy
+                try:
+                    validate_record_policy(load_network_policy(template_network_policy_path))
+                except (OSError, ValueError) as exc:
+                    raise PrebuiltRunnerError(f"invalid recording policy: {exc}") from exc
         elif not template_network_policy_path.is_file():
             template_network_policy_path = None
 
@@ -336,6 +343,7 @@ class PrebuiltRootfsRunner:
         return PreparedRunContext(session=session,iteration=iteration,iteration_dir=iteration_dir,execution_rootfs=execution_rootfs,environment_tree_sha256=actual_digest,template_run_dir=template_run_dir,template_runtime_path=template_runtime_path,template_network_policy_path=template_network_policy_path,host_binary=host_binary,guest_binary=guest_binary,run_dir=run_dir,claim_path=claim_path,execution_plan=execution_plan,attempt_contract=attempt_contract,target_spec=target_spec,replay_store_path=replay_store_path,replay_store_sha256=replay_store_sha256,replay_store_entries=replay_store_entries)
 
     def run_and_complete(self) -> PrebuiltRunnerResult:
+        self.guest_execution_observed = False
         context = self.validate()
         claim = self._create_claim(context)
         guest_exit_code: int | None = None
@@ -347,23 +355,36 @@ class PrebuiltRootfsRunner:
             self._update_claim(context, claim, RunnerStage.PREPARED)
 
             self._check_host_dependencies(context)
-            if self.config.network_mode in {"controlled", "replay"}:
+            if self.config.network_mode in {"controlled", "replay", "record"}:
                 network_backend = self._create_network_backend(context)
                 network_result = network_backend.setup()
                 network_manifest_path = network_result.manifest_path
 
-            try:
-                self._capture_observation(context, "before")
-                self._update_claim(context,claim,RunnerStage.EXECUTING,malware_started=False,network_mode=self.config.network_mode)
-                guest_exit_code = self._execute_guest(context,network_backend=network_backend)
-            finally:
-                if network_backend is not None:
-                    network_backend.cleanup(finalize_logs=True)
+            self._capture_observation(context, "before")
+            self._update_claim(context,claim,RunnerStage.EXECUTING,malware_started=False,network_mode=self.config.network_mode)
+            guest_exit_code = self._execute_guest(context,network_backend=network_backend)
 
+            # The wrapper returned and its exit artifact matched. Keep exit data,
+            # filesystem observation and Phase 1 verification independent of the
+            # parser, and of network log finalization failures.
+            finalization = AttemptFinalization(context)
+            finalization.run("execution", lambda: self._save_execution(context, guest_exit_code))
             self._update_claim(context,claim,RunnerStage.POSTPROCESSING,malware_started=True,guest_exit_code=guest_exit_code)
-
-            self._normalize_log_ownership(context)
-            self._postprocess(context, guest_exit_code)
+            if network_backend is not None:
+                finalization.run("network_cleanup", lambda: network_backend.cleanup(finalize_logs=True))
+            else:
+                finalization.update("network_cleanup", "not_applicable")
+            finalization.run("filesystem", lambda: self._capture_observation(context, "after"))
+            if (context.run_dir / "config/capsule_binding.json").is_file():
+                from .execution_capsule import finish_attempt as finish_capsule
+                finalization.run("capsule", lambda: finish_capsule(context, guest_exit_code))
+            phase1_transitions = ()
+            if context.execution_plan.backend == ExecutionBackendKind.QEMU_PLUGIN:
+                from .unified_runtime import finish_attempt
+                phase1_transitions = finalization.run("phase1", lambda: finish_attempt(context, guest_exit_code)) or ()
+            else:
+                finalization.update("phase1", "not_applicable")
+            self._postprocess(context, finalization)
             target_evaluation = self._evaluate_target_state(context)
             self._validate_final_artifacts(context)
 
@@ -371,7 +392,7 @@ class PrebuiltRootfsRunner:
 
             self._update_claim(context,claim,RunnerStage.COMPLETING,guest_exit_code=guest_exit_code,target_reached=(target_evaluation.reached if target_evaluation is not None else False),target_goal_id=(target_evaluation.goal_id if target_evaluation is not None else None))
 
-            completed = self.controller.complete_iteration(iteration_index=self.config.iteration_index,artifacts_dir=context.run_dir,goal_reached=goal_reached,goal_reason=goal_reason,guest_exit_code=guest_exit_code,timed_out=guest_exit_code == 124)
+            completed = self.controller.complete_iteration(iteration_index=self.config.iteration_index,artifacts_dir=context.run_dir,goal_reached=goal_reached,goal_reason=goal_reason,guest_exit_code=guest_exit_code,timed_out=guest_exit_code == 124,stage_transitions=phase1_transitions)
 
             if completed.attempt_result is None:
                 raise PrebuiltRunnerError("completed iteration did not persist an attempt result")
@@ -406,6 +427,7 @@ class PrebuiltRootfsRunner:
                     pass
             marker = context.run_dir / "logs" / "malware_started"
             malware_started = marker.is_file()
+            self.guest_execution_observed = malware_started
             retry_safe = False
             if not malware_started:
                 retry_safe = self._rootfs_still_matches_snapshot(context)
@@ -477,6 +499,9 @@ class PrebuiltRootfsRunner:
             logs_dir = temporary / "logs"
             config_dir.mkdir()
             logs_dir.mkdir()
+            if context.execution_plan.backend == ExecutionBackendKind.QEMU_PLUGIN:
+                from .unified_runtime import prepare_attempt
+                prepare_attempt(context, temporary)
             if context.replay_store_path is not None:
                 self._copy_bound_replay_store(context,config_dir / "replay_store")
 
@@ -580,7 +605,7 @@ class PrebuiltRootfsRunner:
                     "uts_namespace": True,
                     "ipc_namespace": True,
                     "network_namespace": True,
-                    "network_connected": (self.config.network_mode in {"controlled", "replay"}),
+                    "network_connected": (self.config.network_mode in {"controlled", "replay", "record"}),
                     "proc_private_mount": True,
                     "chroot": True,
                     "seccomp": False,
@@ -591,6 +616,16 @@ class PrebuiltRootfsRunner:
             script_path = temporary / "run_prebuilt_sandbox.sh"
             script_path.write_text(self._build_sandbox_script(context, temporary),encoding="utf-8")
             script_path.chmod(0o700)
+            # Parse both native and QEMU wrappers before any privileged setup.
+            syntax = subprocess.run(
+                ["bash", "-n", str(script_path)],
+                text=True, capture_output=True, check=False,
+            )
+            if syntax.returncode != 0:
+                raise PrebuiltRunnerError(
+                    "generated sandbox script failed bash -n before execution:\n"
+                    + syntax.stderr[-4000:]
+                )
             os.replace(temporary, context.run_dir)
             temporary = None
         finally:
@@ -627,7 +662,6 @@ class PrebuiltRootfsRunner:
         destination.chmod(0o700)
 
     def _build_sandbox_script(self,context: PreparedRunContext,temporary_run_dir: Path) -> str:
-        del temporary_run_dir
         run_dir = context.run_dir
         rootfs = shlex.quote(str(context.execution_rootfs))
         proc_dir = shlex.quote(str(context.execution_rootfs / "proc"))
@@ -642,7 +676,10 @@ class PrebuiltRootfsRunner:
 
         qemu_setup = ""
         qemu_cleanup = ""
-        if context.execution_plan.backend == ExecutionBackendKind.QEMU_USER:
+        if context.execution_plan.backend == ExecutionBackendKind.QEMU_PLUGIN:
+            from .unified_runtime import sandbox_fragments
+            qemu_setup, qemu_cleanup, execution = sandbox_fragments(context, temporary_run_dir)
+        elif context.execution_plan.backend == ExecutionBackendKind.QEMU_USER:
             qemu_host = shlex.quote(str(context.execution_plan.qemu_host_path))
             qemu_guest = shlex.quote(str(context.execution_plan.qemu_guest_path))
             qemu_internal = shlex.quote(
@@ -661,10 +698,10 @@ touch "$QEMU_MOUNT"
 mount --bind "$QEMU_HOST" "$QEMU_MOUNT"
 mount -o remount,bind,ro "$QEMU_MOUNT"
 """.rstrip()
-            qemu_cleanup = """
-umount -l "$QEMU_MOUNT" >/dev/null 2>&1 || true
-rm -f "$QEMU_MOUNT" >/dev/null 2>&1 || true
-rmdir "$QEMU_INTERNAL_DIR" >/dev/null 2>&1 || true
+            qemu_cleanup = f"""
+umount -l {qemu_mount} >/dev/null 2>&1 || true
+rm -f {qemu_mount} >/dev/null 2>&1 || true
+rmdir {qemu_internal} >/dev/null 2>&1 || true
 """.rstrip()
             execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
@@ -674,7 +711,8 @@ rmdir "$QEMU_INTERNAL_DIR" >/dev/null 2>&1 || true
             execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
     strace -ff -yy -s 4096 -o "$STRACE_BASE" \
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
-    chroot "$ROOTFS" "$GUEST_BINARY"""
+    chroot "$ROOTFS" "$GUEST_BINARY"
+""".rstrip()
 
         return f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -687,17 +725,17 @@ STARTED_MARKER={started}
 EXIT_FILE={exit_file}
 TIMEOUT_SECONDS={timeout_value}
 SANDBOX_HOSTNAME={hostname}
-{qemu_setup}
-
-mount --make-rprivate /
-ip link set lo up
-hostname "$SANDBOX_HOSTNAME"
-mount -t proc proc "$PROC_DIR"
 cleanup() {{
     umount -l "$PROC_DIR" >/dev/null 2>&1 || true
     {qemu_cleanup}
 }}
 trap cleanup EXIT INT TERM
+
+mount --make-rprivate /
+{qemu_setup}
+ip link set lo up
+hostname "$SANDBOX_HOSTNAME"
+mount -t proc proc "$PROC_DIR"
 
 printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STARTED_MARKER"
 set +e
@@ -728,11 +766,35 @@ exit "$status"
                 "bash",
                 str(script_path),
             ]
-        result = self.executor.run(command,cwd=self.config.project_root,check=False,stdout_path=stdout_path,stderr_path=stderr_path)
+        binding_path = context.run_dir / "config/capsule_binding.json"
+        binding = json.loads(binding_path.read_text()) if binding_path.is_file() else None
+        if binding is not None and "resources" in binding["settings"]:
+            from .capsule_resources import execute
+            result = execute(binding, command, self.executor, cwd=self.config.project_root, check=False,
+                             stdout_path=stdout_path, stderr_path=stderr_path)
+        else:
+            result = self.executor.run(command,cwd=self.config.project_root,check=False,stdout_path=stdout_path,stderr_path=stderr_path)
         exit_path = context.run_dir / "logs" / "guest_exit_code"
         if not exit_path.is_file():
+            try:
+                with stderr_path.open("rb") as stream:
+                    stream.seek(0, os.SEEK_END)
+                    stream.seek(max(0, stream.tell() - 4000))
+                    stderr_tail = stream.read(4000).decode("utf-8", errors="replace").strip()
+            except OSError as exc:
+                stderr_tail = f"cannot read runtime stderr: {exc}"
+            if not stderr_tail:
+                stderr_tail = result.stderr[-4000:].strip()
             raise PrebuiltRunnerError(
-                f"sandbox infrastructure failed before recording the guest exit status (wrapper exit code {result.returncode})")
+                "sandbox infrastructure failed before recording the guest exit status "
+                f"(wrapper exit code {result.returncode})\n"
+                f"sandbox script: {script_path}\n"
+                f"runtime stderr: {stderr_path}\n"
+                f"{stderr_tail or '(runtime stderr is empty)'}"
+            )
+        # sudo may create status and trace files as root with mode 0600.
+        # Transfer ownership before reading the status, even with umask 0077.
+        self._normalize_output_ownership(context, [context.run_dir / "logs"])
         try:
             guest_exit = int(exit_path.read_text(encoding="utf-8").strip())
         except (OSError, ValueError) as exc:
@@ -743,25 +805,55 @@ exit "$status"
         return guest_exit
 
     def _capture_observation(self,context: PreparedRunContext,phase: str) -> None:
-        self.executor.run(
-            [
-                "sudo",
-                "env",
-                f"PYTHONPATH={self.config.project_root}",
-                sys.executable,
-                "scripts/capture_runtime_observations.py",
-                phase,
-                "--run-dir",
-                str(context.run_dir),
-                "--rootfs",
-                str(context.execution_rootfs),
-                "--allow-external-rootfs",
-            ],
-            cwd=self.config.project_root,
-            check=True,
-        )
+        error = None
+        try:
+            self.executor.run(
+                ["sudo", "env", f"PYTHONPATH={self.config.project_root}", sys.executable,
+                 "scripts/capture_runtime_observations.py", phase,
+                 "--run-dir", str(context.run_dir), "--rootfs", str(context.execution_rootfs),
+                 "--allow-external-rootfs"],
+                cwd=self.config.project_root, check=True,
+            )
+        except Exception as exc:
+            error = exc
+        # In particular, RequirementReport.save inherits the sudo umask.
+        # Keep private reports readable by the invoking process, not world-readable.
+        observation_paths = [
+            context.run_dir / "config" / name
+            for name in (
+                "rootfs_before.json", "rootfs_after.json", "rootfs_diff.json",
+                "runtime_requirements.json", "observation_lifecycle.json",
+                "observation_error.json",
+            )
+            if (context.run_dir / "config" / name).is_file()
+        ]
+        try:
+            if observation_paths:
+                self._normalize_output_ownership(context, observation_paths)
+        except Exception as exc:
+            if error is not None:
+                raise PrebuiltRunnerError(f"{error}\nObservation ownership recovery also failed: {exc}") from error
+            raise
+        if error is not None:
+            raise error
 
-    def _postprocess(self,context: PreparedRunContext,guest_exit_code: int) -> None:
+    def _save_execution(self,context: PreparedRunContext,guest_exit_code: int) -> None:
+        # Persist the observed wrapper result before any expensive log processing.
+        execution = {
+            "schema_version": 1,
+            "generated_at_utc": _utc_now(),
+            "guest_exit_code": guest_exit_code,
+            "timed_out": guest_exit_code == 124,
+            "stdout": "logs/runtime_stdout.log",
+            "stderr": "logs/runtime_stderr.log",
+            "strace": ("logs/qemu_strace.log" if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE else "logs/strace.*"),
+            "execution_backend": context.execution_plan.backend.value,
+            "trace_backend": context.execution_plan.trace_backend.value,
+            "target_arch": context.execution_plan.target.arch,
+        }
+        _atomic_write_json(context.run_dir / "config" / "prebuilt_execution.json",execution)
+
+    def _parse_logs(self, context: PreparedRunContext) -> None:
         if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE:
             parse_command = [
                 sys.executable,
@@ -787,7 +879,8 @@ exit "$status"
             cwd=self.config.project_root,
             check=True,
         )
-        self._capture_observation(context, "finalize")
+
+    def _plan_repairs(self, context: PreparedRunContext) -> None:
         self.executor.run(
             [
                 sys.executable,
@@ -798,20 +891,7 @@ exit "$status"
                 str(context.run_dir / "config" / "repair_plan.json"),
             ], cwd=self.config.project_root,check=True)
 
-        execution = {
-            "schema_version": 1,
-            "generated_at_utc": _utc_now(),
-            "guest_exit_code": guest_exit_code,
-            "timed_out": guest_exit_code == 124,
-            "stdout": "logs/runtime_stdout.log",
-            "stderr": "logs/runtime_stderr.log",
-            "strace": ("logs/qemu_strace.log" if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE else "logs/strace.*"),
-            "execution_backend": context.execution_plan.backend.value,
-            "trace_backend": context.execution_plan.trace_backend.value,
-            "target_arch": context.execution_plan.target.arch,
-        }
-        _atomic_write_json(context.run_dir / "config" / "prebuilt_execution.json",execution)
-
+    def _generate_report(self, context: PreparedRunContext) -> None:
         self.executor.run(
             [
                 sys.executable,
@@ -819,6 +899,26 @@ exit "$status"
                 "--out",
                 str(context.run_dir),
             ], cwd=self.config.project_root,check=True)
+
+    def _postprocess(self, context: PreparedRunContext, finalization: AttemptFinalization) -> None:
+        finalization.run("syscalls", lambda: self._parse_logs(context))
+        if all(finalization.completed(name) for name in ("execution", "filesystem", "syscalls")):
+            finalization.run("requirements", lambda: self._capture_observation(context, "requirements"))
+        else:
+            finalization.update("requirements", "skipped", reason="execution, filesystem or syscall processing failed")
+        if finalization.completed("requirements"):
+            finalization.run("repair_plan", lambda: self._plan_repairs(context))
+        else:
+            finalization.update("repair_plan", "skipped", reason="requirements are unavailable")
+        finalization.finish()
+        try:
+            self._generate_report(context)
+        except Exception as exc:
+            finalization.fail("report", exc)
+            finalization.finish()
+            write_failure_report(context.run_dir, finalization)
+        if finalization.errors:
+            raise PrebuiltRunnerError("attempt finalization failed:\n" + "\n".join(finalization.errors))
 
     def _evaluate_target_state(self,context: PreparedRunContext) -> TargetStateEvaluation | None:
         if context.target_spec is None:
@@ -856,7 +956,7 @@ exit "$status"
             )
         if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE:
             required = (*required,context.run_dir / "logs" / "qemu_strace.log")
-        if self.config.network_mode in {"controlled", "replay"}:
+        if self.config.network_mode in {"controlled", "replay", "record"}:
             required = (*required,context.run_dir / "config" / "network_policy_requested.json",context.run_dir / "config" / "network_backend_manifest.json",context.run_dir / "logs" / "network_events.jsonl")
         if self.config.network_mode == "replay":
             required = (*required,context.run_dir / "config" / "replay_store" / "index.json")
@@ -883,7 +983,7 @@ exit "$status"
             session_id=context.session.session_id,
             iteration_index=context.iteration.index,
             self_test=self.config.network_self_test,
-            responder_mode=("replay" if self.config.network_mode == "replay" else "emulated"),
+            responder_mode=(self.config.network_mode if self.config.network_mode in {"replay", "record"} else "emulated"),
             replay_store_path=(
                 context.run_dir / "config" / "replay_store" if context.replay_store_path is not None else None),
             replay_store_expected_sha256=context.replay_store_sha256
@@ -894,7 +994,7 @@ exit "$status"
         required = ("sudo","unshare","bash","mount","umount","ip","hostname","timeout","chroot","tee")
         if context.execution_plan.backend == ExecutionBackendKind.NATIVE:
             required = (*required, "strace")
-        if self.config.network_mode in {"controlled", "replay"}:
+        if self.config.network_mode in {"controlled", "replay", "record"}:
             required = (*required, "iptables")
         missing = [name for name in required if shutil.which(name) is None]
         if missing:
@@ -915,23 +1015,28 @@ exit "$status"
             )
         elif self.config.network_mode == "replay":
             scripts.append("scripts/start_network_replay.py")
+        elif self.config.network_mode == "record":
+            scripts.append("scripts/start_network_record.py")
         for relative in scripts:
             _validate_regular_file(self.config.project_root / relative,relative)
 
-    def _normalize_log_ownership(self, context: PreparedRunContext) -> None:
-        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-        if not user:
+    def _normalize_output_ownership(self, context: PreparedRunContext, paths: Sequence[Path]) -> None:
+        uid, gid = os.getuid(), os.getgid()
+        if uid == 0 and os.environ.get("SUDO_USER"):
             try:
-                user = pwd.getpwuid(os.getuid()).pw_name
+                account = pwd.getpwnam(os.environ["SUDO_USER"])
             except KeyError as exc:
-                raise PrebuiltRunnerError("cannot determine invoking user for log ownership") from exc
+                raise PrebuiltRunnerError("cannot determine invoking user for output ownership") from exc
+            uid, gid = account.pw_uid, account.pw_gid
         self.executor.run(
             [
                 "sudo",
                 "chown",
                 "-R",
-                f"{user}:{user}",
-                str(context.run_dir / "logs"),
+                "--no-dereference",
+                "--",
+                f"{uid}:{gid}",
+                *(str(path) for path in paths),
             ],
             cwd=self.config.project_root,
             check=True)

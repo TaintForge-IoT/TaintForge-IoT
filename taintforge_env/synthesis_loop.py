@@ -90,9 +90,9 @@ class SynthesisLoopConfig:
                 strict=False
             )
         self.network_mode = str(self.network_mode).strip().lower()
-        if self.network_mode not in {"none", "controlled", "replay"}:
+        if self.network_mode not in {"none", "controlled", "replay", "record"}:
             raise SynthesisLoopError(
-                "network_mode must be one of: none, controlled, replay"
+                "network_mode must be one of: none, controlled, replay, record"
             )
         if self.network_self_test and self.network_mode != "controlled":
             raise SynthesisLoopError(
@@ -330,7 +330,15 @@ class EnvironmentSynthesisLoop:
                         iteration=latest.index,
                     )
                     runner = self.runner_factory(runner_config)
-                    runner_result = runner.run_and_complete()
+                    try:
+                        runner_result = runner.run_and_complete()
+                    except Exception:
+                        # A parser/verification failure can occur after execution.
+                        # Only this newly invoked runner may contribute; a blocked
+                        # resume must not count a previous attempt again.
+                        if getattr(runner, "guest_execution_observed", False):
+                            executions += 1
+                        raise
                     executions += 1
                     self._append_event(
                         "iteration_completed",
@@ -484,6 +492,13 @@ class EnvironmentSynthesisLoop:
             if _sha256_file(qemu_host) != qemu_digest:
                 raise SynthesisLoopError("bound QEMU executable was modified")
 
+        if binding.get("analyzer_bundle_path") is not None:
+            from .unified_runtime import verify_bundle
+            try:
+                verify_bundle(Path(binding["analyzer_bundle_path"]), binding["analyzer_bundle_sha256"])
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise SynthesisLoopError(f"bound analyzer runtime changed: {exc}") from exc
+
         _verify_bound_file_bundle(
             binding.get("template_config_files"),
             binding.get("template_config_bundle_sha256"),
@@ -625,7 +640,7 @@ class EnvironmentSynthesisLoop:
         _validate_directory(self.config.project_root, "project root")
         runtime_path = self.config.template_run_dir / "config" / "runtime.json"
         runtime = _load_json_object(runtime_path, "template runtime")
-        if self.config.network_mode in {"controlled", "replay"}:
+        if self.config.network_mode in {"controlled", "replay", "record"}:
             _validate_regular_file(
                 self.config.template_run_dir / "config" / "network_policy.json",
                 "template network policy",
@@ -708,6 +723,8 @@ class EnvironmentSynthesisLoop:
             "qemu_host_path": execution_plan.qemu_host_path,
             "qemu_host_sha256": execution_plan.qemu_host_sha256,
             "qemu_guest_path": execution_plan.qemu_guest_path,
+            "analyzer_bundle_path": execution_plan.analyzer_bundle_path,
+            "analyzer_bundle_sha256": execution_plan.analyzer_bundle_sha256,
             "analysis_stack_files": analysis_files,
             "analysis_stack_sha256": analysis_digest,
             "target_spec_path": (
@@ -767,6 +784,7 @@ class EnvironmentSynthesisLoop:
             "library_plan.json",
             "library_resolution.json",
             "network_policy.json",
+            "guest_runtime.json",
         )
         entries: list[dict[str, Any]] = []
         for name in names:
@@ -793,6 +811,7 @@ class EnvironmentSynthesisLoop:
                 "scripts/start_transparent_logger.py",
             ),
             "replay": ("scripts/start_network_replay.py",),
+            "record": ("scripts/start_network_record.py",),
         }[self.config.network_mode]
         for relative in (*self.REQUIRED_PROJECT_SCRIPTS, *network_scripts):
             path = self.config.project_root / relative
@@ -898,6 +917,8 @@ class EnvironmentSynthesisLoop:
             "qemu_host_path",
             "qemu_host_sha256",
             "qemu_guest_path",
+            "analyzer_bundle_path",
+            "analyzer_bundle_sha256",
             "analysis_stack_files",
             "analysis_stack_sha256",
             "target_spec_path",

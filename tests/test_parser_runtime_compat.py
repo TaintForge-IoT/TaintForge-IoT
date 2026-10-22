@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from taintforge_env.parser import load_taint_log
@@ -8,12 +9,12 @@ DATA_DIR = Path(__file__).parent / "data"
 
 def test_parse_static_x86_fixture() -> None:
     taint = load_taint_log(
-        DATA_DIR / "unpacked_static_x86.json"
+        DATA_DIR / "static.json"
     )
 
     assert taint.arch == "x86"
     assert taint.oep == "0x804ae0c"
-    assert taint.base == "0x804a000"
+    assert taint.base == "0x8048000"
 
     assert len(taint.regions) == 4
     assert taint.library_dependencies == []
@@ -50,12 +51,12 @@ def test_parse_static_x86_fixture() -> None:
 
 def test_parse_dynamic_x86_fixture() -> None:
     taint = load_taint_log(
-        DATA_DIR / "unpacked_dynamic_x86.json"
+        DATA_DIR / "dynamic.json"
     )
 
     assert taint.arch == "x86"
     assert taint.oep == "0x4010fb"
-    assert taint.base == "0x401000"
+    assert taint.base == "0x400000"
 
     assert len(taint.regions) == 11
     assert len(taint.library_dependencies) == 2
@@ -64,15 +65,15 @@ def test_parse_dynamic_x86_fixture() -> None:
 
     assert loader.name == "ld-linux.so.2"
     assert loader.path == "/lib/ld-linux.so.2"
-    assert loader.observed_base == "0x4083b000"
-    assert loader.observed_size == 9400
+    assert loader.observed_base == "0x40805000"
+    assert loader.observed_size == 230584
 
     libc = taint.library_dependencies[1]
 
     assert libc.name == "libc.so.6"
     assert libc.path == "/usr/lib32/libc.so.6"
-    assert libc.observed_base == "0x40a9f000"
-    assert libc.observed_size == 12288
+    assert libc.observed_base == "0x4088e000"
+    assert libc.observed_size == 2179072
 
     assert len(taint.network_events) == 2
     assert len(taint.network_dependencies) == 1
@@ -91,13 +92,23 @@ def test_parse_dynamic_x86_fixture() -> None:
     assert tmp_dependency.write is True
 
 
-def test_dynamic_fixture_library_addresses_are_observations() -> None:
-    taint = load_taint_log(
-        DATA_DIR / "unpacked_dynamic_x86.json"
-    )
+def test_dynamic_fixture_library_addresses_are_observations(tmp_path: Path) -> None:
+    # Preserve the original regression: observed library mappings need not be
+    # the first/code mapping. The current fixture records whole-library ranges.
+    raw = json.loads((DATA_DIR / "dynamic.json").read_text(encoding="utf-8"))
+    raw["library_dependencies"][0].update(base="0x4083b000", size=9400)
+    raw["library_dependencies"][1].update(base="0x40a9f000", size=12288)
+    path = tmp_path / "partial_library_observations.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    taint = load_taint_log(path)
 
     loader = taint.library_dependencies[0]
     libc = taint.library_dependencies[1]
+
+    assert loader.observed_base == "0x4083b000"
+    assert loader.observed_size == 9400
+    assert libc.observed_base == "0x40a9f000"
+    assert libc.observed_size == 12288
 
     region_starts = {
         int(region.addr, 16)

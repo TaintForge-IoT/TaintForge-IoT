@@ -1,0 +1,266 @@
+diff --git a/taintforge_env/prebuilt_runner.py b/taintforge_env/prebuilt_runner.py
+index d942416..5290103 100644
+--- a/taintforge_env/prebuilt_runner.py
++++ b/taintforge_env/prebuilt_runner.py
+@@ -219,7 +219,7 @@ class PrebuiltRunnerConfig:
+ 
+ class PrebuiltRootfsRunner:
+ 
+-    ADAPTER_VERSION = 6
++    ADAPTER_VERSION = 7
+     TEMPLATE_CONFIG_ALLOWLIST = ("library_plan.json","library_resolution.json","network_policy.json")
+ 
+     def __init__(self,config: PrebuiltRunnerConfig,*,executor: CommandExecutor | None = None,network_backend_factory: NetworkBackendFactory | None = None) -> None:
+@@ -362,7 +362,6 @@ class PrebuiltRootfsRunner:
+ 
+             self._update_claim(context,claim,RunnerStage.POSTPROCESSING,malware_started=True,guest_exit_code=guest_exit_code)
+ 
+-            self._normalize_log_ownership(context)
+             self._postprocess(context, guest_exit_code)
+             target_evaluation = self._evaluate_target_state(context)
+             self._validate_final_artifacts(context)
+@@ -591,6 +590,16 @@ class PrebuiltRootfsRunner:
+             script_path = temporary / "run_prebuilt_sandbox.sh"
+             script_path.write_text(self._build_sandbox_script(context, temporary),encoding="utf-8")
+             script_path.chmod(0o700)
++            # Parse both native and QEMU wrappers before any privileged setup.
++            syntax = subprocess.run(
++                ["bash", "-n", str(script_path)],
++                text=True, capture_output=True, check=False,
++            )
++            if syntax.returncode != 0:
++                raise PrebuiltRunnerError(
++                    "generated sandbox script failed bash -n before execution:\n"
++                    + syntax.stderr[-4000:]
++                )
+             os.replace(temporary, context.run_dir)
+             temporary = None
+         finally:
+@@ -674,7 +683,8 @@ rmdir "$QEMU_INTERNAL_DIR" >/dev/null 2>&1 || true
+             execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
+     strace -ff -yy -s 4096 -o "$STRACE_BASE" \
+     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
+-    chroot "$ROOTFS" "$GUEST_BINARY"""
++    chroot "$ROOTFS" "$GUEST_BINARY"
++""".rstrip()
+ 
+         return f"""#!/usr/bin/env bash
+ set -euo pipefail
+@@ -731,8 +741,25 @@ exit "$status"
+         result = self.executor.run(command,cwd=self.config.project_root,check=False,stdout_path=stdout_path,stderr_path=stderr_path)
+         exit_path = context.run_dir / "logs" / "guest_exit_code"
+         if not exit_path.is_file():
++            try:
++                with stderr_path.open("rb") as stream:
++                    stream.seek(0, os.SEEK_END)
++                    stream.seek(max(0, stream.tell() - 4000))
++                    stderr_tail = stream.read(4000).decode("utf-8", errors="replace").strip()
++            except OSError as exc:
++                stderr_tail = f"cannot read runtime stderr: {exc}"
++            if not stderr_tail:
++                stderr_tail = result.stderr[-4000:].strip()
+             raise PrebuiltRunnerError(
+-                f"sandbox infrastructure failed before recording the guest exit status (wrapper exit code {result.returncode})")
++                "sandbox infrastructure failed before recording the guest exit status "
++                f"(wrapper exit code {result.returncode})\n"
++                f"sandbox script: {script_path}\n"
++                f"runtime stderr: {stderr_path}\n"
++                f"{stderr_tail or '(runtime stderr is empty)'}"
++            )
++        # sudo may create status and trace files as root with mode 0600.
++        # Transfer ownership before reading the status, even with umask 0077.
++        self._normalize_output_ownership(context, [context.run_dir / "logs"])
+         try:
+             guest_exit = int(exit_path.read_text(encoding="utf-8").strip())
+         except (OSError, ValueError) as exc:
+@@ -760,6 +787,19 @@ exit "$status"
+             cwd=self.config.project_root,
+             check=True,
+         )
++        # In particular, RequirementReport.save inherits the sudo umask.
++        # Keep private reports readable by the invoking process, not world-readable.
++        observation_paths = [
++            context.run_dir / "config" / name
++            for name in (
++                "rootfs_before.json", "rootfs_after.json", "rootfs_diff.json",
++                "runtime_requirements.json", "observation_lifecycle.json",
++                "observation_error.json",
++            )
++            if (context.run_dir / "config" / name).is_file()
++        ]
++        if observation_paths:
++            self._normalize_output_ownership(context, observation_paths)
+ 
+     def _postprocess(self,context: PreparedRunContext,guest_exit_code: int) -> None:
+         if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE:
+@@ -918,20 +958,23 @@ exit "$status"
+         for relative in scripts:
+             _validate_regular_file(self.config.project_root / relative,relative)
+ 
+-    def _normalize_log_ownership(self, context: PreparedRunContext) -> None:
+-        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+-        if not user:
++    def _normalize_output_ownership(self, context: PreparedRunContext, paths: Sequence[Path]) -> None:
++        uid, gid = os.getuid(), os.getgid()
++        if uid == 0 and os.environ.get("SUDO_USER"):
+             try:
+-                user = pwd.getpwuid(os.getuid()).pw_name
++                account = pwd.getpwnam(os.environ["SUDO_USER"])
+             except KeyError as exc:
+-                raise PrebuiltRunnerError("cannot determine invoking user for log ownership") from exc
++                raise PrebuiltRunnerError("cannot determine invoking user for output ownership") from exc
++            uid, gid = account.pw_uid, account.pw_gid
+         self.executor.run(
+             [
+                 "sudo",
+                 "chown",
+                 "-R",
+-                f"{user}:{user}",
+-                str(context.run_dir / "logs"),
++                "--no-dereference",
++                "--",
++                f"{uid}:{gid}",
++                *(str(path) for path in paths),
+             ],
+             cwd=self.config.project_root,
+             check=True)
+diff --git a/tests/test_prebuilt_runner.py b/tests/test_prebuilt_runner.py
+index 849c635..1f645ad 100644
+--- a/tests/test_prebuilt_runner.py
++++ b/tests/test_prebuilt_runner.py
+@@ -3,8 +3,11 @@ from __future__ import annotations
+ import hashlib
+ import json
+ import os
++import subprocess
++import sys
+ import tempfile
+ import unittest
++from dataclasses import replace
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+@@ -19,6 +22,7 @@ from taintforge_env.prebuilt_runner import (
+     PrebuiltRootfsRunner,
+     PrebuiltRunnerConfig,
+     PrebuiltRunnerError,
++    SubprocessCommandExecutor,
+ )
+ from taintforge_env.replay_store import ReplayStore
+ from tests.elf_fixture import write_elf
+@@ -613,6 +617,115 @@ class PrebuiltRunnerTests(unittest.TestCase):
+         self.assertIn("ip link set lo up", script)
+         self.assertIn("mount -t proc", script)
+ 
++    def test_native_sandbox_script_passes_real_bash_syntax_check(self) -> None:
++        runner = self.make_runner()
++        context = runner.validate()
++        for suffix in ("plain", "spaces and 'quotes' and $dollars"):
++            with self.subTest(path=suffix):
++                candidate = replace(
++                    context,
++                    run_dir=context.run_dir / suffix,
++                    execution_rootfs=context.execution_rootfs / suffix,
++                )
++                script = runner._build_sandbox_script(candidate, candidate.run_dir)
++                syntax = subprocess.run(
++                    ["bash", "-n"], input=script, text=True,
++                    capture_output=True, check=False,
++                )
++                self.assertEqual(syntax.returncode, 0, syntax.stderr)
++
++    def test_invalid_wrapper_is_rejected_before_privileged_setup(self) -> None:
++        executor = FakeExecutor()
++        runner = self.make_runner(executor, network_mode="controlled")
++        with patch.object(runner, "_build_sandbox_script", return_value='#!/bin/bash\necho "'), \
++                patch.object(runner, "_create_network_backend") as network:
++            with self.assertRaisesRegex(PrebuiltRunnerError, "failed bash -n"):
++                runner.run_and_complete()
++        network.assert_not_called()
++        self.assertEqual(executor.commands, [])
++        iteration = self.session / "iterations/0000"
++        self.assertFalse((iteration / "run").exists())
++        claim = json.loads((iteration / "execution_attempt.json").read_text())
++        self.assertEqual(claim["stage"], "failed")
++        self.assertFalse(claim["malware_started"])
++        self.assertTrue(claim["retry_safe"])
++
++    def test_guest_exit_two_is_not_an_infrastructure_failure(self) -> None:
++        runner = self.make_runner(FakeExecutor(guest_exit_code=2))
++        with patch.object(runner, "_check_host_dependencies", return_value=None):
++            result = runner.run_and_complete()
++        self.assertEqual(result.guest_exit_code, 2)
++        self.assertFalse(result.timed_out)
++        self.assertTrue(result.attempt_result_path.is_file())
++
++    def test_private_privileged_outputs_are_owned_before_reading(self) -> None:
++        protected: set[Path] = set()
++        created: set[Path] = set()
++        original_read_text = Path.read_text
++
++        def unprivileged_read(path, *args, **kwargs):
++            if path in protected:
++                raise PermissionError(f"root-owned private artifact: {path}")
++            return original_read_text(path, *args, **kwargs)
++
++        class PrivateOutputExecutor(FakeExecutor):
++            def run(self, command, **kwargs):
++                cmd = list(command)
++                if cmd[:2] == ["sudo", "chown"]:
++                    targets = [Path(value) for value in cmd[cmd.index("--") + 2:]]
++                    protected.difference_update(
++                        path for path in list(protected)
++                        if any(path == target or target in path.parents for target in targets)
++                    )
++                if "scripts/plan_repairs.py" in cmd:
++                    Path(cmd[cmd.index("--requirements") + 1]).read_text()
++                result = super().run(command, **kwargs)
++                private_path = None
++                if cmd and cmd[-1].endswith("run_prebuilt_sandbox.sh") and "unshare" in cmd:
++                    private_path = Path(cmd[-1]).parent / "logs/guest_exit_code"
++                elif "scripts/capture_runtime_observations.py" in cmd and "finalize" in cmd:
++                    private_path = Path(cmd[cmd.index("--run-dir") + 1]) / "config/runtime_requirements.json"
++                if private_path is not None:
++                    private_path.chmod(0o600)
++                    protected.add(private_path)
++                    created.add(private_path)
++                return result
++
++        runner = self.make_runner(PrivateOutputExecutor())
++        with patch.object(runner, "_check_host_dependencies", return_value=None), \
++                patch.object(Path, "read_text", unprivileged_read):
++            result = runner.run_and_complete()
++        self.assertEqual(result.guest_exit_code, 0)
++        self.assertEqual(len(created), 2)
++        self.assertFalse(protected)
++        for path in created:
++            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
++
++    def test_infrastructure_error_includes_redirected_stderr_tail(self) -> None:
++        runner = self.make_runner()
++        context = runner.validate()
++        runner.executor = SubprocessCommandExecutor()
++
++        class FailingWrapper:
++            def guest_command(self, sandbox_script):
++                # Emit real redirected stderr without entering any namespace.
++                return [
++                    sys.executable, "-c",
++                    "import sys; "
++                    "sys.stderr.buffer.write(b'old log prefix\\n' + b'x' * 9000 "
++                    "+ b'\\xff\\nunexpected EOF while looking for matching quote\\n'); "
++                    "sys.exit(2)",
++                ]
++
++        with self.assertRaises(PrebuiltRunnerError) as raised:
++            runner._execute_guest(context, network_backend=FailingWrapper())
++        message = str(raised.exception)
++        self.assertIn("wrapper exit code 2", message)
++        self.assertIn("unexpected EOF while looking for matching quote", message)
++        self.assertIn(str(context.run_dir / "logs/runtime_stderr.log"), message)
++        self.assertNotIn("old log prefix", message)
++        self.assertLess(len(message), 5000)
++
+     def test_observer_explicitly_allows_external_rootfs(self) -> None:
+         executor = FakeExecutor()
+         runner = self.make_runner(executor)

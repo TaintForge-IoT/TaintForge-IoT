@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "reference_revision": "f75ffe50f7dd8a2972f455532db97d1e7191aeca",
+  "github_reference_revision": "3e74e480eea3e945786aa931690609afb81f5f24",
+  "read_only_guards": {
+    "taintforge_env/phase1_runtime.py": [
+      "b98aa60144b0ffa5b1b116a4e21f96be96f8af2d016a5dc4277faf3c7e6f9093",
+      "d310c66f0cde4f4d5ba55605da9eb885c59752d5d94415a6f8c5192d4d57e2ff"
+    ],
+    "taintforge_env/elf_target.py": [
+      "87c8257c869e7cd98c4f0f2aa54fd94af4d9cdbaf9e3e5c49906eac3e90bbd5f"
+    ],
+    "taintforge_env/unified_runtime.py": [
+      "bc1bab5f5a020f4bff5b448565509408a237d854706197a64a6ee068217d2efd",
+      "535be84c548990998755d1e510db0919f003a0e92e0927d8fb04e7aef5387afe",
+      "180b4b61f8c8dfc08df868f17f1f85a8cfaf738adc565fc16e5a8728fa525dfb"
+    ],
+    "taintforge_env/syscall_result.py": [
+      "faa0184a840389d4faa35c6a5881435fa1f3ebef789340794d00440d86f53536"
+    ],
+    "taintforge_env/target_state_oracle.py": [
+      "e1201bb5d49c0cd129be9b2e889e5f319b79b0a54de9e94aae9c0cd2d5972f36"
+    ],
+    "taintforge_env/__init__.py": [
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    ],
+    "experiments/execution_capsule_probe/controller.py": [
+      "df69790cee3a8e96693f0a4c9082fe5ed9e6eefc38c6d2c62598aed8421d4129"
+    ],
+    "experiments/execution_capsule_probe/BASELINE.json": [
+      "61c521a9555e8c9e836c3d91cbb349548bf237ffc58bb551c0fd120e757abd88",
+      "aa826b89b20fa1b6d8ffcaa580ba408e7e598076ad295aff678b1d27c3720c3a",
+      "36a2db1fe25a19286d4df4e114b5b83504ddda8484f5bd5b9ca8fcc3348d63c1"
+    ],
+    "experiments/execution_capsule_probe/vendor/qemu-plugin.h": [
+      "9592f519d7344b1e38b0123b92c28c4e688faedf41263984910353736bb0b7be"
+    ],
+    "experiments/execution_capsule_probe/probe.c": [
+      "30d4a52a35c7457e113f0ca82d9226e9236baabaad5368942bdc736ca15f5a49"
+    ],
+    "experiments/execution_capsule_probe/guest.S": [
+      "8283e846d15deff45ecc4580e8bd33fea1321dc6df8aa8b8b6677cdead4214d7"
+    ],
+    "experiments/execution_capsule_retire/controller.py": [
+      "ad19d400bcb1571bacee5c10268e2cb748a6ede39f4738ee9d6c8c4c025fc00d"
+    ],
+    "experiments/execution_capsule_retire/retire.c": [
+      "3400e813a51f2b37c271757cf3eca9b203956a439e45675e10d32a9f853a6b28"
+    ]
+  }
+}

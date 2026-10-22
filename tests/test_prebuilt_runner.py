@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,8 +22,10 @@ from taintforge_env.prebuilt_runner import (
     PrebuiltRootfsRunner,
     PrebuiltRunnerConfig,
     PrebuiltRunnerError,
+    SubprocessCommandExecutor,
 )
 from taintforge_env.replay_store import ReplayStore
+from taintforge_env.strace_parser import parse_strace_line
 from tests.elf_fixture import write_elf
 
 
@@ -59,7 +64,7 @@ class FakeExecutor:
             config.mkdir(parents=True, exist_ok=True)
             if phase == "before":
                 _write_json(config / "rootfs_before.json", {"entries_count": 3})
-            elif phase == "finalize":
+            elif phase in {"after", "finalize"}:
                 _write_json(config / "rootfs_after.json", {"entries_count": 3})
                 _write_json(
                     config / "rootfs_diff.json",
@@ -69,6 +74,7 @@ class FakeExecutor:
                         "deleted_count": 0,
                     },
                 )
+            if phase in {"requirements", "finalize"}:
                 _write_json(
                     config / "runtime_requirements.json",
                     {
@@ -92,12 +98,9 @@ class FakeExecutor:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(
                 json.dumps(
-                    {
-                        "event": "syscall",
-                        "execution_context": "guest",
-                        "syscall": "write",
-                        "success": True,
-                    }
+                    asdict(parse_strace_line(
+                        'write(1,"x",1) = 1', "strace.1", 1, "guest"
+                    ))
                 )
                 + "\n",
                 encoding="utf-8",
@@ -598,6 +601,26 @@ class PrebuiltRunnerTests(unittest.TestCase):
             SessionState.FAILED,
         )
 
+    def test_execution_status_exists_before_parser_and_final_observation(self):
+        from taintforge_env.observations import load_observation_bundle
+
+        checked = []
+
+        class CheckingExecutor(FakeExecutor):
+            def run(self, command, **kwargs):
+                cmd = list(map(str, command))
+                if any(value.endswith("parse_strace.py") or value.endswith("parse_qemu_strace.py") for value in cmd):
+                    output = Path(cmd[cmd.index("--out") + 1])
+                    status = output.parent.parent / "config/prebuilt_execution.json"
+                    checked.append(json.loads(status.read_text())["guest_exit_code"])
+                if any(value.endswith("capture_runtime_observations.py") for value in cmd) and "after" in cmd:
+                    run = Path(cmd[cmd.index("--run-dir") + 1])
+                    checked.append(load_observation_bundle(run).runtime_status["guest_exit_code"])
+                return super().run(command, **kwargs)
+
+        self.make_runner(CheckingExecutor(guest_exit_code=124)).run_and_complete()
+        self.assertEqual(checked, [124, 124])
+
     def test_sandbox_uses_private_namespaces(self) -> None:
         executor = FakeExecutor()
         runner = self.make_runner(executor)
@@ -613,6 +636,115 @@ class PrebuiltRunnerTests(unittest.TestCase):
         self.assertIn("ip link set lo up", script)
         self.assertIn("mount -t proc", script)
 
+    def test_native_sandbox_script_passes_real_bash_syntax_check(self) -> None:
+        runner = self.make_runner()
+        context = runner.validate()
+        for suffix in ("plain", "spaces and 'quotes' and $dollars"):
+            with self.subTest(path=suffix):
+                candidate = replace(
+                    context,
+                    run_dir=context.run_dir / suffix,
+                    execution_rootfs=context.execution_rootfs / suffix,
+                )
+                script = runner._build_sandbox_script(candidate, candidate.run_dir)
+                syntax = subprocess.run(
+                    ["bash", "-n"], input=script, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_invalid_wrapper_is_rejected_before_privileged_setup(self) -> None:
+        executor = FakeExecutor()
+        runner = self.make_runner(executor, network_mode="controlled")
+        with patch.object(runner, "_build_sandbox_script", return_value='#!/bin/bash\necho "'), \
+                patch.object(runner, "_create_network_backend") as network:
+            with self.assertRaisesRegex(PrebuiltRunnerError, "failed bash -n"):
+                runner.run_and_complete()
+        network.assert_not_called()
+        self.assertEqual(executor.commands, [])
+        iteration = self.session / "iterations/0000"
+        self.assertFalse((iteration / "run").exists())
+        claim = json.loads((iteration / "execution_attempt.json").read_text())
+        self.assertEqual(claim["stage"], "failed")
+        self.assertFalse(claim["malware_started"])
+        self.assertTrue(claim["retry_safe"])
+
+    def test_guest_exit_two_is_not_an_infrastructure_failure(self) -> None:
+        runner = self.make_runner(FakeExecutor(guest_exit_code=2))
+        with patch.object(runner, "_check_host_dependencies", return_value=None):
+            result = runner.run_and_complete()
+        self.assertEqual(result.guest_exit_code, 2)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.attempt_result_path.is_file())
+
+    def test_private_privileged_outputs_are_owned_before_reading(self) -> None:
+        protected: set[Path] = set()
+        created: set[Path] = set()
+        original_read_text = Path.read_text
+
+        def unprivileged_read(path, *args, **kwargs):
+            if path in protected:
+                raise PermissionError(f"root-owned private artifact: {path}")
+            return original_read_text(path, *args, **kwargs)
+
+        class PrivateOutputExecutor(FakeExecutor):
+            def run(self, command, **kwargs):
+                cmd = list(command)
+                if cmd[:2] == ["sudo", "chown"]:
+                    targets = [Path(value) for value in cmd[cmd.index("--") + 2:]]
+                    protected.difference_update(
+                        path for path in list(protected)
+                        if any(path == target or target in path.parents for target in targets)
+                    )
+                if "scripts/plan_repairs.py" in cmd:
+                    Path(cmd[cmd.index("--requirements") + 1]).read_text()
+                result = super().run(command, **kwargs)
+                private_path = None
+                if cmd and cmd[-1].endswith("run_prebuilt_sandbox.sh") and "unshare" in cmd:
+                    private_path = Path(cmd[-1]).parent / "logs/guest_exit_code"
+                elif "scripts/capture_runtime_observations.py" in cmd and "requirements" in cmd:
+                    private_path = Path(cmd[cmd.index("--run-dir") + 1]) / "config/runtime_requirements.json"
+                if private_path is not None:
+                    private_path.chmod(0o600)
+                    protected.add(private_path)
+                    created.add(private_path)
+                return result
+
+        runner = self.make_runner(PrivateOutputExecutor())
+        with patch.object(runner, "_check_host_dependencies", return_value=None), \
+                patch.object(Path, "read_text", unprivileged_read):
+            result = runner.run_and_complete()
+        self.assertEqual(result.guest_exit_code, 0)
+        self.assertEqual(len(created), 2)
+        self.assertFalse(protected)
+        for path in created:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_infrastructure_error_includes_redirected_stderr_tail(self) -> None:
+        runner = self.make_runner()
+        context = runner.validate()
+        runner.executor = SubprocessCommandExecutor()
+
+        class FailingWrapper:
+            def guest_command(self, sandbox_script):
+                # Emit real redirected stderr without entering any namespace.
+                return [
+                    sys.executable, "-c",
+                    "import sys; "
+                    "sys.stderr.buffer.write(b'old log prefix\\n' + b'x' * 9000 "
+                    "+ b'\\xff\\nunexpected EOF while looking for matching quote\\n'); "
+                    "sys.exit(2)",
+                ]
+
+        with self.assertRaises(PrebuiltRunnerError) as raised:
+            runner._execute_guest(context, network_backend=FailingWrapper())
+        message = str(raised.exception)
+        self.assertIn("wrapper exit code 2", message)
+        self.assertIn("unexpected EOF while looking for matching quote", message)
+        self.assertIn(str(context.run_dir / "logs/runtime_stderr.log"), message)
+        self.assertNotIn("old log prefix", message)
+        self.assertLess(len(message), 5000)
+
     def test_observer_explicitly_allows_external_rootfs(self) -> None:
         executor = FakeExecutor()
         runner = self.make_runner(executor)
@@ -623,7 +755,7 @@ class PrebuiltRunnerTests(unittest.TestCase):
             for command in executor.commands
             if any(value.endswith("capture_runtime_observations.py") for value in command)
         ]
-        self.assertEqual(len(observer_commands), 2)
+        self.assertEqual(len(observer_commands), 3)
         self.assertTrue(
             all("--allow-external-rootfs" in command for command in observer_commands)
         )
@@ -668,6 +800,48 @@ class PrebuiltRunnerTests(unittest.TestCase):
         (self.template / "config" / "network_policy.json").unlink()
         with self.assertRaisesRegex(PrebuiltRunnerError, "network policy"):
             self.make_runner(network_mode="controlled").validate()
+
+    def test_cleanup_error_does_not_skip_post_run_observation(self) -> None:
+        class BrokenCleanup(FakeNetworkBackend):
+            def cleanup(self, *, finalize_logs=True):
+                super().cleanup(finalize_logs=finalize_logs)
+                if finalize_logs:
+                    execution = self.config.run_dir / "config/prebuilt_execution.json"
+                    if not execution.is_file():
+                        raise AssertionError("exit status must be published before network cleanup")
+                    raise RuntimeError("injected network log cleanup failure")
+
+        runner = self.make_runner(network_mode="controlled", network_backend_factory=BrokenCleanup)
+        with patch.object(runner, "_check_host_dependencies"):
+            with self.assertRaisesRegex(PrebuiltRunnerError, "network log cleanup failure"):
+                runner.run_and_complete()
+        run = self.session / "iterations/0000/run"
+        journal = json.loads((run / "config/finalization_status.json").read_text())
+        self.assertEqual(journal["stages"]["network_cleanup"]["status"], "failed")
+        self.assertEqual(journal["stages"]["filesystem"]["status"], "completed")
+        self.assertTrue((run / "config/rootfs_diff.json").is_file())
+        self.assertEqual(journal["stages"]["repair_plan"]["status"], "completed")
+        self.assertEqual(json.loads((run.parent / "execution_attempt.json").read_text())["stage"], "failed")
+
+    def test_failed_observer_recovers_ownership_of_partial_artifacts(self) -> None:
+        class BrokenObserver(FakeExecutor):
+            def run(self, command, **kwargs):
+                result = super().run(command, **kwargs)
+                if "scripts/capture_runtime_observations.py" in command and "after" in command:
+                    raise RuntimeError("injected observer failure after writing files")
+                return result
+
+        executor = BrokenObserver()
+        runner = self.make_runner(executor)
+        with patch.object(runner, "_check_host_dependencies"):
+            with self.assertRaisesRegex(PrebuiltRunnerError, "observer failure"):
+                runner.run_and_complete()
+        run = self.session / "iterations/0000/run"
+        self.assertTrue(any(cmd[:2] == ["sudo", "chown"] and str(run / "config/rootfs_after.json") in cmd
+                            for cmd in executor.commands))
+        journal = json.loads((run / "config/finalization_status.json").read_text())
+        self.assertEqual(journal["stages"]["filesystem"]["status"], "failed")
+        self.assertEqual(journal["stages"]["requirements"]["status"], "skipped")
 
     def test_network_self_test_requires_controlled_mode(self) -> None:
         with self.assertRaisesRegex(PrebuiltRunnerError, "requires"):

@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=int, default=60)
     run.add_argument(
         "--network",
-        choices=("none", "controlled", "replay"),
+        choices=("none", "controlled", "replay", "record"),
         default="none",
         help=(
             "Execution network backend. controlled preserves known endpoints, "
