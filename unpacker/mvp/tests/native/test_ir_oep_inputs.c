@@ -20,9 +20,9 @@ static OepFixture alias_fixture(void) {
     of_read(&a,0x3000,8); seqs[0]=of_emit(&f,pc,mov,sizeof(mov),a,pc+5); pc+=5;
     a=of_registers(); of_read(&a,0x4000,8);
     seqs[1]=of_emit(&f,pc,xorr,sizeof(xorr),a,pc+6);pc+=6;
-    a=alu_after(of_registers(),ALU_XOR,32,8,8,REG_RAX,0,true);
+    a=alu_after(of_registers(),ALU_XOR,32,8,8,DTA_REG_RAX,0,true);
     seqs[2]=of_emit(&f,pc,add,sizeof(add),a,pc+3);pc+=3;
-    a=alu_after(a,ALU_ADD,32,0,9,REG_RAX,0,true);
+    a=alu_after(a,ALU_ADD,32,0,9,DTA_REG_RAX,0,true);
     uint64_t trigger=of_emit(&f,pc,jump,sizeof(jump),a,9);
     OepFixture out={.input=ff_capture(&f,seqs,3,trigger),.variable_count=2,.target_address=9};
     out.variables[0]=(IrOepInput){.kind=IR_INPUT_MEMORY_BYTE,.state_key=IR_X86_MEMORY_KEY,.address=0x3000,.width=8};

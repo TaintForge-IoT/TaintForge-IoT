@@ -135,7 +135,7 @@ static DseSliceResult slice(Fixture *t, uint64_t trigger, const TraceEntry **out
                             uint32_t capacity) {
     DseRelevanceContext c = context(t);
     CHECK(trace_record_control_transfer(t->f.trace, trigger, 0, PROV_LABEL_CLEAN));
-    DseSliceResult r = dse_build_reg_slice_with_relevance(t->f.trace, t->f.aux, trigger, REG_RAX,
+    DseSliceResult r = dse_build_reg_slice_with_relevance(t->f.trace, t->f.aux, trigger, DTA_REG_RAX,
                                                           out, capacity, &c);
     diagnostic_counts(&r.control);
     return r;
@@ -191,8 +191,8 @@ static void constant_choice(bool taken, unsigned fault, bool memory, FILE *json)
     a.mem_reads[0].taint = 15;
     seqs[0] = emit(&t, 0x1000, load, sizeof(load), a, 0x1006, 7, 0);
     a = registers();
-    a.reg_vals[REG_RBX] = taken ? 1 : 0;
-    a.reg_taint[REG_RBX] = 15;
+    a.reg_vals[DTA_REG_RBX] = taken ? 1 : 0;
+    a.reg_taint[DTA_REG_RBX] = 15;
     seqs[1] = emit(&t, 0x1006, cmp, sizeof(cmp), a, 0x1009, 7, 0);
     a.eflags_before = taken ? 0x202 : 0x246;
     uint32_t dest = taken ? 0x1012 : 0x100b;
@@ -206,10 +206,10 @@ static void constant_choice(bool taken, unsigned fault, bool memory, FILE *json)
     uint32_t length = memory ? sizeof(store) : sizeof(mov);
     seqs[3] = emit(&t, dest, memory ? store : mov, length, a, dest + length, 7, 0);
     a = registers();
-    a.reg_vals[REG_RBX] = taken ? 1 : 0;
-    a.reg_taint[REG_RBX] = 15;
+    a.reg_vals[DTA_REG_RBX] = taken ? 1 : 0;
+    a.reg_taint[DTA_REG_RBX] = 15;
     a.eflags_before = taken ? 0x202 : 0x246;
-    a.reg_vals[REG_RAX] = memory ? 0 : value;
+    a.reg_vals[DTA_REG_RAX] = memory ? 0 : value;
     if (memory)
         ff_read(&a, 0x4000, value, 4, true);
     seqs[4] = emit(&t, dest + length, memory ? memjump : jump,
@@ -262,7 +262,7 @@ static void constant_choice(bool taken, unsigned fault, bool memory, FILE *json)
         CHECK(!r.path_complete && !r.complete);
         CHECK(r.control.issues & (DSE_CONTROL_EVENT_MISSING | DSE_CONTROL_EVENT_CONFLICT));
         DseVerifyResult check = dse_verify_oep_candidate_with_relevance(
-            t.f.trace, t.f.aux, seqs[4], REG_RAX, value, NULL, t.f.decoder, &c);
+            t.f.trace, t.f.aux, seqs[4], DTA_REG_RAX, value, NULL, t.f.decoder, &c);
         CHECK(!check.proof_eligible && check.verdict == DSE_VERDICT_UNKNOWN);
         CHECK(check.control.trigger_seq == seqs[4] && !check.slice_complete);
         CHECK(check.control.issues & (DSE_CONTROL_EVENT_MISSING | DSE_CONTROL_EVENT_CONFLICT));
@@ -280,7 +280,7 @@ static void constant_choice(bool taken, unsigned fault, bool memory, FILE *json)
         CHECK(example->successor_index == (taken ? 0U : 1U));
         if (!memory) {
             DseVerifyResult check = dse_verify_oep_candidate_with_relevance(
-                t.f.trace, t.f.aux, seqs[4], REG_RAX, value, NULL, t.f.decoder, &c);
+                t.f.trace, t.f.aux, seqs[4], DTA_REG_RAX, value, NULL, t.f.decoder, &c);
             if (!check.replay_valid || check.path_constraints != 1)
                 fprintf(stderr, "legacy reason=%u replay=%d path=%u/%u failures=%u\n", check.reason,
                         check.replay_valid, check.path_constraints, check.path_constraints_expected,
@@ -339,7 +339,7 @@ static void diagnostic_targets(FILE *json) {
         branch_to(&t, 0x10, a, 0x12, 1, 0, 0, variant ? 0x12 : 0);
         const uint8_t dest[] = {0xb8, 0, 0x20, 0, 0}, jump[] = {0xff, 0xe0};
         emit(&t, 0x12, dest, sizeof(dest), a, 0x17, variant ? 2 : 1, 0);
-        a.reg_vals[REG_RAX] = 0x2000;
+        a.reg_vals[DTA_REG_RAX] = 0x2000;
         uint64_t trigger = emit(&t, 0x17, jump, sizeof(jump), a, 0x2000, variant ? 2 : 1, 0);
         const TraceEntry *out[8];
         DseSliceResult r = slice(&t, trigger, out, 8);
@@ -389,19 +389,19 @@ static void diagnostic_barriers(FILE *json) {
             ff_write(&a, 0x4000, 2, 4, true);
         uint32_t next = 0x1002 + sizes[variant];
         if (variant == 4) {
-            a.reg_vals[REG_RSP] = 0x4000;
+            a.reg_vals[DTA_REG_RSP] = 0x4000;
             ff_read(&a, 0x4000, next, 4, true);
         } else if (variant == 5) {
-            a.reg_vals[REG_RSP] = 0x4004;
+            a.reg_vals[DTA_REG_RSP] = 0x4004;
             ff_write(&a, 0x4000, next, 4, true);
         } else if (variant == 6) {
-            a.reg_vals[REG_RBX] = next;
+            a.reg_vals[DTA_REG_RBX] = next;
         }
         emit(&t, 0x1002, code[variant], sizes[variant], a, next, 1, 0);
         a = registers();
         const uint8_t dest[] = {0xb8, 0, 0x20, 0, 0}, jump[] = {0xff, 0xe0};
         emit(&t, next, dest, sizeof(dest), a, next + 5, 1, 0);
-        a.reg_vals[REG_RAX] = 0x2000;
+        a.reg_vals[DTA_REG_RAX] = 0x2000;
         uint64_t trigger = emit(&t, next + 5, jump, sizeof(jump), a, 0x2000, 1, 0);
         const TraceEntry *out[8];
         DseSliceResult r = slice(&t, trigger, out, 8);
@@ -442,14 +442,14 @@ static void imul_regions(void) {
         const uint8_t initial[] = {0xb8, 0, 0x20, 0, 0}, add[] = {0x83, 0xc0, 0};
         const uint8_t adc[] = {0x83, 0xd0, 0}, jump[] = {0xff, 0xe0};
         emit(&t, 0xffb, initial, sizeof(initial), a, 0x1000, 1, 0);
-        a.reg_vals[REG_RAX] = 0x2000;
+        a.reg_vals[DTA_REG_RAX] = 0x2000;
         a.eflags_before = 0x246;
         uint32_t join = 0x1002 + sizes[variant];
         branch_to(&t, 0x1000, a, 0x1002, 1, 0, 0, join);
         uint64_t multiply = emit(&t, 0x1002, code[variant], sizes[variant], a, join, 1, 0);
         const TraceEntry *entry = trace_find_seq(t.f.trace, multiply, NULL);
         const InsnDesc *desc = trace_insn_desc_get(t.f.trace, entry->insn_desc_id);
-        CHECK(desc->effects.register_defs == (UINT64_C(1) << (variant == 6 ? REG_RAX : REG_RDX)));
+        CHECK(desc->effects.register_defs == (UINT64_C(1) << (variant == 6 ? DTA_REG_RAX : DTA_REG_RDX)));
         uint64_t flags = trace_special_state_bit(X86_SPECIAL_STATE_CF) |
                          trace_special_state_bit(X86_SPECIAL_STATE_PF) |
                          trace_special_state_bit(X86_SPECIAL_STATE_AF) |
@@ -482,8 +482,8 @@ static void imul_regions(void) {
 static void nested_and_occurrences(void) {
     Fixture t = fixture(32);
     InsnAux a = registers();
-    a.reg_vals[REG_RCX] = 1;
-    a.reg_taint[REG_RCX] = 15;
+    a.reg_vals[DTA_REG_RCX] = 1;
+    a.reg_taint[DTA_REG_RCX] = 15;
     const uint8_t cmpc[] = {0x83, 0xf9, 0}, cmpb[] = {0x83, 0xfb, 0};
     const uint8_t one[] = {0xbb, 1, 0, 0, 0}, dest[] = {0xb8, 0, 0x20, 0, 0};
     const uint8_t jump[] = {0xff, 0xe0};
@@ -491,14 +491,14 @@ static void nested_and_occurrences(void) {
     expected[0] = emit(&t, 0x2000, cmpc, sizeof(cmpc), a, 0x2003, 1, 0);
     expected[1] = branch(&t, 0x2003, a, 0x200c, 1, 0, 0);
     expected[2] = emit(&t, 0x200c, one, sizeof(one), a, 0x2011, 1, 0);
-    a.reg_vals[REG_RBX] = 1;
+    a.reg_vals[DTA_REG_RBX] = 1;
     expected[3] = emit(&t, 0x2011, cmpb, sizeof(cmpb), a, 0x2014, 2, 0);
     const uint8_t back[] = {0xe9, 0xea, 0xff, 0xff, 0xff};
     emit(&t, 0x2014, back, sizeof(back), a, 0x2003, 2, 0);
     (void)branch(&t, 0x2003, a, 0x200c, 99, 1, 0);
     expected[4] = branch(&t, 0x2003, a, 0x200c, 2, 0, 0);
     expected[5] = emit(&t, 0x200c, dest, sizeof(dest), a, 0x2011, 2, 0);
-    a.reg_vals[REG_RAX] = 0x2000;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
     expected[6] = emit(&t, 0x2011, jump, sizeof(jump), a, 0x2000, 2, 0);
     const TraceEntry *out[16];
     DseSliceResult r = slice(&t, expected[6], out, 16);
@@ -516,7 +516,7 @@ static void boundaries_and_budgets(void) {
     for (unsigned i = 0; i < 10; ++i)
         emit(&t, 0x1000, nop, 1, a, 0x1001, 1, 0);
     uint64_t def = emit(&t, 0x1001, dest, sizeof(dest), a, 0x1006, 1, 0);
-    a.reg_vals[REG_RAX] = 0x2000;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
     uint64_t trigger = emit(&t, 0x1006, jump, sizeof(jump), a, 0x2000, 1, 0);
     const TraceEntry *out[16];
     DseSliceResult r = slice(&t, trigger, out, 16);
@@ -530,7 +530,7 @@ static void boundaries_and_budgets(void) {
     for (unsigned i = 0; i < DSE_MAX_CONTROL_SCAN + 1; ++i)
         emit(&t, 0x1000, nop, 1, a, 0x1001, 1, 0);
     emit(&t, 0x1001, dest, sizeof(dest), a, 0x1006, 1, 0);
-    a.reg_vals[REG_RAX] = 0x2000;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
     trigger = emit(&t, 0x1006, jump, sizeof(jump), a, 0x2000, 1, 0);
     r = slice(&t, trigger, out, 16);
     CHECK(r.status == DSE_SLICE_OK && !r.path_complete &&
@@ -542,7 +542,7 @@ static void boundaries_and_budgets(void) {
     for (unsigned i = 0; i <= DSE_MAX_PATH_CONSTRAINTS; ++i)
         branch(&t, 0x1000, a, 0x1009, i, 0, 0);
     emit(&t, 0x1009, dest, sizeof(dest), a, 0x100e, 1, 0);
-    a.reg_vals[REG_RAX] = 0x2000;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
     trigger = emit(&t, 0x100e, jump, sizeof(jump), a, 0x2000, 1, 0);
     const TraceEntry *large[MAX_SLICE];
     r = slice(&t, trigger, large, MAX_SLICE);
@@ -555,7 +555,7 @@ static void boundaries_and_budgets(void) {
     t = fixture(1024);
     a = registers();
     emit(&t, 0xffb, dest, sizeof(dest), a, 0x1000, 1, 0);
-    a.reg_vals[REG_RAX] = 0x2000;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
     a.eflags_before = 0x246;
     branch_to(&t, 0x1000, a, 0x1002, 1, 0, 0, 0x1002);
     for (unsigned i = 0; i < DCFG_REGION_MAX_NODES; ++i)
@@ -573,7 +573,7 @@ static void boundaries_and_budgets(void) {
     t = fixture(8192);
     a = registers();
     emit(&t, 0xffb, dest, sizeof(dest), a, 0x1000, 1, 0);
-    a.reg_vals[REG_RAX] = 0x2000;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
     uint32_t pc = 0x1000;
     a.eflags_before = 0x246;
     for (unsigned i = 0; i < DSE_MAX_PATH_CONSTRAINTS; ++i) {
@@ -704,10 +704,10 @@ static void closed_diamond(unsigned variant, bool open_prefix, bool memory_bound
     a.mem_reads[0].taint = 15;
     emit(&t, 0x0ff0, load, sizeof(load), a, 0x0ff5, 1, 0);
     a = registers();
-    a.reg_vals[REG_RAX] = 0x2000;
-    a.reg_taint[REG_RAX] = 15;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
+    a.reg_taint[DTA_REG_RAX] = 15;
     emit(&t, 0x0ff5, init, sizeof(init), a, 0x0ffa, 1, 0);
-    a.reg_vals[REG_RCX] = 2;
+    a.reg_vals[DTA_REG_RCX] = 2;
     emit(&t, 0x0ffa, entry, sizeof(entry), a, 0x1000, 1, 0);
     for (unsigned iteration = 0; iteration < 2; ++iteration) {
         emit(&t, 0x1000, cmp, sizeof(cmp), a, 0x1003, 1, 0);
@@ -715,7 +715,7 @@ static void closed_diamond(unsigned variant, bool open_prefix, bool memory_bound
         branch(&t, 0x1003, a, iteration ? 0x100c : 0x1005, 1, 0, 0);
         if (!iteration) {
             if (variant == 2)
-                ff_write(&a, 0x4000, a.reg_vals[REG_RAX], 4, true);
+                ff_write(&a, 0x4000, a.reg_vals[DTA_REG_RAX], 4, true);
             first_left = emit(&t, 0x1005,
                               variant == 1   ? clobber
                               : variant == 2 ? store
@@ -725,23 +725,23 @@ static void closed_diamond(unsigned variant, bool open_prefix, bool memory_bound
             a.mem_write_count = a.mem_write_total = 0;
             a.mem_write_range_valid = false;
             if (variant == 1) {
-                a.reg_vals[REG_RAX] = 0x9000;
-                a.reg_taint[REG_RAX] = 0;
+                a.reg_vals[DTA_REG_RAX] = 0x9000;
+                a.reg_taint[DTA_REG_RAX] = 0;
             } else if (variant != 2) {
-                a.reg_vals[REG_RDX] = 17;
+                a.reg_vals[DTA_REG_RDX] = 17;
             }
             emit(&t, 0x100a, join_left, sizeof(join_left), a, 0x1013, 1, 0);
         } else {
             emit(&t, 0x100c, right, sizeof(right), a, 0x1011, 1, 0);
-            a.reg_vals[REG_RDX] = 34;
+            a.reg_vals[DTA_REG_RDX] = 34;
             emit(&t, 0x1011, join_right, sizeof(join_right), a, 0x1013, 1, 0);
         }
         emit(&t, 0x1013, dec, sizeof(dec), a, 0x1014, 1, 0);
-        --a.reg_vals[REG_RCX];
+        --a.reg_vals[DTA_REG_RCX];
         a.eflags_before = iteration ? 0x247 : 0x202;
         branch_to(&t, 0x1014, a, iteration ? 0x1016 : 0x1000, 1, 0, 0, 0x1000);
     }
-    uint64_t target = a.reg_vals[REG_RAX];
+    uint64_t target = a.reg_vals[DTA_REG_RAX];
     const uint8_t memjump[] = {0xff, 0x22};
     uint32_t trigger_pc = 0x1016;
     if (memory_boundary) {
@@ -752,13 +752,13 @@ static void closed_diamond(unsigned variant, bool open_prefix, bool memory_bound
         trigger_pc += 2;
         target = 0x3000;
         a = registers();
-        a.reg_vals[REG_RAX] = target;
-        a.reg_taint[REG_RAX] = 15;
-        a.reg_vals[REG_RDX] = 34;
+        a.reg_vals[DTA_REG_RAX] = target;
+        a.reg_taint[DTA_REG_RAX] = 15;
+        a.reg_vals[DTA_REG_RDX] = 34;
         a.eflags_before = 0x247;
     }
     if (variant == 3)
-        ff_read(&a, a.reg_vals[REG_RDX], target, 4, true);
+        ff_read(&a, a.reg_vals[DTA_REG_RDX], target, 4, true);
     uint64_t trigger =
         emit(&t, trigger_pc, variant == 3 ? memjump : jump, sizeof(jump), a, target, 1, 0);
     CHECK(trace_record_control_transfer(t.f.trace, trigger, 0, PROV_LABEL_CLEAN));
@@ -778,7 +778,7 @@ static void closed_diamond(unsigned variant, bool open_prefix, bool memory_bound
     DseVerifyResult before =
         variant == 3 ? dse_verify_oep_candidate_mem_with_relevance(t.f.trace, t.f.aux, trigger, 34,
                                                                    target, NULL, t.f.decoder, &c)
-                     : dse_verify_oep_candidate_with_relevance(t.f.trace, t.f.aux, trigger, REG_RAX,
+                     : dse_verify_oep_candidate_with_relevance(t.f.trace, t.f.aux, trigger, DTA_REG_RAX,
                                                                target, NULL, t.f.decoder, &c);
     dse_set_control_pruning(true);
     DseSliceResult reduced =
@@ -788,7 +788,7 @@ static void closed_diamond(unsigned variant, bool open_prefix, bool memory_bound
     DseVerifyResult after =
         variant == 3 ? dse_verify_oep_candidate_mem_with_relevance(t.f.trace, t.f.aux, trigger, 34,
                                                                    target, NULL, t.f.decoder, &c)
-                     : dse_verify_oep_candidate_with_relevance(t.f.trace, t.f.aux, trigger, REG_RAX,
+                     : dse_verify_oep_candidate_with_relevance(t.f.trace, t.f.aux, trigger, DTA_REG_RAX,
                                                                target, NULL, t.f.decoder, &c);
     if (!before.replay_valid || !after.replay_valid)
         fprintf(stderr, "diamond %u before=%u/%u after=%u/%u\n", variant, before.reason,
@@ -936,14 +936,14 @@ static void descriptor_continuations(unsigned variant, FILE *json) {
     a.mem_reads[0].taint = 15;
     emit(&t, 0xffb, load, sizeof(load), a, 0x1000, 1, 0);
     a = registers();
-    a.reg_vals[REG_RAX] = 0x2000;
-    a.reg_taint[REG_RAX] = 15;
-    a.reg_vals[REG_RCX] = 1;
+    a.reg_vals[DTA_REG_RAX] = 0x2000;
+    a.reg_taint[DTA_REG_RAX] = 15;
+    a.reg_vals[DTA_REG_RCX] = 1;
     emit(&t, 0x1000, cmp, sizeof(cmp), a, 0x1003, 1, 0);
     a.eflags_before = 0x297;
     uint64_t decision = branch(&t, 0x1003, a, 0x100c, 1, 0, 0);
     emit(&t, 0x100c, right, sizeof(right), a, 0x1011, 1, 0);
-    a.reg_vals[REG_RDX] = 34;
+    a.reg_vals[DTA_REG_RDX] = 34;
     emit(&t, 0x1011, back, sizeof(back), a, 0x1013, 1, 0);
     uint64_t trigger = emit(&t, 0x1013, jump, sizeof(jump), a, 0x2000, 1, 0);
     if (variant == 2) {
@@ -963,11 +963,11 @@ static void descriptor_continuations(unsigned variant, FILE *json) {
     DseSliceResult full = slice(&t, trigger, out, 32);
     DseRelevanceContext c = context(&t);
     DseVerifyResult before = dse_verify_oep_candidate_with_relevance(
-        t.f.trace, t.f.aux, trigger, REG_RAX, 0x2000, NULL, t.f.decoder, &c);
+        t.f.trace, t.f.aux, trigger, DTA_REG_RAX, 0x2000, NULL, t.f.decoder, &c);
     dse_set_control_pruning(true);
     DseSliceResult reduced = slice(&t, trigger, out, 32);
     DseVerifyResult after = dse_verify_oep_candidate_with_relevance(
-        t.f.trace, t.f.aux, trigger, REG_RAX, 0x2000, NULL, t.f.decoder, &c);
+        t.f.trace, t.f.aux, trigger, DTA_REG_RAX, 0x2000, NULL, t.f.decoder, &c);
     CHECK(before.replay_valid && after.replay_valid);
     CHECK(before.verdict == after.verdict && before.candidate_query == after.candidate_query &&
           before.alternative_query == after.alternative_query);

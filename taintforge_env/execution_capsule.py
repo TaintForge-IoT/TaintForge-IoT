@@ -1,10 +1,4 @@
-"""Opt-in unified handoff experiment for the shipped single-thread i386 ELF.
-
-The native reader and wire protocol stay in experiments/execution_capsule_probe.
-This adapter binds their evidence to a real attempt, runs the controller in the
-same PID namespace as QEMU, and validates the result before attempt completion.
-An authorized handoff is NOT Phase 1 completion, analyzer quiescence or an OEP.
-"""
+"""Bind capsule handoff evidence to unified attempts."""
 from __future__ import annotations
 
 import argparse
@@ -44,12 +38,17 @@ def expected_exit(case):
 
 
 def bundle_profile(built):
+    if built.get("profile") == "input-static-i386-retirement-m3":
+        from .input_retirement import bundle_profile as input_profile
+        return input_profile(built)
     probe.require(built["plugin_api"] == 6, "Capsule requires API 6")
     result = {"profile": PROFILE, "plugin": "capsule/libcapsule_probe.so",
             "fixture": "capsule/guest_i386", "fixture_sha256": built["hashes"]["capsule_guest_i386"],
             "symbols": built["symbols"], "qemu_version": "11.0.1",
             "qemu_source_revision": built["qemu_source_revision"],
             "source_hashes": {key: built["hashes"][key] for key in ("probe.c", "guest.S", "qemu-plugin.h")}}
+    if "phase1_retirement" in built:
+        result["phase1_retirement"] = built["phase1_retirement"]
     if "lifecycle_plugin" in built:
         from .capsule_lifecycle import bundle_profile as owner_profile
         result["lifecycle"] = owner_profile(built)
@@ -57,6 +56,9 @@ def bundle_profile(built):
 
 
 def verify_profile(manifest):
+    if manifest["capsule"].get("profile") == "input-static-i386-retirement-m3":
+        from .input_retirement import verify_profile as verify_input_profile
+        return verify_input_profile(manifest)
     profile = manifest["capsule"]
     probe.require(isinstance(profile, dict) and profile.get("profile") == PROFILE and
                   profile.get("qemu_version") == "11.0.1" and manifest["plugin_api"] == 6,
@@ -68,9 +70,18 @@ def verify_profile(manifest):
                   inventory[profile["fixture"]]["sha256"] == profile.get("fixture_sha256"),
                   "Capsule fixture/plugin are not bound to the runtime bundle")
     symbols = profile.get("symbols", {})
-    probe.require(set(symbols) == {"capsule_point_one", "capsule_point_two", "capsule_buffer"} and
+    expected_symbols = {"capsule_point_one", "capsule_point_two", "capsule_buffer"}
+    if "phase1_retirement" in profile:
+        from .phase1_retirement import fixture
+        source, extra_symbols = fixture(profile["phase1_retirement"]["protocol"])
+        probe.require("lifecycle" not in profile and profile["phase1_retirement"] ==
+                      {"protocol": profile["phase1_retirement"]["protocol"], "guest_source_sha256": probe.sha(source)} and
+                      profile["source_hashes"]["guest.S"] == probe.sha(source),
+                      "Unbound Phase 1 retirement fixture")
+        expected_symbols.update(extra_symbols)
+    probe.require(set(symbols) == expected_symbols and
                   all(type(value) is int and 0 < value <= 0xfffffff0 for value in symbols.values()) and
-                  len(set(symbols.values())) == 3, "Invalid capsule observation addresses")
+                  len(set(symbols.values())) == len(expected_symbols), "Invalid capsule observation addresses")
     if "lifecycle" in profile:
         from .capsule_lifecycle import verify_profile as verify_owner
         verify_owner(profile["lifecycle"], inventory)
@@ -86,6 +97,9 @@ def settings(case="phase1-first", *, hold_ms=200, pause_ms=5000, total_ms=30000,
 
 
 def prepare_binding(context, temporary, manifest, phase1):
+    if manifest["capsule"].get("profile") == "input-static-i386-retirement-m3":
+        from .input_retirement import prepare_binding as prepare_input_binding
+        return prepare_input_binding(context, temporary, manifest, phase1)
     runtime = read_json(context.template_runtime_path)
     config = runtime.get("capsule", {})
     probe.require(config.get("profile") == PROFILE and runtime.get("network_mode") == "none",
@@ -104,8 +118,23 @@ def prepare_binding(context, temporary, manifest, phase1):
                    rootfs=str(context.execution_rootfs), run_dir=str(context.run_dir),
                    guest_binary=context.guest_binary, limitations=LIMITS)
     (temporary / "logs/capsule").mkdir()
-    probe.require(("lifecycle" in config) == ("lifecycle" in profile) == ("resources" in config),
-                  "Lifecycle settings, resource policy and bundled owner must be enabled together")
+    real_retirement = "phase1_retirement" in config
+    probe.require(real_retirement == ("phase1_retirement" in profile) and
+                  ("lifecycle" in config) == ("lifecycle" in profile) and
+                  ("resources" in config) == (real_retirement or "lifecycle" in config) and
+                  not (real_retirement and "lifecycle" in config),
+                  "Retirement settings, resource policy and bundle must agree")
+    if real_retirement:
+        binding["retirement_evidence_schema"] = 1
+        from .phase1_retirement import validate_settings
+        from .capsule_resources import validate
+        validate_settings(config["phase1_retirement"])
+        probe.require(config["phase1_retirement"]["protocol"] == profile["phase1_retirement"]["protocol"],
+                      "Retirement protocol differs from bundled fixture")
+        probe.require(config["case"] in {"phase1-first", "capsule-first"}, "Unsupported observer case for Phase 1 retirement")
+        validate(config["resources"])
+        binding["lifecycle_attempt"] = uuid.uuid4().hex
+        (temporary / "logs/capsule/phase1-retirement").mkdir()
     if "lifecycle" in config:
         from .capsule_lifecycle import settings as owner_settings
         from .capsule_resources import validate
@@ -127,14 +156,21 @@ CAPSULE_IPC=$(mktemp -d /tmp/tfc-unified.XXXXXXXX)
 mkdir -m 0700 {mount}
 mount --bind "$CAPSULE_IPC" {mount}
 """
+    binding_path = context.run_dir / 'config/capsule_binding.json'
+    # During staging only the temporary copy exists; the launch uses its final path.
+    runtime = read_json(context.template_runtime_path)
+    if 'hardening' in runtime.get('capsule', {}):
+        setup += f"""env PYTHONPATH={quote(str(Path(__file__).resolve().parents[1]))} \\
+{quote(sys.executable)} -m taintforge_env.capsule_hardening prepare \\
+--binding {quote(str(binding_path))} --ipc "$CAPSULE_IPC"
+"""
     cleanup = f"""umount -l {mount} >/dev/null 2>&1 || true
 rmdir {mount} >/dev/null 2>&1 || true
 if [[ -n "${{CAPSULE_IPC:-}}" ]]; then
-    rm -f -- "$CAPSULE_IPC/control.sock" "$CAPSULE_IPC/events.sock" "$CAPSULE_IPC/export.bin"
+    rm -f -- "$CAPSULE_IPC/control.sock" "$CAPSULE_IPC/events.sock" "$CAPSULE_IPC/export.bin" "$CAPSULE_IPC/phase1.sock" "$CAPSULE_IPC/observer.sock"
     rmdir -- "$CAPSULE_IPC" >/dev/null 2>&1 || true
 fi"""
-    # The outer timeout remains a last resort. Its firing cannot pass capsule
-    # finalization: a complete, independently validated supervisor result is needed.
+    # An outer timeout cannot pass finalization.
     execution = f"""timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \\
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \\
     PYTHONPATH={quote(str(Path(__file__).resolve().parents[1]))} \\
@@ -194,6 +230,9 @@ class Handoff:
 
 def verify_evidence(binding, result):
     """Run after QEMU exit, and again during independent attempt finalization."""
+    if "phase1_retirement" in binding["settings"]:
+        from .phase1_retirement import verify_attempt
+        return verify_attempt(binding, result)
     run = Path(binding["run_dir"])
     output = run / "logs/capsule"
     case = binding["settings"]["case"]
@@ -287,13 +326,12 @@ def verify_evidence(binding, result):
 
 def supervise(binding, ipc):
     """Runs inside the sandbox PID namespace; the worker alone owns the socket."""
+    if "input_retirement" in binding:
+        from .input_retirement import supervise as supervise_input
+        return supervise_input(binding, ipc)
     from .unified_runtime import verify_bundle
     run = Path(binding["run_dir"])
     output = run / "logs/capsule"
-    manifest = verify_bundle(run / "config/analyzer_runtime", binding["bundle_sha256"])
-    probe.require(manifest["capsule"] == binding["capsule"], "Capsule bundle/binding mismatch")
-    probe.require(probe.sha(Path(binding["rootfs"]) / binding["guest_binary"].lstrip("/")) ==
-                  binding["capsule"]["fixture_sha256"], "Controlled ELF changed before launch")
     config = binding["settings"]
     case = config["case"]
     total = 5000 if case == "total-timeout" else config["total_ms"]
@@ -304,32 +342,51 @@ def supervise(binding, ipc):
               "pid_scope": "sandbox_pid_namespace"}
     worker = process = parent = child = None
     owner_gate = None
+    permit_worker = permit_parent = permit_child = None
     started = time.monotonic()
+    stage = "preflight"
     try:
+        manifest = verify_bundle(run / "config/analyzer_runtime", binding["bundle_sha256"])
+        probe.require(manifest["capsule"] == binding["capsule"], "Capsule bundle/binding mismatch")
+        probe.require(probe.sha(Path(binding["rootfs"]) / binding["guest_binary"].lstrip("/")) ==
+                      binding["capsule"]["fixture_sha256"], "Controlled ELF changed before launch")
         if "resources" in config:
             from .capsule_resources import inspect_self
             result["resource_entry"] = inspect_self(binding)
         handoff = Handoff(binding)
+        if "phase1_retirement" in config:
+            from . import phase1_retirement
+            handoff = phase1_retirement.Transition(binding)
         if "lifecycle" in config:
             from . import capsule_lifecycle
             owner_gate = capsule_lifecycle.gate(binding, ipc)
             handoff = capsule_lifecycle.Transition(handoff, owner_gate)
         ctx = mp.get_context("fork")
         parent, child = ctx.Pipe()
+        if "phase1_retirement" in config:
+            permit_parent, permit_child = ctx.Pipe()
+            permit_worker = ctx.Process(target=phase1_retirement.permit_worker,
+                args=(Path(ipc) / "phase1.sock", permit_child, binding))
+            permit_worker.start()
+            permit_child.close()
+            probe.wait_worker_ready(permit_parent, "permit")
         endpoint = Path(ipc) / "control.sock"
         worker = ctx.Process(target=probe.control_worker,
             args=(str(endpoint), child, str(output), binding["capsule"]["symbols"], case, config["hold_ms"], total),
             kwargs={"fd_path": str(Path(binding["rootfs"]) / "capsule-fd.txt"), "transition": handoff})
         worker.start()
         child.close()
-        probe.require(parent.poll(5) and parent.recv() == "ready", "Capsule controller did not become ready")
+        probe.wait_worker_ready(parent, "observer")
         symbols = binding["capsule"]["symbols"]
         argument = ",".join(["/__taintforge/" + binding["capsule"]["plugin"],
             "socket=" + IPC_GUEST + "/control.sock", "p1=" + hex(symbols["capsule_point_one"]),
             "p2=" + hex(symbols["capsule_point_two"]), "buffer=" + hex(symbols["capsule_buffer"]),
             f"pause-ms={pause}", f"total-ms={total}", f"controller={worker.pid}"])
         phase1 = read_json(run / "config/phase1_binding.json")
-        plugins = [phase1["plugin_argument"], argument]
+        phase1_argument = phase1["plugin_argument"]
+        if permit_worker is not None:
+            phase1_argument += "," + ",".join(phase1_retirement.plugin_options(binding, IPC_GUEST, permit_worker.pid))
+        plugins = [phase1_argument, argument]
         if case == "capsule-first":
             plugins.reverse()
         if owner_gate is not None:
@@ -344,12 +401,18 @@ def supervise(binding, ipc):
             command += ["-plugin", plugin]
         command.append(binding["guest_binary"])
         result["command"] = command
+        result["expected_qemu_exit"] = (phase1_retirement.FAULTS[config["phase1_retirement"]["fault"]]
+            if permit_worker is not None else expected_exit(case))
+        stage = "qemu_start"
         with (run / "logs/qemu_strace.log").open("wb") as trace:
             process = subprocess.Popen(command, cwd=binding["rootfs"], close_fds=True, stderr=trace,
                                        env={"PATH": "/usr/bin:/bin", "HOME": "/", "LANG": "C", "LC_ALL": "C"})
             result.update(qemu_pid=process.pid, controller_pid=worker.pid)
             parent.send(process.pid)
+            if permit_parent is not None:
+                permit_parent.send(process.pid)
             try:
+                stage = "qemu_wait"
                 result["qemu_exit"] = process.wait(timeout=total / 1000 + 5)
             except subprocess.TimeoutExpired:
                 result["supervisor_kill"] = True
@@ -358,14 +421,21 @@ def supervise(binding, ipc):
         worker.join(timeout=4)
         probe.require(not worker.is_alive(), "Capsule controller did not terminate")
         result["controller_exit"] = worker.exitcode
-        # Capture while the privileged supervisor can still read mode-0600
-        # guest output. The ordinary runner later owns the logs, not the rootfs.
+        if permit_worker is not None:
+            permit_worker.join(timeout=1)
+            if config["phase1_retirement"]["fault"] != "missing-verdict":
+                probe.require(not permit_worker.is_alive() and permit_worker.exitcode == 0,
+                              "Retirement controller did not terminate")
+        # Capture mode-0600 output before dropping supervisor access.
         shutil.copyfile(Path(binding["rootfs"]) / "capsule-fd.txt", output / "capsule-fd.txt")
         if owner_gate is not None:
             capsule_lifecycle.capture_export(binding, ipc)
+        stage = "verification"
         result.update(verify_evidence(binding, result))
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"[-6000:]
+        result["failure"] = probe.execution_failure(exc, result, stage)
+        result["controller_failures"] = probe.saved_worker_failures(output)
     finally:
         if process is not None and process.poll() is None:
             result["supervisor_kill"] = True
@@ -376,7 +446,11 @@ def supervise(binding, ipc):
                 worker.kill()
             worker.join(timeout=3)
             result["controller_exit"] = worker.exitcode
-        for pipe in (parent, child):
+        if permit_worker is not None and permit_worker.pid is not None:
+            if permit_worker.is_alive():
+                permit_worker.kill()
+            permit_worker.join(timeout=3)
+        for pipe in (parent, child, permit_parent, permit_child):
             if pipe is not None:
                 pipe.close()
         if owner_gate is not None:
@@ -385,7 +459,7 @@ def supervise(binding, ipc):
                 capsule_lifecycle.capture_export(binding, ipc)
             except (OSError, RuntimeError) as exc:
                 result.update(status="failed", export_capture_error=str(exc))
-        for name in ("events.sock", "export.bin"):
+        for name in ("events.sock", "export.bin", "phase1.sock"):
             (Path(ipc) / name).unlink(missing_ok=True)
         (Path(ipc) / "control.sock").unlink(missing_ok=True)
         result["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -401,6 +475,9 @@ def finish_attempt(context, guest_exit_code):
     """Preserve abort evidence, fail the attempt, and prevent automatic reuse."""
     run = context.run_dir
     binding = read_json(run / "config/capsule_binding.json")
+    if "input_retirement" in binding:
+        from .input_retirement import finish_attempt as finish_input
+        return finish_input(context, guest_exit_code)
     summary = {"schema_version": 1, "profile": PROFILE, "status": "failed",
                **{key: binding[key] for key in IDENTITY}, "limitations": LIMITS}
     try:
@@ -419,6 +496,8 @@ def finish_attempt(context, guest_exit_code):
                                       for name in ("observations.jsonl", "supervisor.json")}
     except Exception as exc:
         summary.update(status="failed", error=f"{type(exc).__name__}: {exc}"[-6000:])
+        from .retirement_mappings import EvidenceInconclusive
+        summary["evidence_status"] = "inconclusive" if isinstance(exc, EvidenceInconclusive) else "failed"
         raise
     finally:
         probe.write_json(run / "config/capsule_result.json", summary)

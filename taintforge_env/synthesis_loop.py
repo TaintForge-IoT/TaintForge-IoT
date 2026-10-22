@@ -804,6 +804,17 @@ class EnvironmentSynthesisLoop:
         paths: list[Path] = []
         module_dir = Path(__file__).resolve().parent
         paths.extend(sorted(module_dir.glob("*.py")))
+        # The M3 controller and mapping predicates live in experiments. Bind
+        # these executable Python inputs as well, so resume cannot silently
+        # replace a verifier/controller while retaining the same native bundle.
+        runtime_path = self.config.template_run_dir / "config/runtime.json"
+        runtime = _load_json_object(runtime_path, "template runtime")
+        if runtime.get("capsule", {}).get("profile") == "input-static-i386-retirement-m3":
+            paths.extend(self.config.project_root / relative for relative in (
+                "experiments/retirement_observer/controller.py",
+                "experiments/execution_capsule_probe/controller.py",
+                "experiments/execution_capsule_retire/controller.py",
+            ))
         network_scripts = {
             "none": (),
             "controlled": (

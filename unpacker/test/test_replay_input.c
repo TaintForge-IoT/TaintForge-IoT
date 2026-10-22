@@ -27,7 +27,7 @@ static Fixture fixture_create(uint32_t capacity) {
 static InsnAux registers_before(uint64_t eax) {
   InsnAux aux = {0};
   aux.reg_value_valid_mask = (1U << REG_COUNT) - 1U;
-  aux.reg_vals[REG_RAX] = eax;
+  aux.reg_vals[DTA_REG_RAX] = eax;
   aux.eflags_valid = true;
   aux.eflags_before = 2;
   return aux;
@@ -75,11 +75,11 @@ static void test_replay_after_source_destruction(void) {
   uint64_t selected[2];
   selected[0] = emit(&f, 0x1000, mov, sizeof(mov), 1, 3, &aux);
   finish(&f, selected[0], 0x1005);
-  aux.reg_vals[REG_RAX] = 0x12340078;
-  aux.reg_taint[REG_RAX] = 0xf;
+  aux.reg_vals[DTA_REG_RAX] = 0x12340078;
+  aux.reg_taint[DTA_REG_RAX] = 0xf;
   selected[1] = emit(&f, 0x1005, ah, sizeof(ah), 1, 3, &aux);
   finish(&f, selected[1], 0x1007);
-  aux.reg_vals[REG_RAX] = 0x12345678;
+  aux.reg_vals[DTA_REG_RAX] = 0x12345678;
   uint64_t trigger = emit(&f, 0x1007, jmp, sizeof(jmp), 1, 3, &aux);
 
   ReplayInputStatus status;
@@ -99,7 +99,7 @@ static void test_replay_after_source_destruction(void) {
   finish(&f, trigger, 0x12345678);
   dse_lift_attach(f.trace, f.ring, &dse_arch_x86);
   DseVerifyResult result = dse_verify_oep_candidate(f.trace, f.ring, trigger,
-      REG_RAX, 0x12345678, NULL, f.cs);
+      DTA_REG_RAX, 0x12345678, NULL, f.cs);
   assert(result.replay_valid && result.lifted_total == 3 && result.aux_miss == 0);
 
   /* Rewrite the same PC, with new bytes/generation, and evict all saved slots. */
@@ -117,7 +117,7 @@ static void test_replay_after_source_destruction(void) {
   assert(dse_lift_replay_step(&ctx, input, 0, f.cs));
   assert(dse_lift_replay_step(&ctx, input, 1, f.cs));
   SymExpr *target = dse_read_rid_fit(&ctx, replay_input_aux(input, trigger),
-                                    REG_RAX, 32, 32);
+                                    DTA_REG_RAX, 32, 32);
   uint64_t value = 0;
   assert(target && dse_eval_expr_observed(&ctx, target, &value) == DSE_REPLAY_EVAL_OK);
   assert(value == 0x12345678);
@@ -137,9 +137,9 @@ static void test_rep_payload_and_budget(void) {
   const uint8_t movs[] = {0xf3, 0xa4};
   const uint8_t jmp[] = {0xff, 0xe0};
   InsnAux aux = registers_before(0x401000);
-  aux.reg_vals[REG_RCX] = 10;
-  aux.reg_vals[REG_RSI] = 0x2000;
-  aux.reg_vals[REG_RDI] = 0x3000;
+  aux.reg_vals[DTA_REG_RCX] = 10;
+  aux.reg_vals[DTA_REG_RSI] = 0x2000;
+  aux.reg_vals[DTA_REG_RDI] = 0x3000;
   aux.execution_complete = true;
   aux.next_pc_valid = true;
   aux.next_pc = 0x1002;
@@ -222,7 +222,7 @@ static void test_memory_target_replay(void) {
   const uint8_t store[] = {0xa3, 0x00, 0x30, 0x00, 0x00};
   const uint8_t jump[] = {0xff, 0x25, 0x00, 0x30, 0x00, 0x00};
   InsnAux writer = registers_before(0x401000);
-  writer.reg_taint[REG_RAX] = 0xf;
+  writer.reg_taint[DTA_REG_RAX] = 0xf;
   writer.has_mem_write = true;
   writer.mem_write_addr = 0x3000;
   writer.mem_write_size = 4;

@@ -29,19 +29,73 @@ def prepare(args) -> dict:
         raise ValueError("--replay-store is required only with --network replay")
     if min(args.timeout, args.max_iterations, args.max_steps) < 1:
         raise ValueError("timeout and iteration limits must be positive")
+    input_config = None
+    if args.retire_phase1:
+        from taintforge_env import input_retirement
+        from taintforge_env.capsule_resources import preflight
+        if not args.binary or args.capsule_probe or args.capsule_lifecycle or args.capsule_phase1_retirement:
+            raise ValueError("--retire-phase1 requires --binary and cannot select a built-in capsule fixture")
+        if args.network != "none" or args.phase1_option or args.extra_library or args.library_dir:
+            raise ValueError("M3 requires network=none, no extra libraries and bound Phase 1 selection settings")
+        if (args.capsule_case is not None or args.capsule_owner_mode != "remove" or
+            args.capsule_owner_order != "after" or args.capsule_retirement_fault != "none" or
+            args.capsule_retirement_trigger != "boundary" or args.capsule_selection_delay != 16):
+            raise ValueError("Built-in fixture options cannot be combined with --retire-phase1")
+        input_retirement.inspect_input(args.binary.expanduser())
+        input_config = input_retirement.settings(hold_ms=args.capsule_hold_ms,
+            pause_ms=args.capsule_pause_ms, total_ms=args.capsule_total_ms, timeout=args.timeout,
+            memory_mib=args.capsule_memory_mib, selection_delay=args.retirement_selection_delay,
+            max_instructions=args.retirement_max_insns)
+        if args.capsule_hardening:
+            from taintforge_env.capsule_hardening import policy
+            input_config = input_retirement.settings(hold_ms=args.capsule_hold_ms,
+                pause_ms=args.capsule_pause_ms, total_ms=args.capsule_total_ms, timeout=args.timeout,
+                memory_mib=args.capsule_memory_mib, selection_delay=args.retirement_selection_delay,
+                max_instructions=args.retirement_max_insns, hardening=policy(analysis_mib=args.analysis_memory_mib,
+                    export_mib=args.export_mib, journal_mib=args.journal_mib, uid=args.execution_uid, gid=args.execution_gid))
+        preflight()
+        args.phase1_option = ["tf-selection-delay=" + str(args.retirement_selection_delay)]
+    elif args.retirement_selection_delay != 16 or args.retirement_max_insns != 10000000:
+        raise ValueError("M3 retirement settings require --retire-phase1")
+    if not args.retire_phase1 and (args.capsule_hardening or args.analysis_memory_mib != 512 or
+        args.export_mib != 256 or args.journal_mib != 32 or args.execution_uid != 65534 or args.execution_gid != 65534):
+        raise ValueError('M4 hardening requires --retire-phase1')
+    if not args.capsule_hardening and (args.analysis_memory_mib != 512 or args.export_mib != 256 or
+        args.journal_mib != 32 or args.execution_uid != 65534 or args.execution_gid != 65534):
+        raise ValueError('M4 budget and credential options require --capsule-hardening')
+    if args.capsule_phase1_retirement:
+        if args.capsule_lifecycle:
+            raise ValueError("Select real Phase 1 retirement or fixture-owner lifecycle")
+        args.capsule_probe = True
+    elif (args.capsule_retirement_fault != "none" or args.capsule_retirement_trigger != "boundary" or
+          args.capsule_selection_delay != 16):
+        raise ValueError("retirement options require --capsule-phase1-retirement")
     if args.capsule_lifecycle:
         args.capsule_probe = True
-    elif args.capsule_owner_mode != "remove" or args.capsule_owner_order != "after" or args.capsule_memory_mib != 1024:
+    elif args.capsule_owner_mode != "remove" or args.capsule_owner_order != "after" or (args.capsule_memory_mib != 1024 and not (args.capsule_phase1_retirement or args.retire_phase1)):
         raise ValueError("owner and resource options require --capsule-lifecycle")
     if bool(args.binary) == bool(args.capsule_probe):
         raise ValueError("select exactly one of --binary or --capsule-probe")
-    capsule_config = None
+    capsule_config = input_config
     if args.capsule_probe:
         from taintforge_env.execution_capsule import settings
         if args.network != "none" or args.max_iterations != 1 or args.max_steps != 1:
             raise ValueError("--capsule-probe requires --network none --max-iterations 1 --max-steps 1")
         capsule_config = settings(args.capsule_case or "phase1-first", hold_ms=args.capsule_hold_ms,
                                   pause_ms=args.capsule_pause_ms, total_ms=args.capsule_total_ms, timeout=args.timeout)
+        if args.capsule_phase1_retirement:
+            from taintforge_env.phase1_retirement import settings as retirement_settings
+            from taintforge_env.capsule_resources import policy, preflight
+            if capsule_config["case"] not in {"phase1-first", "capsule-first"}:
+                raise ValueError("Phase 1 retirement has its own fault suite")
+            if args.phase1_option:
+                raise ValueError("The first Phase 1 retirement profile fixes its analysis options")
+            capsule_config["phase1_retirement"] = retirement_settings(args.capsule_retirement_fault,
+                trigger=args.capsule_retirement_trigger, selection_delay=args.capsule_selection_delay)
+            args.phase1_option = ["tf-selection-delay=" + ("100000000" if args.capsule_retirement_fault == "missing-verdict"
+                                                         else str(args.capsule_selection_delay))]
+            capsule_config["resources"] = policy(args.capsule_memory_mib, args.timeout + 10)
+            preflight()
         if args.capsule_lifecycle:
             from taintforge_env.capsule_lifecycle import settings as owner_settings
             from taintforge_env.capsule_resources import policy, preflight
@@ -57,7 +111,11 @@ def prepare(args) -> dict:
     binary = args.binary.expanduser().resolve(strict=True) if args.binary else None
     if capsule_config is not None:
         from experiments.execution_capsule_probe import controller as probe
-        probe.load_phase1(PROJECT_ROOT, plugin, qemu)
+        loaded = probe.load_phase1(PROJECT_ROOT, plugin, qemu)
+        if args.capsule_phase1_retirement or args.retire_phase1:
+            from taintforge_env.phase1_retirement import check_runtime
+            _, selected_runtime, _ = loaded
+            check_runtime(selected_runtime, trigger="verdict" if args.retire_phase1 else args.capsule_retirement_trigger)
     policy = load_network_policy(args.network_policy) if args.network_policy else None
     dns_server = args.dns_server
     if dns_server is None and policy is not None:
@@ -69,13 +127,21 @@ def prepare(args) -> dict:
     out.mkdir(parents=True)
     capsule_build = None
     if capsule_config is not None:
-        if args.capsule_lifecycle:
+        if args.retire_phase1:
+            from experiments.retirement_observer.controller import build_plugin
+            capsule_build = build_plugin(out / "capsule_build")
+            capsule_build["profile"] = input_retirement.PROFILE
+        elif args.capsule_phase1_retirement:
+            from taintforge_env.phase1_retirement import build
+            capsule_build = build(out / "capsule_build", trigger=args.capsule_retirement_trigger)
+        elif args.capsule_lifecycle:
             from experiments.execution_capsule_lifecycle import controller as lifecycle
             lifecycle.audit(PROJECT_ROOT)
             capsule_build = lifecycle.build(out / "capsule_build")
         else:
             capsule_build = probe.build(out / "capsule_build")
-        binary = Path(capsule_build["guest"])
+        if not args.retire_phase1:
+            binary = Path(capsule_build["guest"])
     template = out / "template"
     rootfs = template / "rootfs"
     for name in ("proc", "dev", "tmp", "bin", "etc", "var/tmp", "run", "root"):
@@ -85,6 +151,15 @@ def prepare(args) -> dict:
     guest = "/bin/sample.elf"
     guest_runtime = provision_guest(binary, rootfs, sysroot=args.sysroot.expanduser(),
                                      binary_guest_path=guest, library_dirs=args.library_dir, extra_libraries=args.extra_library)
+    if args.retire_phase1:
+        # Keep a stable original input for every fresh attempt and later resume.
+        # The caller may move the source after preparation; captured memory is
+        # never used as the next executable.
+        from taintforge_env.elf_runtime import copy_file
+        saved_input = out / "input/sample.elf"
+        copy_file(rootfs / guest.lstrip("/"), saved_input,
+                  expected=guest_runtime["target"]["sha256"], executable=True)
+        binary = saved_input
     if guest_runtime["target"]["arch"] != "i386":
         raise ValueError("the Phase 1 v1 integration profile supports Linux i386 ELF only")
     config = template / "config"
@@ -192,11 +267,27 @@ def parser():
     commands = result.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="prepare a fresh environment and run the original ELF")
     run.add_argument("--binary", type=Path)
+    run.add_argument("--retire-phase1", action="store_true",
+        help="M3: static i386 input, current heuristic verdict, independent observer and fresh repair attempts")
+    run.add_argument("--retirement-selection-delay", type=int, default=16)
+    run.add_argument("--retirement-max-insns", type=int, default=10000000)
     run.add_argument("--capsule-probe", action="store_true", help="experimental handoff with the built-in controlled i386 ELF")
     run.add_argument("--capsule-lifecycle", action="store_true", help="run the controlled ELF with verified owner retirement and cgroup limits")
+    run.add_argument("--capsule-phase1-retirement", action="store_true", help="retire the real Phase 1 after a verified export, on the controlled ELF")
+    run.add_argument("--capsule-retirement-trigger", choices=("boundary", "verdict"), default="boundary",
+                     help="v1 fixed fixture boundary or v2 next instruction after live OEP selection")
+    run.add_argument("--capsule-selection-delay", type=int, default=16,
+                     help="controlled verdict fixture selection delay (1..256)")
+    run.add_argument("--capsule-retirement-fault", choices=("none", "deny", "stale-permit", "bad-digest", "disconnect", "timeout", "missing-verdict"), default="none")
     run.add_argument("--capsule-owner-mode", choices=("remove", "keep", "leak-arena", "bad-export"), default="remove")
     run.add_argument("--capsule-owner-order", choices=("before", "after"), default="after")
     run.add_argument("--capsule-memory-mib", type=int, default=1024)
+    run.add_argument('--capsule-hardening', action='store_true')
+    run.add_argument('--analysis-memory-mib', type=int, default=512)
+    run.add_argument('--export-mib', type=int, default=256)
+    run.add_argument('--journal-mib', type=int, default=32)
+    run.add_argument('--execution-uid', type=int, default=65534)
+    run.add_argument('--execution-gid', type=int, default=65534)
     run.add_argument("--capsule-case", choices=("phase1-first", "capsule-first", "timeout-1", "timeout-2",
         "disconnect-1", "disconnect-2", "kill-controller-1", "kill-controller-2", "bad-command", "slow-command", "total-timeout"))
     run.add_argument("--capsule-hold-ms", type=int, default=200)

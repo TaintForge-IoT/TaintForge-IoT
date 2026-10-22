@@ -800,14 +800,26 @@ void tf_concolic_instruction(TfConcolic *run, const TraceBuffer *trace, const Ds
         run->selected_seq = seq;
 }
 
+bool tf_concolic_finish(TfConcolic *run) {
+    if (!run || !run->report)
+        return true;
+    bool ok = true;
+    if (!run->finished &&
+        fprintf(run->report, "{\"schema\":%u,\"status\":\"UNKNOWN\",\"reason\":\"%s\"}\n",
+                run->guest_file ? 2U : 1U,
+                run->failure ? run->failure : "selected_branch_not_reached") < 0)
+        ok = false;
+    if (fclose(run->report))
+        ok = false;
+    run->report = NULL;
+    run->finished = true;
+    return ok;
+}
+
 void tf_concolic_destroy(TfConcolic *run) {
     if (!run)
         return;
-    if (!run->finished)
-        fprintf(run->report, "{\"schema\":%u,\"status\":\"UNKNOWN\",\"reason\":\"%s\"}\n",
-                run->guest_file ? 2U : 1U,
-                run->failure ? run->failure : "selected_branch_not_reached");
-    if (fclose(run->report))
+    if (!tf_concolic_finish(run))
         fprintf(stderr, "[CONCOLIC] report close failed\n");
     free(run->guest_file);
     free(run->file_bytes);

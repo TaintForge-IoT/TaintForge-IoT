@@ -1,8 +1,4 @@
-"""Resource limits around the existing privileged unified sandbox.
-
-The transient system service owns the complete namespace process tree. This
-does not separate guest memory from analyzer memory inside the QEMU process.
-"""
+"""Resource limits for the unified sandbox."""
 from __future__ import annotations
 
 import json

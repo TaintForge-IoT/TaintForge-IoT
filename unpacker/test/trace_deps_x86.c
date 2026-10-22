@@ -120,8 +120,8 @@ bool trace_deps_x86_build(const TraceEntry *entry, const InsnDesc *desc, const I
          aux->string_summary.element_size != meta->string_element_size ||
          aux->string_summary.has_rep_prefix != meta->has_rep_prefix ||
          (meta->has_rep_prefix &&
-          (!(aux->reg_value_valid_mask & (1U << REG_RCX)) ||
-           aux->string_summary.expected_iterations != (uint32_t)aux->reg_vals[REG_RCX])))) {
+          (!(aux->reg_value_valid_mask & (1U << DTA_REG_RCX)) ||
+           aux->string_summary.expected_iterations != (uint32_t)aux->reg_vals[DTA_REG_RCX])))) {
         (void)trace_deps_build(NULL, occurrence, register_width, out);
         out->incomplete_reasons |= TRACE_DEPS_IDENTITY_MISMATCH;
         return false;
@@ -139,17 +139,17 @@ bool trace_deps_x86_build(const TraceEntry *entry, const InsnDesc *desc, const I
         /* Linux i386 ABI effects are not present in Capstone's INT metadata.
          * Retain the boundary even when its EAX result looks untainted. The
          * lifter still rejects every call without an explicit model. */
-        out->may_write[REG_RAX] = UINT32_MAX;
-        out->must_write[REG_RAX] = UINT32_MAX;
-        out->value_uses[REG_RAX] = out->explicit_value_uses[REG_RAX] = UINT32_MAX;
+        out->may_write[DTA_REG_RAX] = UINT32_MAX;
+        out->must_write[DTA_REG_RAX] = UINT32_MAX;
+        out->value_uses[DTA_REG_RAX] = out->explicit_value_uses[DTA_REG_RAX] = UINT32_MAX;
         if (aux->syscall && (aux->syscall->number == 90 || aux->syscall->number == 6))
-            out->value_uses[REG_RBX] = out->explicit_value_uses[REG_RBX] = UINT32_MAX;
+            out->value_uses[DTA_REG_RBX] = out->explicit_value_uses[DTA_REG_RBX] = UINT32_MAX;
         if (aux->syscall && (aux->syscall->number == 93 || aux->syscall->number == 125 ||
                              aux->syscall->number == 356 || aux->syscall->number == 4)) {
-            out->value_uses[REG_RBX] = out->explicit_value_uses[REG_RBX] = UINT32_MAX;
-            out->value_uses[REG_RCX] = out->explicit_value_uses[REG_RCX] = UINT32_MAX;
+            out->value_uses[DTA_REG_RBX] = out->explicit_value_uses[DTA_REG_RBX] = UINT32_MAX;
+            out->value_uses[DTA_REG_RCX] = out->explicit_value_uses[DTA_REG_RCX] = UINT32_MAX;
             if (aux->syscall->number == 125 || aux->syscall->number == 4)
-                out->value_uses[REG_RDX] = out->explicit_value_uses[REG_RDX] = UINT32_MAX;
+                out->value_uses[DTA_REG_RDX] = out->explicit_value_uses[DTA_REG_RDX] = UINT32_MAX;
         }
     }
 
@@ -177,7 +177,7 @@ bool trace_deps_x86_build(const TraceEntry *entry, const InsnDesc *desc, const I
         if (!meta->has_rep_prefix) {
             promote_writes(out);
         } else if ((dse_aux_has_exact_movs(aux) || dse_aux_has_exact_stos(aux)) &&
-                   !(aux->reg_taint[REG_RCX] & 0xfU)) {
+                   !(aux->reg_taint[DTA_REG_RCX] & 0xfU)) {
             if (aux->string_summary.expected_iterations)
                 promote_writes(out);
             else
@@ -237,32 +237,32 @@ uint64_t trace_deps_x86_forced_value_regs(const InsnMeta *meta, const uint8_t ne
     case X86_INS_PUSHFQ:
     case X86_INS_CALL:
     case X86_INS_RET:
-        if (needed[REG_RSP] & natural_mask)
-            forced |= UINT64_C(1) << REG_RSP;
+        if (needed[DTA_REG_RSP] & natural_mask)
+            forced |= UINT64_C(1) << DTA_REG_RSP;
         break;
     case X86_INS_LEAVE:
-        if (needed[REG_RSP] & natural_mask)
-            forced |= UINT64_C(1) << REG_RBP;
+        if (needed[DTA_REG_RSP] & natural_mask)
+            forced |= UINT64_C(1) << DTA_REG_RBP;
         break;
     case X86_INS_MOVSB:
     case X86_INS_MOVSW:
     case X86_INS_MOVSD:
     case X86_INS_MOVSQ:
-        if (needed[REG_RSI] & natural_mask)
-            forced |= UINT64_C(1) << REG_RSI;
-        if (needed[REG_RDI] & natural_mask)
-            forced |= UINT64_C(1) << REG_RDI;
+        if (needed[DTA_REG_RSI] & natural_mask)
+            forced |= UINT64_C(1) << DTA_REG_RSI;
+        if (needed[DTA_REG_RDI] & natural_mask)
+            forced |= UINT64_C(1) << DTA_REG_RDI;
         break;
     case X86_INS_STOSB:
     case X86_INS_STOSW:
     case X86_INS_STOSD:
     case X86_INS_STOSQ:
-        if (needed[REG_RDI] & natural_mask)
-            forced |= UINT64_C(1) << REG_RDI;
+        if (needed[DTA_REG_RDI] & natural_mask)
+            forced |= UINT64_C(1) << DTA_REG_RDI;
         break;
     case X86_INS_SCASD:
-        if (insn_meta_is_plain_scasd(meta) && (needed[REG_RDI] & natural_mask))
-            forced |= UINT64_C(1) << REG_RDI;
+        if (insn_meta_is_plain_scasd(meta) && (needed[DTA_REG_RDI] & natural_mask))
+            forced |= UINT64_C(1) << DTA_REG_RDI;
         break;
     default:
         break;

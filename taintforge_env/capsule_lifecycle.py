@@ -1,8 +1,4 @@
-"""Bind the reviewed retirement fixture to a unified execution attempt.
-
-Phase 1 remains active. Only the explicitly bundled fixture owner is retired.
-Live checks use the sandbox proc mount; saved checks revalidate their artifacts.
-"""
+"""Bind fixture retirement to a unified attempt."""
 from __future__ import annotations
 
 import hashlib

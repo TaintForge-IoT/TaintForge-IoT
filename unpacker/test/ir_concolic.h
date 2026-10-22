@@ -83,5 +83,7 @@ void tf_concolic_return_bytes(TfConcolic *run, unsigned vcpu, int64_t number, in
 bool tf_concolic_read_address(const TfConcolic *run, uint32_t *address);
 void tf_concolic_return(TfConcolic *run, unsigned vcpu, int64_t number, int64_t returned,
                         bool byte_valid, uint8_t byte);
+/* Finalize the report before hashing exports; keep owned memory until removal. */
+bool tf_concolic_finish(TfConcolic *run);
 void tf_concolic_destroy(TfConcolic *run);
 #endif

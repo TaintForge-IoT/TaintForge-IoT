@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded controller/supervisor for the benign Execution Capsule probe.
-
-Linux only. One module intentionally owns build, source audit, IPC and reports.
-The controller is a separate child, so killing it does not kill the supervisor
-that must reap QEMU and distinguish plugin exit from an external fallback kill.
-"""
+"""Controller and supervisor for the benign capsule probe."""
 from __future__ import annotations
 
 import argparse
@@ -38,6 +33,67 @@ CASES = (
 
 class ProbeError(RuntimeError):
     pass
+
+
+class WorkerStartupError(ProbeError):
+    def __init__(self, failure):
+        self.failure = failure
+        super().__init__(f"{failure['component']} startup at {failure['stage']}: "
+                         f"{failure['exception_type']}: {failure['message']}")
+
+
+def worker_failure(exc, component, stage, ready=False):
+    return {"category": "controller_failure" if ready else "startup_failure",
+            "component": component, "stage": stage, "exception_type": type(exc).__name__,
+            "errno": exc.errno if isinstance(exc, OSError) else None, "message": str(exc)[:3000]}
+
+
+def send_startup_failure(pipe, failure):
+    try:
+        pipe.send({"status": "startup_failed", "failure": failure})
+    except (OSError, EOFError):
+        pass  # The parent may already have terminated; the worker report remains.
+
+
+def wait_worker_ready(pipe, component, timeout=5):
+    try:
+        if not pipe.poll(timeout):
+            raise TimeoutError("Controller readiness deadline expired")
+        message = pipe.recv()
+    except (EOFError, OSError) as exc:
+        raise WorkerStartupError(worker_failure(exc, component, "readiness")) from exc
+    if isinstance(message, dict) and message.get("status") == "startup_failed":
+        raise WorkerStartupError(message["failure"])
+    require(message == "ready", component + " returned an invalid readiness message")
+
+
+def execution_failure(exc, result, stage):
+    if isinstance(exc, WorkerStartupError):
+        return exc.failure
+    if result.get("supervisor_kill") or isinstance(exc, subprocess.TimeoutExpired):
+        category = "execution_timeout"
+    elif result.get("qemu_pid") is None:
+        category = "startup_failure"
+    elif result.get("qemu_exit") not in {None, result.get("expected_qemu_exit", 0)}:
+        category = "guest_failure"
+    else:
+        category = "evidence_failure" if stage == "verification" else "controller_failure"
+    return {**worker_failure(exc, "supervisor", stage), "category": category}
+
+
+def saved_worker_failures(directory):
+    failures = []
+    for name in ("controller.json", "phase1-retirement/retirement.json"):
+        path = Path(directory) / name
+        try:
+            if path.stat().st_size > 256 * 1024:
+                continue
+            record = json.loads(path.read_text())
+            if isinstance(record, dict) and isinstance(record.get("failure"), dict):
+                failures.append(record["failure"])
+        except (OSError, ValueError):
+            pass
+    return failures
 
 
 def require(condition, message):
@@ -106,7 +162,7 @@ def install(repo):
     print(destination)
 
 
-def build(out):
+def build(out, *, guest_source=None, extra_symbols=()):
     out = Path(out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     baseline = json.loads((HERE / "BASELINE.json").read_text())
@@ -117,22 +173,23 @@ def build(out):
     command("cc", "-std=c11", "-O2", "-g", "-Wall", "-Wextra", "-Werror", "-Wformat=2",
             "-Wshadow", "-fPIC", "-fvisibility=hidden", "-shared", "-pthread",
             "-Wl,-z,relro,-z,now", "-I", HERE / "vendor", HERE / "probe.c", "-o", plugin, *flags)
-    command("as", "--32", HERE / "guest.S", "-o", out / "guest.o")
+    guest_source = Path(guest_source) if guest_source is not None else HERE / "guest.S"
+    command("as", "--32", guest_source, "-o", out / "guest.o")
     guest = out / "capsule_guest_i386"
     command("ld", "-m", "elf_i386", "-z", "noexecstack", "--build-id=none",
             out / "guest.o", "-o", guest)
     symbols = {}
     for line in command("nm", "-P", "--defined-only", guest).splitlines():
         fields = line.split()
-        if fields[0] in {"capsule_point_one", "capsule_point_two", "capsule_buffer"}:
+        if fields[0] in {"capsule_point_one", "capsule_point_two", "capsule_buffer", *extra_symbols}:
             symbols[fields[0]] = int(fields[2], 16)
-    require(len(symbols) == 3, "Missing fixture symbols")
+    require(len(symbols) == 3 + len(extra_symbols), "Missing fixture symbols")
     elf = guest.read_bytes()
     require(elf[:7] == b"\x7fELF\x01\x01\x01" and struct.unpack_from("<HH", elf, 16) == (2, 3),
             "Fixture must be little-endian i386 ET_EXEC")
     require("INTERP" not in command("readelf", "-lW", guest), "Fixture unexpectedly uses a loader")
     result = {"plugin": str(plugin), "guest": str(guest), "symbols": symbols,
-              "hashes": {p.name: sha(p) for p in (plugin, guest, HERE / "probe.c", HERE / "guest.S", header)},
+              "hashes": {p.name: sha(p) for p in (plugin, guest, HERE / "probe.c", guest_source, header)},
               "compiler": command("cc", "--version").splitlines()[0],
               "glib": command("pkg-config", "--modversion", "glib-2.0").strip(),
               "qemu_source_revision": baseline["qemu_revision"], "plugin_api": 6}
@@ -195,21 +252,29 @@ def control_worker(endpoint, pipe, directory, symbols, case, hold_ms, total_ms,
     """This process owns the only listening/accepted control sockets."""
     directory = Path(directory)
     result = {"case": case, "status": "failed"}
-    connection = None
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection = listener = None
+    ready = False
+    stage = "socket"
     try:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stage = "bind"
         listener.bind(endpoint)
         os.chmod(endpoint, 0o600)
         listener.listen(1)
         listener.settimeout(total_ms / 1000 + 3)
         pipe.send("ready")
+        ready = True
+        stage = "qemu_pid"
         require(pipe.poll(total_ms / 1000 + 3), "Missing QEMU PID")
         qpid = pipe.recv()
+        stage = "accept"
         connection, _ = listener.accept()
         listener.close()
+        stage = "peer_identity"
         peer_pid, peer_uid, _ = struct.unpack("3i", connection.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
         require((peer_pid, peer_uid) == (qpid, os.getuid()), "Unexpected QEMU peer")
+        stage = "observations"
         frames = Frames(connection, time.monotonic() + total_ms / 1000 + 4)
         first = None
         with (directory / "observations.jsonl").open("w") as journal:
@@ -291,10 +356,17 @@ def control_worker(endpoint, pipe, directory, symbols, case, hold_ms, total_ms,
             result.update(status="passed", action="two_resumes")
     except BaseException as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["failure"] = worker_failure(exc, "observer", stage, ready)
+        if not ready:
+            try:
+                write_json(directory / "controller.json", result)
+            finally:
+                send_startup_failure(pipe, result["failure"])
     finally:
         if connection:
             connection.close()
-        listener.close()
+        if listener is not None:
+            listener.close()
         pipe.close()
         write_json(directory / "controller.json", result)
 
@@ -342,7 +414,7 @@ def run_case(case, directory, built, qemu, runtime, phase1_cls, hold_ms, pause_m
                 built["symbols"], case, hold_ms, effective_total), kwargs={"transition": transition})
             worker.start()
             child_pipe.close()
-            require(parent_pipe.poll(5) and parent_pipe.recv() == "ready", "Controller did not become ready")
+            wait_worker_ready(parent_pipe, "observer")
             capsule_arg = ",".join([
                 built["plugin"], "socket=" + endpoint,
                 "p1=" + hex(built["symbols"]["capsule_point_one"]),

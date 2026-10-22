@@ -141,7 +141,7 @@ class Phase1Run:
             options.append(f"x86-flags-receipt={receipt}")
         options.extend(f"tf-{'ir-report' if key == 'ir' else key}={path}" for key, path in self.paths.items())
         options.append(f"ir-check={'on' if ir else 'off'}")
-        allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-tls32", "ir-observed-munmap", "ir-observed-mprotect", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates"}
+        allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-tls32", "ir-observed-munmap", "ir-observed-mprotect", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates", "tf-capture", "tf-max-capture-bytes"}
         for option in extra:
             if option.split("=", 1)[0] not in allowed or "=" not in option:
                 raise Phase1RuntimeError(f"not an allowed per-run analysis option: {option}")
@@ -180,7 +180,8 @@ class Phase1Run:
             raise Phase1RuntimeError("Phase 1 event stream did not finish")
         return result
 
-    def verify(self, *, require_protected_channel: bool = False) -> dict[str, Any]:
+    def verify(self, *, require_protected_channel: bool = False,
+               recorded_directory: Path | None = None) -> dict[str, Any]:
         # No opt-in flag can manufacture channel isolation from this transport.
         if require_protected_channel:
             raise Phase1RuntimeError("protected evidence channel is unsupported by the regular-file QEMU-user adapter")
@@ -200,7 +201,8 @@ class Phase1Run:
                 continue
             path = self.paths[name]
             _regular(path, 1024 * 1024 * 1024)
-            if item.get("path") != str(path) or type(item.get("size")) is not int or item["size"] != path.stat().st_size or item.get("sha256") != digest(path):
+            recorded = path if recorded_directory is None else recorded_directory / path.name
+            if not recorded.is_absolute() or item.get("path") != str(recorded) or type(item.get("size")) is not int or item["size"] != path.stat().st_size or item.get("sha256") != digest(path):
                 raise Phase1RuntimeError(f"Phase 1 artifact integrity mismatch: {name}")
         events = self.events()
         if manifest.get("event_count") != len(events):

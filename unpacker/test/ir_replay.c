@@ -455,7 +455,7 @@ static uint32_t lift_file_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
     if(!ir_environment_order(r->environment,s->boundary_id,step->entry.seq_id,
                               step->entry.vcpu_index,s->boundary_ordered)) return environment_failure(r);
     IrOrigin o=origin_of(step);
-    const unsigned regs[]={REG_RAX,REG_RBX,REG_RCX,REG_RDX,REG_RSI,REG_RDI,REG_RBP};
+    const unsigned regs[]={DTA_REG_RAX,DTA_REG_RBX,DTA_REG_RCX,DTA_REG_RDX,DTA_REG_RSI,DTA_REG_RDI,DTA_REG_RBP};
     const uint32_t expected[]={s->number,s->args[0],s->args[1],s->args[2],s->args[3],s->args[4],s->args[5]};
     unsigned count=s->number==192?7U:map||closing||heap?2U:writing||sync?4U:3U;
     for(unsigned i=0;i<count;++i) {
@@ -513,7 +513,7 @@ static uint32_t lift_file_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
     if(!ok) return environment_failure(r);
     IrValueId result=replay_constant(r,b,o,32,s->result);
     (void)ir_emit_effect(r->module,b,(IrInstSpec){.op=IR_OP_WRITE_STATE,.type=ir_type_void(),
-        .state=r->state.gpr[REG_RAX],.args={result},.origin=o});
+        .state=r->state.gpr[DTA_REG_RAX],.args={result},.origin=o});
     r->info.syscall_present=false;r->info.stopped_syscall=(DseSyscallObservation){0};
     return 0;
 }
@@ -535,7 +535,7 @@ static uint32_t lift_proc_exe_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
     r->executable_identity=src->source_identity;r->executable_link_size=src->link_size;
     memcpy(r->executable_link,src->link,src->link_size);
     IrOrigin o=origin_of(step);
-    const unsigned regs[]={REG_RAX,REG_RBX,REG_RCX,REG_RDX};
+    const unsigned regs[]={DTA_REG_RAX,DTA_REG_RBX,DTA_REG_RCX,DTA_REG_RDX};
     const uint32_t expected[]={s->number,s->args[0],s->args[1],s->args[2]};
     for(unsigned i=0;i<(opening?3U:4U);++i) {
         IrValueId value=ir_emit_value(r->module,b,(IrInstSpec){.op=IR_OP_READ_STATE,
@@ -576,7 +576,7 @@ static uint32_t lift_proc_exe_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
     }
     IrValueId result=replay_constant(r,b,o,32,s->result);
     (void)ir_emit_effect(r->module,b,(IrInstSpec){.op=IR_OP_WRITE_STATE,.type=ir_type_void(),
-        .state=r->state.gpr[REG_RAX],.args={result},.origin=o});
+        .state=r->state.gpr[DTA_REG_RAX],.args={result},.origin=o});
     r->info.syscall_present=false;r->info.stopped_syscall=(DseSyscallObservation){0};
     return 0;
 }
@@ -615,7 +615,7 @@ static uint32_t lift_syscall(IrReplay *r, IrX86Frontend *f, IrBlockId block, con
     if ((!protect && !unmap) || !r->options.x86.flat32_ram || step->descriptor.size != 2 ||
         step->descriptor.bytes[0] != 0xcd || step->descriptor.bytes[1] != 0x80)
         return IR_REPLAY_SYSCALL_MODEL;
-    unsigned regs[4] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX};
+    unsigned regs[4] = {DTA_REG_RAX, DTA_REG_RBX, DTA_REG_RCX, DTA_REG_RDX};
     uint32_t expected[4] = {e->number, e->args[0], e->args[1], e->args[2]};
     unsigned count = protect ? 4 : 3;
     for (unsigned i = 0; i < count; ++i)
@@ -680,7 +680,7 @@ static uint32_t lift_syscall(IrReplay *r, IrX86Frontend *f, IrBlockId block, con
     (void)ir_emit_effect(r->module, block,
                          (IrInstSpec){.op = IR_OP_WRITE_STATE,
                                       .type = ir_type_void(),
-                                      .state = r->state.gpr[REG_RAX],
+                                      .state = r->state.gpr[DTA_REG_RAX],
                                       .args = {result},
                                       .origin = origin});
     if (protect)
@@ -840,8 +840,8 @@ static uint32_t repeat_shape(IrX86LiftResult lift, const InsnAux *a, const InsnO
     const DseStringSummary *s = &a->string_summary;
     if (!(lift.string_move ? dse_aux_has_exact_movs(a) : dse_aux_has_exact_stos(a)) ||
         !s->has_rep_prefix || s->element_size != lift.string_bytes ||
-        !(a->reg_value_valid_mask & (1U << REG_RCX)) ||
-        a->reg_vals[REG_RCX] != s->expected_iterations ||
+        !(a->reg_value_valid_mask & (1U << DTA_REG_RCX)) ||
+        a->reg_vals[DTA_REG_RCX] != s->expected_iterations ||
         o->mem_read_total != s->read_events || o->mem_write_total != s->write_events ||
         (o->incomplete_reasons & TRACE_OCCURRENCE_RANGE_UNKNOWN))
         return IR_REPLAY_OBSERVATION_SHAPE;

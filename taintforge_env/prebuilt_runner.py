@@ -794,7 +794,10 @@ exit "$status"
             )
         # sudo may create status and trace files as root with mode 0600.
         # Transfer ownership before reading the status, even with umask 0077.
-        self._normalize_output_ownership(context, [context.run_dir / "logs"])
+        output_paths = [context.run_dir / 'logs']
+        if binding is not None and 'hardening' in binding['settings']:
+            output_paths.append(context.execution_rootfs)
+        self._normalize_output_ownership(context, output_paths)
         try:
             guest_exit = int(exit_path.read_text(encoding="utf-8").strip())
         except (OSError, ValueError) as exc:

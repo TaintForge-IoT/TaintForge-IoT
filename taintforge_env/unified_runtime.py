@@ -138,7 +138,9 @@ def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: 
         elif source == plugin:
             relative = f"plugin/{plugin.name}"
         elif source == capsule_plugin:
-            relative = "capsule/libcapsule_probe.so"
+            relative = ("capsule/libretirement_observer.so" if
+                        capsule_probe.get("profile") == "input-static-i386-retirement-m3"
+                        else "capsule/libcapsule_probe.so")
         elif source == lifecycle_plugin:
             relative = "capsule/libcapsule_lifecycle.so"
         else:
@@ -158,9 +160,10 @@ def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: 
     if capsule_probe is not None:
         from .execution_capsule import bundle_profile
         profile = bundle_profile(capsule_probe)
-        fixture = Path(capsule_probe["guest"])
-        digest = copy_file(fixture, destination / profile["fixture"], expected=profile["fixture_sha256"], executable=True)
-        inventory[profile["fixture"]] = {"path": profile["fixture"], "sha256": digest, "size": fixture.stat().st_size}
+        if "fixture" in profile:
+            fixture = Path(capsule_probe["guest"])
+            digest = copy_file(fixture, destination / profile["fixture"], expected=profile["fixture_sha256"], executable=True)
+            inventory[profile["fixture"]] = {"path": profile["fixture"], "sha256": digest, "size": fixture.stat().st_size}
         manifest["capsule"] = profile
         manifest["files"] = sorted(inventory.values(), key=lambda item: item["path"])
     manifest["bundle_sha256"] = canonical_hash(manifest)
@@ -377,6 +380,9 @@ mkdir -m 0700 {quote(str(tool_mount))}
 mount --bind {quote(str(context.run_dir / 'config/analyzer_runtime'))} {quote(str(tool_mount))}
 mount -o remount,bind,ro {quote(str(tool_mount))}
 """
+    capsule_path = temporary / 'config/capsule_binding.json'
+    if capsule_path.is_file() and 'hardening' in json.loads(capsule_path.read_text())['settings']:
+        setup = setup.replace('remount,bind,ro ', 'remount,bind,ro,nosuid,nodev ')
     for path in created:
         setup += f"mkdir -m 0755 {quote(str(path))}\n"
     setup += f"mount --bind {quote(str(output))} {quote(str(current))}\n"
