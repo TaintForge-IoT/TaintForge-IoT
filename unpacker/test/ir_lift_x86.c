@@ -505,7 +505,7 @@ static IrValueId choose(Lift *l, unsigned width, IrValueId condition, IrValueId 
 
 static void stack_pointer(Lift *l, IrValueId value, IrX86LiftResult *r) {
     write_register(l, X86_REG_ESP, value);
-    r->gpr_writes |= UINT32_C(1) << REG_RSP;
+    r->gpr_writes |= UINT32_C(1) << DTA_REG_RSP;
 }
 
 static void push(Lift *l, IrValueId value, unsigned bytes, IrX86LiftResult *r) {
@@ -737,7 +737,7 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
         stack_pointer(&l, binary(&l, IR_OP_ADD, 32, sp, constant(&l, 32, bytes)), &r);
         if (leave) {
             write_register(&l, X86_REG_EBP, value);
-            r.gpr_writes |= 1U << REG_RBP;
+            r.gpr_writes |= 1U << DTA_REG_RBP;
         } else
             write_operand(&l, x, &x->operands[0], value, &r);
     } else if (shift(insn->id)) {
@@ -753,7 +753,7 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
         write_register(&l, index,
                        choose(&l, bits, df, binary(&l, IR_OP_SUB, bits, di, delta),
                               binary(&l, IR_OP_ADD, bits, di, delta)));
-        r.gpr_writes |= 1U << REG_RDI;
+        r.gpr_writes |= 1U << DTA_REG_RDI;
     } else if (insn->id == X86_INS_CLD || insn->id == X86_INS_STD) {
         write_state(&l, f->state.flags[X86_SPECIAL_STATE_DF],
                     constant(&l, 1, insn->id == X86_INS_STD));

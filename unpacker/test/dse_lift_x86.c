@@ -859,7 +859,7 @@ static bool lift_pushf(DSECtx *ctx, const cs_insn *insn, const InsnAux *aux, con
     if (!flags_value)
         return false;
     SymExpr *old_stack_pointer =
-        dse_read_rid_observed_root(ctx, aux, REG_RSP, arch->natural_width, arch->natural_width);
+        dse_read_rid_observed_root(ctx, aux, DTA_REG_RSP, arch->natural_width, arch->natural_width);
     if (!old_stack_pointer) {
         sym_expr_free(flags_value);
         return false;
@@ -880,7 +880,7 @@ static bool lift_pushf(DSECtx *ctx, const cs_insn *insn, const InsnAux *aux, con
         sym_expr_free(new_stack_pointer);
         return false;
     }
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, arch->natural_width);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, arch->natural_width);
     return true;
 }
 
@@ -925,7 +925,7 @@ static bool lift_push(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
         return false;
 
     SymExpr *old_stack_pointer =
-        dse_read_rid_observed_root(ctx, aux, REG_RSP, pointer_width, pointer_width);
+        dse_read_rid_observed_root(ctx, aux, DTA_REG_RSP, pointer_width, pointer_width);
     if (!old_stack_pointer) {
         sym_expr_free(value);
         return false;
@@ -946,7 +946,7 @@ static bool lift_push(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
         sym_expr_free(new_stack_pointer);
         return false;
     }
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, pointer_width);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, pointer_width);
     return true;
 }
 
@@ -982,7 +982,7 @@ static bool lift_pop(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
     }
 
     SymExpr *old_stack_pointer =
-        dse_read_rid_observed_root(ctx, aux, REG_RSP, pointer_width, pointer_width);
+        dse_read_rid_observed_root(ctx, aux, DTA_REG_RSP, pointer_width, pointer_width);
     if (!old_stack_pointer)
         return false;
     if (!dse_constrain_observed_address(ctx, sym_expr_clone(old_stack_pointer), aux->mem_read_addr,
@@ -1002,7 +1002,7 @@ static bool lift_pop(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
         sym_expr_free(value);
         return false;
     }
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, pointer_width);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, pointer_width);
     return commit_operand(ctx, x86, aux, arch, dst, value, popped_width);
 }
 
@@ -1031,7 +1031,7 @@ static bool lift_leave(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, cons
     uint32_t popped_width = operand_size_16 ? 16u : 32u;
     uint32_t popped_bytes = popped_width / 8u;
 
-    SymExpr *old_frame_pointer = dse_read_rid_observed_root(ctx, aux, REG_RBP, 32, 32);
+    SymExpr *old_frame_pointer = dse_read_rid_observed_root(ctx, aux, DTA_REG_RBP, 32, 32);
     if (!old_frame_pointer)
         return false;
     if (!dse_constrain_observed_address(ctx, sym_expr_clone(old_frame_pointer), aux->mem_read_addr,
@@ -1049,12 +1049,12 @@ static bool lift_leave(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, cons
         sym_expr_free(restored_frame_pointer);
         return false;
     }
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, 32);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, 32);
 
     if (operand_size_16) {
         return commit_reg(ctx, aux, arch, X86_REG_BP, restored_frame_pointer, 16);
     }
-    dse_set_reg(ctx, REG_RBP, restored_frame_pointer, 32);
+    dse_set_reg(ctx, DTA_REG_RBP, restored_frame_pointer, 32);
 
     return true;
 }
@@ -1078,8 +1078,8 @@ static bool lift_popal(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, cons
     SymExpr *values[7] = {0};
     SymExpr *old_stack_pointer = NULL;
     int destination_rids[7];
-    uint32_t old_esp = (uint32_t)aux->reg_vals[REG_RSP];
-    old_stack_pointer = dse_read_rid_observed_root(ctx, aux, REG_RSP, 32, 32);
+    uint32_t old_esp = (uint32_t)aux->reg_vals[DTA_REG_RSP];
+    old_stack_pointer = dse_read_rid_observed_root(ctx, aux, DTA_REG_RSP, 32, 32);
     if (!old_stack_pointer)
         goto fail;
     for (uint32_t i = 0; i < 7; i++) {
@@ -1122,7 +1122,7 @@ static bool lift_popal(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, cons
         dse_set_reg(ctx, destination_rids[i], values[i], 32);
         values[i] = NULL;
     }
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, 32);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, 32);
     return true;
 fail:
     sym_expr_free(old_stack_pointer);
@@ -1208,7 +1208,7 @@ static bool x86_constrain_string_count(DSECtx *ctx, const InsnAux *aux, const Ds
     if (!summary->has_rep_prefix)
         return summary->expected_iterations == 1U;
     SymExpr *count =
-        dse_read_rid_observed_root(ctx, aux, REG_RCX, arch->natural_width, arch->natural_width);
+        dse_read_rid_observed_root(ctx, aux, DTA_REG_RCX, arch->natural_width, arch->natural_width);
     if (!count)
         return false;
     SymExpr *expected = sym_expr_const(summary->expected_iterations, arch->natural_width);
@@ -1263,7 +1263,7 @@ static bool lift_lods(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
         return false;
     }
     SymExpr *source_address =
-        dse_read_rid_observed_root(ctx, aux, REG_RSI, arch->natural_width, arch->natural_width);
+        dse_read_rid_observed_root(ctx, aux, DTA_REG_RSI, arch->natural_width, arch->natural_width);
     if (!source_address)
         return false;
     if (!dse_constrain_observed_address(ctx, source_address, aux->mem_reads[0].addr,
@@ -1273,12 +1273,12 @@ static bool lift_lods(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
     SymExpr *loaded_value = dse_load_mem(ctx, aux, (uint32_t)element_size * 8U, false);
     if (!loaded_value)
         return false;
-    if (!dse_commit_slice(ctx, aux, REG_RAX, loaded_value, 0, (uint32_t)element_size * 8U,
+    if (!dse_commit_slice(ctx, aux, DTA_REG_RAX, loaded_value, 0, (uint32_t)element_size * 8U,
                           arch->natural_width)) {
         return false;
     }
     int8_t direction = (aux->eflags_before & (UINT32_C(1) << 10)) != 0 ? -1 : 1;
-    return x86_update_string_index(ctx, aux, arch, REG_RSI, element_size, direction);
+    return x86_update_string_index(ctx, aux, arch, DTA_REG_RSI, element_size, direction);
 }
 
 static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86,
@@ -1307,11 +1307,11 @@ static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x8
         return false;
     }
     if (summary->expected_iterations != 0) {
-        if (is_movs && !x86_constrain_string_base(ctx, aux, arch, REG_RSI, summary->source_first,
+        if (is_movs && !x86_constrain_string_base(ctx, aux, arch, DTA_REG_RSI, summary->source_first,
                                                   DSE_ADDRESS_READ)) {
             return false;
         }
-        if (!x86_constrain_string_base(ctx, aux, arch, REG_RDI, summary->destination_first,
+        if (!x86_constrain_string_base(ctx, aux, arch, DTA_REG_RDI, summary->destination_first,
                                        DSE_ADDRESS_WRITE)) {
             return false;
         }
@@ -1379,7 +1379,7 @@ static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x8
                     continue;
                 }
                 if (!pattern[byte]) {
-                    pattern[byte] = dse_read_rid_slice(ctx, aux, REG_RAX, (uint32_t)byte * 8U, 8,
+                    pattern[byte] = dse_read_rid_slice(ctx, aux, DTA_REG_RAX, (uint32_t)byte * 8U, 8,
                                                        arch->natural_width);
                     if (!pattern[byte])
                         goto fail;
@@ -1388,7 +1388,7 @@ static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x8
                 if (!value)
                     goto fail;
                 uint8_t observed_value =
-                    (uint8_t)((aux->reg_vals[REG_RAX] >> (8U * byte)) & UINT64_C(0xff));
+                    (uint8_t)((aux->reg_vals[DTA_REG_RAX] >> (8U * byte)) & UINT64_C(0xff));
                 uint64_t destination =
                     x86_string_event_byte_address(summary->destination_first, summary->direction,
                                                   summary->element_size, event, byte);
@@ -1408,14 +1408,14 @@ static bool lift_exact_string(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x8
     uint32_t total_bytes = (uint32_t)total_bytes_64;
 
     if (is_movs &&
-        !x86_update_string_index(ctx, aux, arch, REG_RSI, total_bytes, summary->direction)) {
+        !x86_update_string_index(ctx, aux, arch, DTA_REG_RSI, total_bytes, summary->direction)) {
         return false;
     }
-    if (!x86_update_string_index(ctx, aux, arch, REG_RDI, total_bytes, summary->direction)) {
+    if (!x86_update_string_index(ctx, aux, arch, DTA_REG_RDI, total_bytes, summary->direction)) {
         return false;
     }
     if (summary->has_rep_prefix) {
-        dse_set_reg(ctx, REG_RCX, sym_expr_const(0, arch->natural_width), arch->natural_width);
+        dse_set_reg(ctx, DTA_REG_RCX, sym_expr_const(0, arch->natural_width), arch->natural_width);
         if (ctx->resource_limit_hit) {
             return false;
         }
@@ -1526,7 +1526,7 @@ static bool lift_call(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
     uint32_t pushed_width = operand_size_16 ? 16u : 32u;
     uint32_t pushed_bytes = pushed_width / 8u;
     SymExpr *old_stack_pointer =
-        dse_read_rid_observed_root(ctx, aux, REG_RSP, pointer_width, pointer_width);
+        dse_read_rid_observed_root(ctx, aux, DTA_REG_RSP, pointer_width, pointer_width);
     if (!old_stack_pointer)
         return false;
     SymExpr *new_stack_pointer =
@@ -1548,7 +1548,7 @@ static bool lift_call(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
         sym_expr_free(new_stack_pointer);
         return false;
     }
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, pointer_width);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, pointer_width);
     return true;
 }
 
@@ -1572,7 +1572,7 @@ static bool lift_ret(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
         }
         immediate_adjustment = (uint16_t)x86->operands[0].imm;
     }
-    SymExpr *old_stack_pointer = dse_read_rid_observed_root(ctx, aux, REG_RSP, 32, 32);
+    SymExpr *old_stack_pointer = dse_read_rid_observed_root(ctx, aux, DTA_REG_RSP, 32, 32);
     if (!old_stack_pointer)
         return false;
     if (!dse_constrain_observed_address(ctx, sym_expr_clone(old_stack_pointer), aux->mem_read_addr,
@@ -1585,7 +1585,7 @@ static bool lift_ret(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
 
     if (!new_stack_pointer)
         return false;
-    dse_set_reg(ctx, REG_RSP, new_stack_pointer, 32);
+    dse_set_reg(ctx, DTA_REG_RSP, new_stack_pointer, 32);
     return true;
 }
 

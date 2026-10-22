@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from taintforge_env.capture_importer import import_capture
 from taintforge_env.replay_store import (
     ReplayEntryExistsError,
     ReplayStore,
@@ -33,6 +34,17 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--delay-ms", type=int, default=0)
     add_parser.add_argument("--keep-open", action="store_true")
     add_parser.add_argument("--replace", action="store_true")
+
+    import_parser = subparsers.add_parser(
+        "import-capture",
+        help="Import a completed TCP, UDP or DNS capture; print a JSON source receipt",
+    )
+    import_parser.add_argument("--store", required=True)
+    import_parser.add_argument(
+        "--session-dir", required=True,
+        help="One archived capture directory containing session.json and events.jsonl",
+    )
+    import_parser.add_argument("--protocol-hint")
 
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--store", required=True)
@@ -102,6 +114,11 @@ def main() -> None:
                     f"response={entry.response.size}B "
                     f"hint={entry.request.protocol_hint}"
                 )
+            return
+
+        if args.command == "import-capture":
+            result = import_capture(args.session_dir, store, protocol_hint=args.protocol_hint)
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
             return
 
         if args.command == "lookup":

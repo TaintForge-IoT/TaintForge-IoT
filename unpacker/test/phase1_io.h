@@ -12,6 +12,7 @@
  * protection from a hostile guest remain execution-backend responsibilities. */
 typedef struct {
     bool enabled, storage_failed, profile_lost, finished, flags_required, analysis_incomplete;
+    bool quiesced, retirement_enabled;
     char *session, *attempt, *instance;
     char *events_path, *manifest_path, *dump_path, *report_path, *ir_path;
     FILE *events;

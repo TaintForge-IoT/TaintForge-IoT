@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .log_io import LogReadError, OBSERVATION_PREVIEW_CHARS, iter_log_lines, read_log_preview
+
 
 class ObservationLoadError(RuntimeError):
     """Raised when Phase 2 runtime artifacts cannot be parsed safely."""
@@ -27,6 +29,17 @@ class ObservationBundle:
     stderr_text: str = ""
     rootfs_diff: dict[str, Any] | None = None
     warnings: tuple[str, ...] = ()
+    stderr_path: Path | None = None
+
+    def iter_stderr_lines(self):
+        """Scan the full log for requirements, even when its preview is bounded."""
+        if self.stderr_path is None:
+            yield from self.stderr_text.splitlines()
+            return
+        try:
+            yield from iter_log_lines(self.stderr_path)
+        except (LogReadError, OSError) as exc:
+            raise ObservationLoadError(str(exc)) from exc
 
     def guest_syscall_events(self) -> tuple[dict[str, Any], ...]:
         return tuple(
@@ -59,6 +72,10 @@ def load_observation_bundle(run_dir: str | Path) -> ObservationBundle:
 
     logs_dir = run_dir / "logs"
     warnings: list[str] = []
+    runtime = _load_first_json(
+        candidates=(run_dir / "config" / "runtime.json",),
+        artifact_name="runtime configuration", warnings=warnings, missing_is_warning=False,
+    ) or {}
 
     syscall_events = _load_jsonl_optional(
         logs_dir / "syscall_events.jsonl",
@@ -69,10 +86,12 @@ def load_observation_bundle(run_dir: str | Path) -> ObservationBundle:
         logs_dir / "network_events.jsonl",
         artifact_name="network events",
         warnings=warnings,
+        missing_is_warning=runtime.get("network_mode") != "none",
     )
 
     runtime_status = _load_first_json(
         candidates=(
+            run_dir / "config" / "prebuilt_execution.json",
             logs_dir / "runtime_status.json",
             run_dir / "runtime_status.json",
             run_dir / "config" / "runtime_status.json",
@@ -83,9 +102,9 @@ def load_observation_bundle(run_dir: str | Path) -> ObservationBundle:
 
     rootfs_diff = _load_first_json(
         candidates=(
+            run_dir / "config" / "rootfs_diff.json",
             logs_dir / "rootfs_diff.json",
             run_dir / "rootfs_diff.json",
-            run_dir / "config" / "rootfs_diff.json",
         ),
         artifact_name="rootfs diff",
         warnings=warnings,
@@ -112,6 +131,7 @@ def load_observation_bundle(run_dir: str | Path) -> ObservationBundle:
         stderr_text=stderr_text,
         rootfs_diff=rootfs_diff,
         warnings=tuple(warnings),
+        stderr_path=(logs_dir / "runtime_stderr.log") if (logs_dir / "runtime_stderr.log").is_file() else None,
     )
 
 
@@ -120,32 +140,34 @@ def _load_jsonl_optional(
     *,
     artifact_name: str,
     warnings: list[str],
+    missing_is_warning: bool = True,
 ) -> list[dict[str, Any]]:
     if not path.exists():
-        warnings.append(f"{artifact_name} not found: {path}")
+        if missing_is_warning:
+            warnings.append(f"{artifact_name} not found: {path}")
         return []
     if not path.is_file():
         raise ObservationLoadError(f"{artifact_name} is not a file: {path}")
 
     events: list[dict[str, Any]] = []
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8", errors="replace").splitlines(),
-        start=1,
-    ):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ObservationLoadError(
-                f"invalid JSON in {artifact_name} at {path}:{line_number}: {exc}"
-            ) from exc
-        if not isinstance(value, dict):
-            raise ObservationLoadError(
-                f"expected JSON object in {artifact_name} at "
-                f"{path}:{line_number}, got {type(value).__name__}"
-            )
-        events.append(value)
+    try:
+        for line_number, line in enumerate(iter_log_lines(path), start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ObservationLoadError(
+                    f"invalid JSON in {artifact_name} at {path}:{line_number}: {exc}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise ObservationLoadError(
+                    f"expected JSON object in {artifact_name} at "
+                    f"{path}:{line_number}, got {type(value).__name__}"
+                )
+            events.append(value)
+    except (LogReadError, OSError) as exc:
+        raise ObservationLoadError(str(exc)) from exc
     return events
 
 
@@ -191,4 +213,10 @@ def _read_text_optional(
         return ""
     if not path.is_file():
         raise ObservationLoadError(f"{artifact_name} is not a file: {path}")
-    return path.read_text(encoding="utf-8", errors="replace")
+    text, truncated = read_log_preview(path, OBSERVATION_PREVIEW_CHARS)
+    if truncated:
+        warnings.append(
+            f"{artifact_name} preview limited to {OBSERVATION_PREVIEW_CHARS} characters: {path}; "
+            "loader requirement extraction scans the complete stderr log"
+        )
+    return text

@@ -33,7 +33,7 @@ def add_execution_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--timeout", type=int, default=60)
     command.add_argument(
         "--network",
-        choices=("none", "controlled", "replay"),
+        choices=("none", "controlled", "replay", "record"),
         default="none",
         help=(
             "none creates a disconnected private namespace; controlled adds "

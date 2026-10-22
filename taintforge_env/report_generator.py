@@ -7,11 +7,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .log_io import iter_log_lines, read_log_preview
+from .attempt_finalization import write_json
+
+
+def _first_artifact(*paths: Path) -> Path:
+    return next((path for path in paths if path.exists()), paths[0])
+
 def is_malware_syscall_event(event: dict) -> bool:
     context = event.get("context") or event.get("execution_context")
     return context == "guest"
 
 PREVIEW_CHARS = 4000
+NETWORK_ATTEMPT_SYSCALLS = {"connect", "send", "sendto", "sendmsg", "sendmmsg"}
+
+
+def _network_setting(runtime: dict, policy: dict, runtime_key: str, policy_key: str) -> tuple[Any, str | None]:
+    # The per-attempt runtime records the selected mode; a template policy may
+    # still exist when this attempt uses network=none. Preserve explicit False.
+    if runtime_key in runtime:
+        return runtime[runtime_key], f"config/runtime.json:{runtime_key}"
+    if policy_key in policy:
+        return policy[policy_key], f"config/network_policy.json:{policy_key}"
+    return None, None
 
 
 class ReportGenerationError(RuntimeError):
@@ -29,27 +47,37 @@ class RunReportGenerator:
         self.library_plan_path = self.config_dir / "library_plan.json"
         self.library_resolution_path = self.config_dir / "library_resolution.json"
         self.network_events_path = self.logs_dir / "network_events.jsonl"
-        self.runtime_status_path = self.logs_dir / "runtime_status.json"
+        self.runtime_status_path = _first_artifact(
+            self.config_dir / "prebuilt_execution.json", self.logs_dir / "runtime_status.json",
+            self.out_dir / "runtime_status.json", self.config_dir / "runtime_status.json",
+        )
         self.security_status_path = self.logs_dir / "security_status.json"
+        self.runner_manifest_path = self.config_dir / "prebuilt_runner_manifest.json"
         self.syscall_events_path = self.logs_dir / "syscall_events.jsonl"
         self.syscall_summary_path = self.logs_dir / "syscall_events.summary.json"
-        self.rootfs_snapshot_before_path = self.logs_dir / "rootfs_snapshot_before.json"
-        self.rootfs_snapshot_after_path = self.logs_dir / "rootfs_snapshot_after.json"
-        self.rootfs_diff_path = self.logs_dir / "rootfs_diff.json"
+        self.rootfs_snapshot_before_path = _first_artifact(
+            self.config_dir / "rootfs_before.json", self.logs_dir / "rootfs_snapshot_before.json")
+        self.rootfs_snapshot_after_path = _first_artifact(
+            self.config_dir / "rootfs_after.json", self.logs_dir / "rootfs_snapshot_after.json")
+        self.rootfs_diff_path = _first_artifact(
+            self.config_dir / "rootfs_diff.json", self.logs_dir / "rootfs_diff.json",
+            self.out_dir / "rootfs_diff.json")
 
         self.report_json_path = self.out_dir / "report.json"
         self.report_md_path = self.out_dir / "report.md"
 
 
     def build_filesystem_section(self, rootfs_diff: dict[str, Any]) -> dict[str, Any]:
+        available = bool(rootfs_diff) and "_error" not in rootfs_diff
         created = rootfs_diff.get("created", [])
         modified = rootfs_diff.get("modified", [])
         deleted = rootfs_diff.get("deleted", [])
 
         return {
-            "created_count": rootfs_diff.get("created_count", len(created)),
-            "modified_count": rootfs_diff.get("modified_count", len(modified)),
-            "deleted_count": rootfs_diff.get("deleted_count", len(deleted)),
+            "observation_available": available,
+            "created_count": rootfs_diff.get("created_count", len(created)) if available else None,
+            "modified_count": rootfs_diff.get("modified_count", len(modified)) if available else None,
+            "deleted_count": rootfs_diff.get("deleted_count", len(deleted)) if available else None,
             "created": created[:100],
             "modified": modified[:100],
             "deleted": deleted[:100],
@@ -60,6 +88,35 @@ class RunReportGenerator:
         syscall_events: list[dict[str, Any]],
         syscall_summary: dict[str, Any],
     ) -> dict[str, Any]:
+        # connect/send attempts remain observable even when QEMU prints only a
+        # sockaddr pointer. An undecoded endpoint must not erase the syscall.
+        network_attempts = []
+        attempts_count = unknown_endpoints = 0
+        network_targets = set()
+        for event in syscall_events:
+            if event.get("syscall") not in NETWORK_ATTEMPT_SYSCALLS:
+                continue
+            remote_ip, remote_port = event.get("remote_ip"), event.get("remote_port")
+            endpoint_parsed = remote_ip is not None and remote_port is not None
+            target = f"{remote_ip}:{remote_port}" if endpoint_parsed else None
+            attempts_count += 1
+            unknown_endpoints += not endpoint_parsed
+            if target is not None:
+                network_targets.add(target)
+            if len(network_attempts) < 100:
+                network_attempts.append({
+                    "syscall": event.get("syscall"), "category": event.get("category"),
+                    "remote_ip": remote_ip, "remote_port": remote_port, "target": target,
+                    "endpoint_parsed": endpoint_parsed, "result": event.get("result"),
+                    "errno": event.get("errno"), "raw": event.get("raw"),
+                    "source_file": event.get("source_file"), "line_number": event.get("line_number"),
+                })
+        attempt_details = {
+            "network_targets": sorted(network_targets),
+            "network_attempts_count": attempts_count,
+            "network_attempts_without_endpoint_count": unknown_endpoints,
+            "network_attempts": network_attempts,
+        }
         if syscall_summary:
             return {
                 "events_total": syscall_summary.get("events_total", len(syscall_events)),
@@ -73,7 +130,7 @@ class RunReportGenerator:
                 ),
                 "host_wrapper_paths": syscall_summary.get("host_wrapper_paths", []),
                 "all_paths": syscall_summary.get("all_paths", []),
-                "network_targets": syscall_summary.get("network_targets", []),
+                **attempt_details,
                 "high_risk_count": syscall_summary.get("high_risk_count", 0),
                 "high_risk_events": syscall_summary.get("high_risk_events", []),
             }
@@ -97,36 +154,6 @@ class RunReportGenerator:
             }
         )
 
-        network_targets = sorted(
-            {
-                f"{event.get('remote_ip')}:{event.get('remote_port')}"
-                for event in syscall_events
-                if event.get("remote_ip") is not None
-                and event.get("remote_port") is not None
-            }
-        )
-
-        network_attempts = []
-
-        for event in syscall_events:
-            remote_ip = event.get("remote_ip")
-            remote_port = event.get("remote_port")
-
-            if remote_ip is None or remote_port is None:
-                continue
-
-            network_attempts.append(
-                {
-                    "syscall": event.get("syscall"),
-                    "category": event.get("category"),
-                    "remote_ip": remote_ip,
-                    "remote_port": remote_port,
-                    "target": f"{remote_ip}:{remote_port}",
-                    "result": event.get("result"),
-                    "raw": event.get("raw"),
-                }
-            )
-
         high_risk_events = [
             event
             for event in syscall_events
@@ -138,9 +165,7 @@ class RunReportGenerator:
             "by_syscall": dict(by_syscall),
             "by_category": dict(by_category),
             "paths": paths,
-            "network_targets": network_targets,
-            "network_attempts_count": len(network_attempts),
-            "network_attempts": network_attempts[:100],
+            **attempt_details,
             "high_risk_count": len(high_risk_events),
             "high_risk_events": high_risk_events[:50],
         }
@@ -155,9 +180,17 @@ class RunReportGenerator:
         network_events = self.load_jsonl_optional(self.network_events_path)
         runtime_status = self.load_json_optional(self.runtime_status_path)
         security_status = self.load_json_optional(self.security_status_path)
-        raw_syscall_events = self.load_jsonl_optional(self.syscall_events_path)
-        syscall_summary = self.load_json_optional(self.syscall_summary_path)
+        runner_manifest = self.load_json_optional(self.runner_manifest_path)
+        finalization = self.load_json_optional(self.config_dir / "finalization_status.json")
+        stages = finalization.get("stages", {})
+        syscalls_available = self.syscall_events_path.is_file() and (
+            not finalization or stages.get("syscalls", {}).get("status") == "completed")
+        # A killed parser may have left a valid prefix. It is evidence for
+        # offline recovery, never a complete syscall result for this attempt.
+        raw_syscall_events = self.load_jsonl_optional(self.syscall_events_path) if syscalls_available else []
         rootfs_diff = self.load_json_optional(self.rootfs_diff_path)
+        if finalization and stages.get("filesystem", {}).get("status") != "completed":
+            rootfs_diff = {}
 
         syscall_events = [
             e for e in raw_syscall_events
@@ -176,6 +209,7 @@ class RunReportGenerator:
             "network": self.build_network_section(
                 network_policy=network_policy,
                 network_events=network_events,
+                runtime=runtime,
             ),
             "syscalls": self.build_syscalls_section(
                 syscall_events=syscall_events,
@@ -184,8 +218,18 @@ class RunReportGenerator:
             "filesystem": self.build_filesystem_section(rootfs_diff),
             "artifacts": self.build_artifacts_section(network_events),
             "logs": self.build_logs_section(),
-            "security": self.build_security_section(network_policy=network_policy, security_status=security_status),
+            "security": self.build_security_section(
+                network_policy=network_policy, security_status=security_status,
+                runtime=runtime, runner_manifest=runner_manifest,
+            ),
         }
+        report["syscalls"]["observation_available"] = syscalls_available
+        if not syscalls_available:
+            for name in ("events_total", "network_attempts_count", "network_attempts_without_endpoint_count", "high_risk_count"):
+                report["syscalls"][name] = None
+        if finalization:
+            report["finalization"] = finalization
+            report["phase1"] = self.load_json_optional(self.config_dir / "phase1_result.json")
 
         self.save_json_report(report)
         self.save_markdown_report(report)
@@ -203,6 +247,7 @@ class RunReportGenerator:
             "syscall_summary": self.rel(self.syscall_summary_path),
             "runtime_status": self.rel(self.runtime_status_path),
             "security_status": self.rel(self.security_status_path),
+            "runner_manifest": self.rel(self.runner_manifest_path),
             "runtime_stdout": self.rel(self.logs_dir / "runtime_stdout.log"),
             "runtime_stderr": self.rel(self.logs_dir / "runtime_stderr.log"),
             "report_json": self.rel(self.report_json_path),
@@ -258,7 +303,12 @@ class RunReportGenerator:
         self,
         network_policy: dict[str, Any],
         network_events: list[dict[str, Any]],
+        runtime: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        runtime = runtime or {}
+        mode, mode_source = _network_setting(runtime, network_policy, "network_mode", "mode")
+        allow_internet, internet_source = _network_setting(
+            runtime, network_policy, "allow_internet", "allow_internet")
         services = network_policy.get("services", [])
         catch_all = network_policy.get("catch_all", {})
 
@@ -284,12 +334,12 @@ class RunReportGenerator:
 
         udp_events = [
             event for event in network_events
-            if event.get("listener_type") == "udp_transparent"
+            if event.get("listener_type") == "udp_transparent" or event.get("transport") == "udp"
         ]
 
         dns_events = [
-            event for event in udp_events
-            if event.get("udp_role") == "dns"
+            event for event in network_events
+            if event.get("udp_role") == "dns" or str(event.get("event", "")).startswith("dns_")
         ]
 
         http_events = [
@@ -334,8 +384,11 @@ class RunReportGenerator:
         )
 
         return {
-            "mode": network_policy.get("mode"),
-            "allow_internet": network_policy.get("allow_internet"),
+            "mode": mode,
+            "mode_source": mode_source,
+            "allow_internet": allow_internet,
+            "allow_internet_source": internet_source,
+            "events_available": self.network_events_path.is_file(),
             "services_count": len(services),
             "services": services,
             "catch_all": catch_all,
@@ -345,9 +398,11 @@ class RunReportGenerator:
             "known_tcp_events": len(known_tcp_events),
             "unknown_tcp_events": len(unknown_tcp_events),
             "udp_datagrams": len(udp_events),
-            "dns_datagrams": len(dns_events),
+            "dns_datagrams": sum(e.get("transport") == "udp" or e.get("listener_type") == "udp_transparent" for e in dns_events),
+            "dns_events_total": len(dns_events),
             "dns_queries": dns_queries,
             "dns_responses_sent": dns_responses_sent,
+            "dns_responses_prepared": sum(e.get("dns_response_prepared") is True for e in dns_events),
             "known_tcp_targets": self.unique_targets(known_tcp_events),
             "unknown_tcp_targets": self.unique_targets(unknown_tcp_events),
             "udp_targets": self.unique_targets(udp_events),
@@ -419,77 +474,48 @@ class RunReportGenerator:
         self,
         network_policy: dict[str, Any],
         security_status: dict[str, Any],
+        runtime: dict[str, Any] | None = None,
+        runner_manifest: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        catch_all = network_policy.get("catch_all", {})
+        status_available = bool(security_status) and "_error" not in security_status
+        status = security_status if status_available else {}
+        manifest = runner_manifest or {}
+        isolation = manifest.get("isolation") if "_error" not in manifest else None
+        if not isinstance(isolation, dict):
+            isolation = None
+        allow_internet, _ = _network_setting(
+            runtime or {}, network_policy, "allow_internet", "allow_internet")
 
         return {
-            "isolation_ready": security_status.get("isolation_ready", False),
-            "chroot_enabled": True,
-            "network_namespace_enabled": security_status.get(
-                "network_namespace",
-                True,
-            ),
-            "pid_namespace_enabled": security_status.get(
-                "pid_namespace",
-                False,
-            ),
-            "mount_namespace_enabled": security_status.get(
-                "mount_namespace",
-                False,
-            ),
-            "uts_namespace_enabled": security_status.get(
-                "uts_namespace",
-                False,
-            ),
-            "ipc_namespace_enabled": security_status.get(
-                "ipc_namespace",
-                False,
-            ),
-            "user_namespace_enabled": security_status.get(
-                "user_namespace",
-                False,
-            ),
-            "mount_propagation": security_status.get(
-                "mount_propagation",
-            ),
-            "sandbox_hostname": security_status.get(
-                "sandbox_hostname",
-            ),
-            "proc_mode": security_status.get(
-                "proc_mode",
-                "static_rootfs_stubs",
-            ),
-            "iptables_default_deny_expected": True,
-            "host_ip_forwarding_expected": False,
-            "allow_internet": bool(
-                network_policy.get("allow_internet", False)
-            ),
-            "known_endpoint_dnat": True,
-            "tcp_catch_all_redirect": bool(
-                catch_all.get("enabled", False)
-            ),
-            "udp_catch_all_redirect": bool(
-                catch_all.get("udp_enabled", False)
-            ),
-            "strace_enabled": security_status.get(
-                "strace_enabled",
-                False,
-            ),
-            "resource_limits": security_status.get(
-                "resource_limits",
-                {},
-            ),
-            "limitations": security_status.get(
-                "limitations",
-                [],
-            ),
+            "status_available": status_available,
+            "status_source": self.rel(self.security_status_path) if status_available else None,
+            "status_error": security_status.get("_error"),
+            "configured_isolation": isolation,
+            "configuration_source": self.rel(self.runner_manifest_path) if isolation is not None else None,
+            "isolation_ready": status.get("isolation_ready"),
+            "chroot_enabled": status.get("chroot_enabled", status.get("chroot")),
+            "network_namespace_enabled": status.get("network_namespace"),
+            "pid_namespace_enabled": status.get("pid_namespace"),
+            "mount_namespace_enabled": status.get("mount_namespace"),
+            "uts_namespace_enabled": status.get("uts_namespace"),
+            "ipc_namespace_enabled": status.get("ipc_namespace"),
+            "user_namespace_enabled": status.get("user_namespace"),
+            "mount_propagation": status.get("mount_propagation"),
+            "sandbox_hostname": status.get("sandbox_hostname"),
+            "proc_mode": status.get("proc_mode"),
+            "iptables_default_deny_expected": status.get("iptables_default_deny_expected"),
+            "host_ip_forwarding_expected": status.get("host_ip_forwarding_expected"),
+            "allow_internet": allow_internet,
+            "known_endpoint_dnat": status.get("known_endpoint_dnat"),
+            "tcp_catch_all_redirect": status.get("tcp_catch_all_redirect"),
+            "udp_catch_all_redirect": status.get("udp_catch_all_redirect"),
+            "strace_enabled": status.get("strace_enabled"),
+            "resource_limits": status.get("resource_limits"),
+            "limitations": status.get("limitations"),
         }
 
     def save_json_report(self, report: dict[str, Any]) -> None:
-        self.report_json_path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        write_json(self.report_json_path, report)
 
     def save_markdown_report(self, report: dict[str, Any]) -> None:
         content = self.render_markdown(report)
@@ -513,6 +539,15 @@ class RunReportGenerator:
         lines.append(f"Output directory: `{report['out_dir']}`")
         lines.append("")
 
+        if report.get("finalization"):
+            lines.extend(["## Attempt finalization", "", "| Operation | Status | Error / reason |", "|---|---|---|"])
+            for name, stage in report["finalization"].get("stages", {}).items():
+                reason = str(stage.get("error", stage.get("reason", ""))).replace("\n", " ")
+                lines.append(f"| {self.md(name)} | {self.md(stage.get('status'))} | {self.md(reason)} |")
+            phase1 = report.get("phase1", {})
+            lines.extend(["", f"Phase 1 artifact integrity: `{phase1.get('artifact_integrity', 'not_applicable')}`.",
+                          "A completed verification operation can still describe an incomplete capture.", ""])
+
         lines.append("## Runtime")
         lines.append("")
         lines.append(f"- Architecture: `{runtime.get('arch')}`")
@@ -529,7 +564,8 @@ class RunReportGenerator:
         if status:
             lines.append("### Runtime status")
             lines.append("")
-            lines.append(f"- Exit code: `{status.get('exit_code')}`")
+            exit_code = status.get("guest_exit_code", status.get("exit_code"))
+            lines.append(f"- Exit code: `{exit_code if exit_code is not None else 'unknown'}`")
             lines.append(f"- Timed out: `{status.get('timed_out')}`")
             lines.append(f"- Timeout seconds: `{status.get('timeout_seconds')}`")
             lines.append(f"- Duration seconds: `{status.get('duration_seconds')}`")
@@ -591,6 +627,8 @@ class RunReportGenerator:
         lines.append("")
         lines.append(f"- Mode: `{network.get('mode')}`")
         lines.append(f"- Allow internet: `{network.get('allow_internet')}`")
+        lines.append("- Mode and internet access above describe the saved configuration.")
+        lines.append(f"- Network service log available: `{network.get('events_available')}`")
         lines.append(f"- Known services: `{network.get('services_count')}`")
         lines.append(f"- Total events: `{network.get('events_total')}`")
         lines.append(f"- Known TCP events: `{network.get('known_tcp_events')}`")
@@ -630,18 +668,23 @@ class RunReportGenerator:
         network_attempts = syscalls.get("network_attempts") or []
         lines.append("### Network attempts from malware syscalls")
         lines.append("")
+        lines.append(f"- Recorded connect/send attempts: `{syscalls.get('network_attempts_count', 0)}`")
+        lines.append(f"- Attempts with an undecoded endpoint: `{syscalls.get('network_attempts_without_endpoint_count', 0)}`")
+        lines.append("")
         if network_attempts:
             lines.append("| Syscall | Target | Result |")
             lines.append("|---|---|---|")
 
             for event in network_attempts[:50]:
-                target = event.get("target")
+                target = event.get("target") or "unknown (endpoint not decoded)"
                 lines.append(
                     "| "
                     f"`{event.get('syscall')}` | "
                     f"`{target}` | "
                     f"`{event.get('result')}` |"
                 )
+        elif syscalls.get("observation_available") is False:
+            lines.append("- Syscall processing is unavailable; network attempts are unknown.")
         else:
             lines.append("- No network attempts recorded from malware syscalls.")
         lines.append("")
@@ -693,7 +736,7 @@ class RunReportGenerator:
             for name, count in sorted(by_category.items()):
                 lines.append(f"- `{name}`: `{count}`")
         else:
-            lines.append("- No syscall events recorded.")
+            lines.append("- Syscall processing is unavailable." if syscalls.get("observation_available") is False else "- No syscall events recorded.")
         lines.append("")
 
         lines.append("### Top syscalls")
@@ -709,7 +752,7 @@ class RunReportGenerator:
             for name, count in top_syscalls:
                 lines.append(f"- `{name}`: `{count}`")
         else:
-            lines.append("- No syscall events recorded.")
+            lines.append("- Syscall processing is unavailable." if syscalls.get("observation_available") is False else "- No syscall events recorded.")
         lines.append("")
 
         malware_paths = syscalls.get("paths") or []
@@ -721,7 +764,7 @@ class RunReportGenerator:
             if len(malware_paths) > 50:
                 lines.append(f"- ... truncated, total malware paths: `{len(malware_paths)}`")
         else:
-            lines.append("- No malware filesystem paths recorded.")
+            lines.append("- Syscall paths are unavailable." if syscalls.get("observation_available") is False else "- No malware filesystem paths recorded.")
         lines.append("")
 
         high_risk = syscalls.get("high_risk_events") or []
@@ -741,11 +784,15 @@ class RunReportGenerator:
                     f"`{raw[:160]}` |"
                 )
         else:
-            lines.append("- No high-risk syscall events recorded.")
+            lines.append("- Syscall risk assessment is unavailable." if syscalls.get("observation_available") is False else "- No high-risk syscall events recorded.")
         lines.append("")
 
         lines.append("## Filesystem mutations")
         lines.append("")
+        filesystem_available = filesystem.get("observation_available") is True
+        lines.append(f"- Observation available: `{filesystem_available}`")
+        if not filesystem_available:
+            lines.append("- Filesystem changes are unknown: no usable before/after diff was recorded.")
         lines.append(f"- Created files/entries: `{filesystem.get('created_count')}`")
         lines.append(f"- Modified files/entries: `{filesystem.get('modified_count')}`")
         lines.append(f"- Deleted files/entries: `{filesystem.get('deleted_count')}`")
@@ -754,7 +801,9 @@ class RunReportGenerator:
         created = filesystem.get("created") or []
         lines.append("### Created entries")
         lines.append("")
-        if created:
+        if not filesystem_available:
+            lines.append("- Created entries were not established.")
+        elif created:
             lines.append("| Path | Type | Size | SHA256 |")
             lines.append("|---|---|---:|---|")
 
@@ -773,7 +822,9 @@ class RunReportGenerator:
         modified = filesystem.get("modified") or []
         lines.append("### Modified entries")
         lines.append("")
-        if modified:
+        if not filesystem_available:
+            lines.append("- Modified entries were not established.")
+        elif modified:
             lines.append("| Path | Changes |")
             lines.append("|---|---|")
 
@@ -791,7 +842,9 @@ class RunReportGenerator:
         deleted = filesystem.get("deleted") or []
         lines.append("### Deleted entries")
         lines.append("")
-        if deleted:
+        if not filesystem_available:
+            lines.append("- Deleted entries were not established.")
+        elif deleted:
             lines.append("| Path | Type | Size | SHA256 |")
             lines.append("|---|---|---:|---|")
 
@@ -828,6 +881,9 @@ class RunReportGenerator:
 
         lines.append("## Security model")
         lines.append("")
+        lines.append("Runtime fields come from the saved security status. Unknown means no value was recorded.")
+        lines.append("Configured isolation and internet access describe intended setup; they do not verify enforcement.")
+        lines.append("")
         for key, value in security.items():
             if isinstance(value, (dict, list)):
                 rendered = json.dumps(
@@ -836,9 +892,10 @@ class RunReportGenerator:
                     sort_keys=True,
                 )
             else:
-                rendered = str(value)
+                rendered = str(value) if value is not None else "unknown"
 
             lines.append(f"- `{key}`: `{rendered}`")
+        lines.append("")
         lines.append("## Runtime stdout preview")
         lines.append("")
         lines.append("```text")
@@ -867,7 +924,10 @@ class RunReportGenerator:
             return {}
 
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                return {"_error": f"Expected a JSON object: {path}"}
+            return value
         except json.JSONDecodeError:
             return {
                 "_error": f"Invalid JSON: {path}",
@@ -879,7 +939,7 @@ class RunReportGenerator:
 
         events = []
 
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in iter_log_lines(path):
             if not line.strip():
                 continue
 
@@ -894,12 +954,8 @@ class RunReportGenerator:
         if not path.exists():
             return ""
 
-        data = path.read_text(encoding="utf-8", errors="replace")
-
-        if len(data) <= limit:
-            return data
-
-        return data[:limit] + "\n...[truncated]..."
+        data, truncated = read_log_preview(path, limit)
+        return data + "\n...[truncated]..." if truncated else data
 
     def file_info(self, path: Path) -> dict[str, Any]:
         return {

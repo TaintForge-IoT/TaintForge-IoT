@@ -11,7 +11,7 @@ from taintforge_env.replay_store import ReplayStore, ReplayStoreError
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Serve exact TCP exchanges from a TaintForge replay store")
+    parser = argparse.ArgumentParser(description="Serve TCP, UDP and DNS exchanges from a TaintForge replay store")
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--expected-store-sha256", required=True)

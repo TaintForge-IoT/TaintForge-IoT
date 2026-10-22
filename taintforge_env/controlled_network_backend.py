@@ -126,6 +126,8 @@ class SocketPortAllocator:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     sock.bind((host, port))
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                        udp.bind((host, port))
                 except OSError:
                     continue
                 return port
@@ -142,6 +144,10 @@ class NetworkServiceMapping:
     placement: str
     bind_ip: str
     bind_port: int
+    domain: str | None = None
+    upstream_ip: str | None = None
+    upstream_port: int | None = None
+    dns_records: dict | None = None
 
     def to_policy_dict(self) -> dict[str, Any]:
         return {
@@ -149,10 +155,13 @@ class NetworkServiceMapping:
             "role": self.role,
             "remote_ip": self.remote_ip,
             "remote_port": self.remote_port,
-            "domain": None,
+            "domain": self.domain,
             "bind_ip": self.bind_ip,
             "bind_port": self.bind_port,
-            "protocol_hint": self.protocol_hint
+            "protocol_hint": self.protocol_hint,
+            **({"upstream_ip": self.upstream_ip, "upstream_port": self.upstream_port}
+               if self.upstream_ip is not None else {}),
+            **({"dns_records": self.dns_records} if self.dns_records is not None else {})
         }
 
 
@@ -212,8 +221,8 @@ class ControlledNetworkConfig:
         self.run_dir = Path(self.run_dir).resolve(strict=False)
         self.template_policy_path = Path(self.template_policy_path).resolve(strict=False)
         self.responder_mode = str(self.responder_mode).strip().lower()
-        if self.responder_mode not in {"emulated", "replay"}:
-            raise ControlledNetworkError("responder_mode must be one of: emulated, replay")
+        if self.responder_mode not in {"emulated", "replay", "record"}:
+            raise ControlledNetworkError("responder_mode must be one of: emulated, replay, record")
         if self.replay_store_path is not None:
             self.replay_store_path = Path(self.replay_store_path).resolve(strict=False)
         if self.responder_mode == "replay" and self.replay_store_path is None:
@@ -341,9 +350,13 @@ class ControlledNetworkBackend:
         _validate_directory(self.config_dir, "run config directory")
         _validate_directory(self.logs_dir, "run logs directory")
         _validate_regular_file(self.config.template_policy_path,"template network policy")
-        service_scripts = (("scripts/start_network_replay.py",) if self.config.responder_mode == "replay" else ("scripts/start_network_emulator.py","scripts/start_transparent_logger.py"))
+        service_scripts = (("scripts/start_network_record.py",) if self.config.responder_mode == "record" else ("scripts/start_network_replay.py",) if self.config.responder_mode == "replay" else ("scripts/start_network_emulator.py","scripts/start_transparent_logger.py"))
         for relative in service_scripts:
             _validate_regular_file(self.config.project_root / relative,relative)
+        if self.config.responder_mode == "record":
+            from .network_policy import load_network_policy
+            from .network_record import validate_record_policy
+            validate_record_policy(load_network_policy(self.config.template_policy_path))
         if self.config.responder_mode == "replay":
             assert self.config.replay_store_path is not None
             try:
@@ -399,7 +412,8 @@ class ControlledNetworkBackend:
                 skipped.append({"index": index, "reason": "service is not an object"})
                 continue
             service_type = str(item.get("service_type") or "tcp").lower()
-            if service_type != "tcp":
+            static_dns = item.get("protocol_hint") == "dns" and isinstance(item.get("dns_records"), dict)
+            if service_type != "tcp" and not (service_type == "udp" and (self.config.responder_mode in {"record", "replay"} or static_dns)):
                 skipped.append(
                     {
                         "index": index,
@@ -450,17 +464,24 @@ class ControlledNetworkBackend:
             role = str(item.get("role") or "tcp")
             protocol_hint_raw = item.get("protocol_hint")
             protocol_hint = (str(protocol_hint_raw) if protocol_hint_raw is not None else None)
-            if remote_ip.is_loopback:
-                loopback_services.append(NetworkServiceMapping(service_type="tcp",role=role,remote_ip=str(remote_ip),remote_port=remote_port,protocol_hint=protocol_hint,placement="namespace_loopback",bind_ip=str(remote_ip),bind_port=remote_port))
+            if self.config.responder_mode == "emulated" and protocol_hint == "dns" and not static_dns:
+                skipped.append({"index": index, "reason": "synthetic DNS requires explicit dns_records"})
+                continue
+            extra = {"domain": item.get("domain"), "upstream_ip": item.get("upstream_ip"), "upstream_port": item.get("upstream_port"), "dns_records": item.get("dns_records")}
+            if remote_ip.is_loopback and self.config.responder_mode != "record":
+                loopback_services.append(NetworkServiceMapping(service_type=service_type,role=role,remote_ip=str(remote_ip),remote_port=remote_port,protocol_hint=protocol_hint,placement="namespace_loopback",bind_ip=str(remote_ip),bind_port=remote_port,**extra))
             else:
-                bind_port = self.port_allocator.allocate(topology.host_ip,port_seed + len(host_services))
-                host_services.append(NetworkServiceMapping(service_type="tcp",role=role,remote_ip=str(remote_ip),remote_port=remote_port,protocol_hint=protocol_hint,placement="host_gateway",bind_ip=topology.host_ip,bind_port=bind_port))
+                preferred = max(port_seed, max((s.bind_port + 1 for s in host_services), default=port_seed))
+                bind_port = self.port_allocator.allocate(topology.host_ip,preferred)
+                if any(s.bind_port == bind_port for s in host_services):
+                    raise ControlledNetworkError("network port allocator returned a duplicate port")
+                host_services.append(NetworkServiceMapping(service_type=service_type,role=role,remote_ip=str(remote_ip),remote_port=remote_port,protocol_hint=protocol_hint,placement="host_gateway",bind_ip=topology.host_ip,bind_port=bind_port,**extra))
 
         catch_all_raw = requested.get("catch_all", {})
         if not isinstance(catch_all_raw, dict):
             raise ControlledNetworkError("network policy catch_all must be a JSON object")
         catch_all_enabled = bool(catch_all_raw.get("enabled", True))
-        if self.config.responder_mode == "replay":
+        if self.config.responder_mode in {"replay", "record"}:
             catch_all_enabled = False
         tcp_port = _validated_port(catch_all_raw.get("tcp_bind_port", 40000),"catch_all.tcp_bind_port")
         udp_port = _validated_port(catch_all_raw.get("udp_bind_port", 40001),"catch_all.udp_bind_port")
@@ -470,6 +491,12 @@ class ControlledNetworkBackend:
         return ControlledNetworkPlan(namespace_name=topology.namespace_name,veth_host=topology.veth_host,veth_namespace=topology.veth_namespace,host_ip=topology.host_ip,namespace_ip=topology.namespace_ip,host_cidr=topology.host_cidr,namespace_cidr=topology.namespace_cidr,catch_all_enabled=catch_all_enabled,catch_all_tcp_port=tcp_port,catch_all_udp_port=udp_port,host_services=tuple(host_services),loopback_services=tuple(loopback_services),skipped_services=tuple(skipped))
 
     def _validate_replay_plan(self, plan: ControlledNetworkPlan) -> None:
+        if self.config.responder_mode in {"record", "replay"}:
+            endpoints = [(s.service_type, s.remote_ip, s.remote_port) for s in plan.all_services]
+            if len(endpoints) != len(set(endpoints)):
+                raise ControlledNetworkError("duplicate original network endpoint")
+            if plan.skipped_services:
+                raise ControlledNetworkError("network policy contains unsupported services: " + str(plan.skipped_services))
         if self.config.responder_mode != "replay":
             return
         if plan.skipped_services:
@@ -482,7 +509,7 @@ class ControlledNetworkBackend:
         missing: list[str] = []
         for service in plan.all_services:
             try:
-                exchanges = store.exchanges_for_endpoint(transport="tcp",remote_ip=service.remote_ip,remote_port=service.remote_port,protocol_hint=service.protocol_hint)
+                exchanges = store.exchanges_for_endpoint(transport=service.service_type,remote_ip=service.remote_ip,remote_port=service.remote_port,protocol_hint=service.protocol_hint)
             except ReplayStoreValidationError as exc:
                 raise ControlledNetworkError(str(exc)) from exc
             if not exchanges:
@@ -523,6 +550,9 @@ class ControlledNetworkBackend:
             "requested_policy_sha256": _sha256_file(self.requested_policy_path),
             "requested_mode": requested.get("mode")
         }
+        if self.config.responder_mode == "record":
+            for policy in (host_policy, loopback_policy, effective):
+                policy["recording"] = requested["recording"]
         _atomic_write_json(self.host_policy_path, host_policy)
         _atomic_write_json(self.loopback_policy_path, loopback_policy)
         _atomic_write_json(self.effective_policy_path, effective)
@@ -542,11 +572,17 @@ class ControlledNetworkBackend:
         for mapping in plan.host_services:
             commands.extend(
                 [
-                    self._ns_command(plan,"iptables","-t","nat","-A","OUTPUT","-p","tcp","-d",mapping.remote_ip,"--dport",str(mapping.remote_port),"-j","DNAT","--to-destination",f"{mapping.bind_ip}:{mapping.bind_port}"),
-                    self._ns_command(plan,"iptables","-A","OUTPUT","-p","tcp","-d",mapping.bind_ip,"--dport",str(mapping.bind_port),"-j","ACCEPT"),
-                    self._ns_command(plan,"iptables","-A","INPUT","-p","tcp","-s",mapping.bind_ip,"--sport",str(mapping.bind_port),"-j","ACCEPT")
+                    self._ns_command(plan,"iptables","-t","nat","-A","OUTPUT","-p",mapping.service_type,"-d",mapping.remote_ip,"--dport",str(mapping.remote_port),"-j","DNAT","--to-destination",f"{mapping.bind_ip}:{mapping.bind_port}"),
+                    self._ns_command(plan,"iptables","-A","OUTPUT","-p",mapping.service_type,"-d",mapping.bind_ip,"--dport",str(mapping.bind_port),"-j","ACCEPT"),
+                    self._ns_command(plan,"iptables","-A","INPUT","-p",mapping.service_type,"-s",mapping.bind_ip,"--sport",str(mapping.bind_port),"-j","ACCEPT")
                 ]
             )
+            if ipaddress.ip_address(mapping.remote_ip).is_loopback:
+                commands.extend([
+                    self._ns_command(plan,"sysctl","-q","-w",f"net.ipv4.conf.{plan.veth_namespace}.route_localnet=1"),
+                    self._ns_command(plan,"iptables","-t","nat","-A","POSTROUTING","-p",mapping.service_type,
+                        "-s","127.0.0.0/8","-d",mapping.bind_ip,"--dport",str(mapping.bind_port),
+                        "-j","SNAT","--to-source",plan.namespace_ip)])
 
         if plan.catch_all_enabled:
             commands.extend(self._catch_all_commands(plan))
@@ -598,7 +634,7 @@ class ControlledNetworkBackend:
 
     def _start_services(self, plan: ControlledNetworkPlan) -> None:
         self.processes = []
-        service_script = ("scripts/start_network_replay.py" if self.config.responder_mode == "replay" else "scripts/start_network_emulator.py")
+        service_script = ("scripts/start_network_record.py" if self.config.responder_mode == "record" else "scripts/start_network_replay.py" if self.config.responder_mode == "replay" else "scripts/start_network_emulator.py")
         replay_arguments = (["--store", str(self.config.replay_store_path), "--expected-store-sha256", str(self.config.replay_store_expected_sha256)] if self.config.responder_mode == "replay" else [])
         if plan.host_services:
             self.processes.append(

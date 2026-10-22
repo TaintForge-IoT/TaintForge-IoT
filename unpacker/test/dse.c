@@ -15,7 +15,7 @@
 #define DSE_Z3_TIMEOUT 2000U
 #define REG_VAR_BASE 0xF000000000000000ULL
 #define FLAG_VAR_BASE 0xE000000000000000ULL
-#define STACK_MASK ((1U << REG_RSP) | (1U << REG_RBP))
+#define STACK_MASK ((1U << DTA_REG_RSP) | (1U << DTA_REG_RBP))
 #define DSE_PATH_MODEL_IMPLEMENTED 1
 #define DSE_MAX_REPLAY_DEPTH 4096U
 #define DSE_MAX_REPLAY_EVAL_NODES DSE_MAX_EXPR_NODES
@@ -3034,7 +3034,7 @@ static bool dse_audit_exact_string_write(const InsnAux *aux, uint64_t address, u
                 }
                 *out_value = summary->values[captured_index];
             } else {
-                *out_value = (uint8_t)((aux->reg_vals[REG_RAX] >> (8U * byte)) & UINT64_C(0xff));
+                *out_value = (uint8_t)((aux->reg_vals[DTA_REG_RAX] >> (8U * byte)) & UINT64_C(0xff));
             }
             *out_event = event;
             *out_byte = byte;
@@ -4315,7 +4315,7 @@ static bool dse_mem_need_apply_exact_string(GHashTable *needed_memory,
                     return false;
             }
         } else {
-            needed_registers[REG_RAX] |= (uint8_t)(needed_mask & aux->reg_taint[REG_RAX]);
+            needed_registers[DTA_REG_RAX] |= (uint8_t)(needed_mask & aux->reg_taint[DTA_REG_RAX]);
         }
     }
     return true;
@@ -4858,7 +4858,7 @@ static bool dse_dependency_frontier_apply(DseDependencyFrontier *frontier, const
     uint64_t excluded_value_mask = observed_address_mask;
 
     if (exact_string && aux->string_summary.kind == DSE_STRING_STOS) {
-        excluded_value_mask |= 1U << REG_RAX;
+        excluded_value_mask |= 1U << DTA_REG_RAX;
     }
     dse_add_deps_value_inputs(deps, aux, excluded_value_mask, forced_value_mask, frontier->regs,
                               natural_mask);

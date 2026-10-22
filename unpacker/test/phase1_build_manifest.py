@@ -63,7 +63,11 @@ def main() -> None:
         "build_inputs": identity,
         "compiled_profile": {"architecture": "i386", "mode": "linux-user", "processes": 1, "threads": 1},
         "requirements": {"qemu_linkage": "dynamic", "plugins": True, "plugin_api": int(api[1]), "flags_contract": "taintforge_x86_flags_v1_when_required"},
-        "formats": {"events": 1, "report": 1, "capture_manifest": 1, "provenance_export": None},
+        "formats": {"events": 1, "report": 1, "capture_manifest": 1, "provenance_export": None,
+                    "cooperative_retirement": 1 if int(api[1]) == 6 else None,
+                    "verdict_retirement": 2 if int(api[1]) == 6 else None},
+        "resource_ledger": {"schema": 1, "scope": "explicit_project_allocations",
+                            "external_allocations_tracked": False},
         "runtime_verification": "not_performed_by_build",
     }
     output = Path(str(args.plugin) + ".runtime.json")
