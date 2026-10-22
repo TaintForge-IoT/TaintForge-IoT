@@ -141,7 +141,7 @@ class Phase1Run:
             options.append(f"x86-flags-receipt={receipt}")
         options.extend(f"tf-{'ir-report' if key == 'ir' else key}={path}" for key, path in self.paths.items())
         options.append(f"ir-check={'on' if ir else 'off'}")
-        allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates"}
+        allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-tls32", "ir-observed-munmap", "ir-observed-mprotect", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates"}
         for option in extra:
             if option.split("=", 1)[0] not in allowed or "=" not in option:
                 raise Phase1RuntimeError(f"not an allowed per-run analysis option: {option}")
