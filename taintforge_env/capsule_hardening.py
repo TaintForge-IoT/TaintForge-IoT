@@ -20,7 +20,7 @@ CONTEXT_KEYS = ('Uid', 'Gid', 'Groups', 'CapInh', 'CapPrm', 'CapEff', 'CapBnd', 
 
 
 def policy(*, analysis_mib=512, export_mib=256, journal_mib=32, uid=65534, gid=65534):
-    for value, maximum in ((analysis_mib, 1024), (export_mib, 512), (journal_mib, 256)):
+    for value, maximum in ((analysis_mib, 131072), (export_mib, 512), (journal_mib, 256)):
         p.require(type(value) is int and 1 <= value <= maximum, 'Invalid M4 byte budget')
     p.require(type(uid) is int and type(gid) is int and 1 <= uid <= 2**31-1 and 1 <= gid <= 2**31-1,
               'M4 execution requires explicit non-root UID/GID')

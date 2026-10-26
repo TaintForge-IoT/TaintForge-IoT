@@ -50,7 +50,7 @@ bool tf_resources_configure(int argc, char **argv) {
         if (*text < '0' || *text > '9') return false;
         char *end; errno = 0;
         value = strtoull(text, &end, 10);
-        if (errno || *end || value < tf_resources_reserved() || value > UINT64_C(4294967296)) return false;
+        if (errno || *end || value < tf_resources_reserved() || value > UINT64_C(137438953472)) return false;
         seen = true;
     }
     if (live) return false;

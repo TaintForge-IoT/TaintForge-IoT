@@ -57,7 +57,7 @@ def settings(*, hold_ms=200, pause_ms=5000, total_ms=30000, timeout=60,
              memory_mib=1024, selection_delay=16, max_instructions=10000000, hardening=None):
     # Native observer/permit deadlines are fixed to the M2 five-second hold.
     p.require(type(hold_ms) is int and 20 <= hold_ms <= 1000 and pause_ms == 5000 and
-              type(total_ms) is int and 10000 <= total_ms <= 600000 and
+              type(total_ms) is int and 10000 <= total_ms <= 86400000 and
               timeout * 1000 >= total_ms + 12000, "Invalid M3 hold/total/wrapper deadlines")
     result = {"profile": PROFILE, "hold_ms": hold_ms, "pause_ms": pause_ms,
             "total_ms": total_ms, "plugin_order": "phase1-first",
@@ -120,6 +120,14 @@ def prepare_binding(context, temporary, manifest, phase1):
         "pc_source": observer.PC_SOURCE, "fault": "none", "plugin_order": config["plugin_order"],
         "hold_ms": config["hold_ms"], "pause_ms": config["pause_ms"], "total_ms": config["total_ms"],
         "after_release_delay_ms": 0, "guest_sha256": descriptor["sha256"]}
+    if 'afl_file' in read_json(context.template_runtime_path):
+        from .afl_file import validate_setting
+        binding['afl_file'] = validate_setting(read_json(context.template_runtime_path)['afl_file'],
+                                              context.execution_rootfs, context.guest_binary)
+    if 'afl_warm' in read_json(context.template_runtime_path):
+        from .afl_warm import validate
+        p.require('afl_file' in binding, 'Warm execution requires a file input')
+        binding['afl_warm'] = validate(read_json(context.template_runtime_path)['afl_warm'])
     (temporary / "logs/capsule/phase1-retirement").mkdir(parents=True)
     # Paths will change during the atomic staging rename; contract data does not.
     modules = {"phase1": temporary / "config/analyzer_runtime" / phase1["plugin"],
@@ -137,11 +145,15 @@ def prepare_binding(context, temporary, manifest, phase1):
 
 
 def contract_data(binding, attempt, modules):
-    return {"schema": 1, "profile": PROFILE, "attempt": attempt,
+    result = {"schema": 1, "profile": PROFILE, "attempt": attempt,
             **{k: binding[k] for k in retirement_mappings.IDENTITY},
             "nonce": binding["lifecycle_attempt"], "input": binding["input_retirement"],
             "observer": binding["observer"], "settings": binding["settings"],
             "phase1_sha256": p.sha(modules["phase1"]), "observer_sha256": p.sha(modules["observer"])}
+    if 'afl_file' in binding:
+        result['afl_file'] = binding['afl_file']
+    if 'afl_warm' in binding: result['afl_warm'] = binding['afl_warm']
+    return result
 
 
 def verify_contract(binding):
@@ -178,6 +190,7 @@ def supervise(binding, ipc):
         "supervisor_kill": False, "pid_scope": "sandbox_pid_namespace", "claims": retirement.CLAIMS}
     workers, pipes = [], []
     process = None
+    warm = None
     stage, started = "preflight", time.monotonic()
     try:
         verify_contract(binding)
@@ -210,6 +223,14 @@ def supervise(binding, ipc):
             phase += ',m4-memory-bytes=' + str(limits['analysis_bytes'])
             phase += ',retire-controller-uid=' + str(os.geteuid())
             arg += ',controller-uid=' + str(os.geteuid())
+        if 'afl_file' in binding:
+            from .afl_file import prepare_map
+            arg += ',' + ','.join(prepare_map(binding, ipc))
+        if 'afl_warm' in binding:
+            from .afl_warm import Broker
+            warm = Broker(binding, ipc)
+            warm.start()
+            arg += ',afl-warm=/__taintforge_capsule/afl-warm.sock,afl-warm-rss=' + str(binding['afl_warm']['max_rss_mib'])
         command = ["chroot", binding["rootfs"], "/__taintforge/bin/loader", "--inhibit-cache",
             "--library-path", "/__taintforge/lib", "/__taintforge/bin/qemu-i386", "-L", "/", "-strace",
             "-plugin", phase, "-plugin", arg, binding["guest_binary"]]
@@ -239,6 +260,10 @@ def supervise(binding, ipc):
             else:
                 result["qemu_exit"] = process.wait(timeout=binding["settings"]["total_ms"] / 1000 + 5)
             result['finish_monotonic_ns'] = time.monotonic_ns()
+        if warm is not None:
+            warm.close()
+            p.require(not warm.errors, 'Warm executor failed: '+str(warm.errors))
+            result['warm'] = read_json(Path(binding['afl_warm']['campaign_root'])/'warm-executor.json')
         worker.join(4)
         p.require(not worker.is_alive(), "M3 observer controller did not finish")
         result["controller_exit"] = worker.exitcode
@@ -254,10 +279,19 @@ def supervise(binding, ipc):
         if process is not None:
             if result['qemu_exit'] is None: result['qemu_exit'] = process.wait(timeout=3)
             result.setdefault('finish_monotonic_ns',time.monotonic_ns())
+        if warm is not None:
+            try: warm.close()
+            except Exception as exc: result.update(status='failed', warm_error=str(exc))
         for worker in workers:
             if worker.is_alive(): worker.kill()
             worker.join(3)
         for pipe in pipes: pipe.close()
+        if 'afl_file' in binding:
+            try:
+                from .afl_file import save_map
+                save_map(binding, ipc)
+            except Exception as exc:
+                result.update(status='failed', coverage_error=str(exc))
         for name in ("phase1.sock", "observer.sock"): (ipc / name).unlink(missing_ok=True)
         result["controller_failures"] = p.saved_worker_failures(output)
         result["elapsed_seconds"] = round(time.monotonic()-started, 3)
@@ -284,7 +318,14 @@ def finish_attempt(context, guest_exit_code):
         from .retirement_evidence import pack
         summary["portable_evidence"] = pack(run, run / "retirement-evidence")
         p.require(summary["status"] == "passed", "M3 retirement/continuation not proven; attempt cannot be reused")
-        summary.update(application_success="evaluated_separately_by_phase2", restart="new_original_elf_attempt")
+        if 'afl_file' in binding and 'afl_warm' not in binding:
+            from .afl_file import verify_map
+            summary['afl_coverage'] = verify_map(binding)
+        if 'afl_warm' in binding:
+            p.require(result.get('warm', {}).get('status') == 'passed' and result['warm']['children'] >= 0,
+                      'Invalid warm completion record')
+            summary['warm'] = result['warm']
+        summary.update(application_success="evaluated_separately_by_phase2", restart="live_post_retirement_fork" if "afl_warm" in binding else "new_original_elf_attempt")
     except Exception as exc:
         summary.update(status="failed", error=f"{type(exc).__name__}: {exc}"[-6000:])
         raise

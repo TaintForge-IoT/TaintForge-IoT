@@ -37,7 +37,8 @@ def build_plugin(out):
               "-Wformat=2", "-fPIC", "-fvisibility=hidden", "-shared", "-pthread",
               "-Wl,-z,relro,-z,now", "-I", header.parent, HERE / "observer.c", "-o", plugin, *flags)
     result = dict(plugin=str(plugin), plugin_sha256=p.sha(plugin),
-                  source_sha256={"observer.c": p.sha(HERE / "observer.c"), "qemu-plugin.h": p.sha(header)})
+                  source_sha256={"observer.c": p.sha(HERE / "observer.c"), "qemu-plugin.h": p.sha(header),
+                                 "afl_coverage.h": p.sha(HERE.parent / "afl_file/coverage.h")})
     p.write_json(out / "build.json", result)
     return result
 
@@ -304,6 +305,12 @@ def control_worker(endpoint, pipe, gate, binding):
                 record(dict(event="progress_window", scope=WINDOW, lower_seq=stamp["seq"],
                             upper_seq=first["seq"], entries=first["seq"]-stamp["seq"],
                             exact_uninstall_interval=False, exact_oep_cutover=False))
+        if 'afl_warm' in binding:
+            stage = 'warm_checkpoint'
+            channel.timeout = binding['afl_warm']['bootstrap_seconds'] + 1
+            checkpoint = channel.receive('warm_checkpoint')
+            p.require(checkpoint['host_pid'] == pid and checkpoint['seq'] > first['seq'],
+                      'Warm checkpoint precedes retirement continuation')
         stage = "guest_exit"
         channel.timeout = config["total_ms"] / 1000 + 1
         done = channel.receive("done")
@@ -374,6 +381,8 @@ def verify_attempt(binding, result):
     prefix = first_order + ["RESUME 1", "resumed", "export_ready", "STAMP", "stamp", "permit_grant", "released"]
     second_order = ["module_unmapped", "HOLD 2", "snapshot", "maps_held", "CHECK 2", "snapshot"]
     success_order = prefix + second_order + ["RESUME 2", "resumed", "progress_window", "done"]
+    if 'afl_warm' in binding:
+        success_order.insert(-1, 'warm_checkpoint')
     controller = read_json(output / "controller.json")
     fault, code = config["fault"], result["qemu_exit"]
     if fault == "none" and (code == 0 or (input_mode and type(code) is int and
@@ -398,10 +407,10 @@ def verify_attempt(binding, result):
     pid = result["qemu_pid"]
     identity = mappings.load_identity(binding)
     for event in stripped:
-        if event["event"] in {"snapshot", "resumed", "stamp", "done", "early_exit"}:
+        if event["event"] in {"snapshot", "resumed", "stamp", "done", "early_exit", "warm_checkpoint"}:
             p.require(type(event.get("protocol")) is int and event["protocol"] == protocol,
                       "Mixed/downgraded observer protocol")
-        if event["event"] in {"stamp", "done", "early_exit"}:
+        if event["event"] in {"stamp", "done", "early_exit", "warm_checkpoint"}:
             p.require(event.get("host_pid") == pid and
                       type(event.get("seq")) is int and event["seq"] >= 1, "Invalid counter event identity")
     for point in (1, 2):
@@ -465,6 +474,6 @@ def verify_attempt(binding, result):
         hardening['hardening'] = verify_saved(binding, stripped, pid)
         report = read_json(retirement.analysis(binding).paths['report'])
         verify_ledger(binding, accepted['events'][-1]['data'], report)
-    return dict(status=status, **hardening, continuation_observed=status == "passed", guest_completed=status == "passed",
+    return dict(status=status, **hardening, continuation_observed=status == "passed", guest_completed=status == "passed" and "afl_warm" not in binding,
                 phase1_retirement=dict(status="verified" if accepted else "unproven", phase1_retired=bool(accepted),
                     claims=retirement.CLAIMS, verdict=accepted["events"][0]["data"] if accepted else None))

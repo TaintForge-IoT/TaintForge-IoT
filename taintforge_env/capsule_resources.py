@@ -16,9 +16,9 @@ PROPERTIES = "LoadState,ActiveState,Result,ExecMainCode,ExecMainStatus,ControlGr
 
 
 def policy(memory_mib=1024, seconds=70):
-    probe.require(type(memory_mib) is int and 256 <= memory_mib <= 4096,
-                  "Capsule memory limit must be an integer between 256 and 4096 MiB")
-    probe.require(type(seconds) is int and 20 <= seconds <= 900, "Invalid capsule service lifetime")
+    probe.require(type(memory_mib) is int and 256 <= memory_mib <= 262144,
+                  "Capsule memory limit must be an integer between 256 and 262144 MiB")
+    probe.require(type(seconds) is int and 20 <= seconds <= 172800, "Invalid capsule service lifetime")
     return {"backend": "systemd-system-service-v1", "memory_bytes": memory_mib * 1024 * 1024,
             "swap_bytes": 0, "tasks": 64, "seconds": seconds}
 
