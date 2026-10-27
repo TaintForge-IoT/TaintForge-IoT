@@ -29,6 +29,8 @@ static TfConcolic *g_concolic;
 static TfRuntimeDiag g_runtime_diag;
 static TfPhase1Io g_phase1;
 static void phase1_invalidate(uint64_t address, uint32_t generation, const char *reason);
+static void stage_clear_producers(void);
+static void stage_invalidate_mapping_range(uint64_t address, uint64_t size);
 
 /* Opt-in diagnostic consumer. Existing DSE verdict/scoring is independent. */
 static IrRuntime g_ir_runtime;
@@ -350,6 +352,22 @@ typedef struct {
     bool exec_seen;
     bool candidate_seen;
     uint64_t candidate_epoch;
+    uint64_t candidate_seq;
+    uint32_t candidate_generation;
+    /* Conservative last contiguous guest-store interval. Any unknown writer,
+     * disjoint interval, mapping replacement or intervening kernel copy-in
+     * loses older producer evidence instead of inventing a relation. */
+    bool producer_valid;
+    uint64_t producer_candidate_id, producer_begin, producer_end;
+    uint64_t producer_write_pc, producer_write_seq;
+    uint32_t producer_write_generation, producer_vcpu;
+    uint64_t mapping_epoch, guest_store_generation, producer_writer_mapping_epoch;
+    /* Kind zero is deliberately anonymous/initial for zero-initialized pages.
+     * File identity is observational metadata, not an assertion that a mapping
+     * is immutable or that its current COW bytes still equal the file. */
+    unsigned backing_kind;
+    bool backing_shared;
+    uint64_t backing_offset, descriptor_epoch, backing_content_epoch;
 } page_t;
 
 typedef struct {
@@ -374,11 +392,56 @@ typedef struct {
     uint64_t observed_seq, candidate_id, epoch;
     uint32_t code_generation;
     bool stale;
+    bool superseded;
+    uint64_t parent_candidate_id, superseded_by_candidate_id;
+    uint64_t source_write_pc, source_write_seq, transfer_seq;
+    uint32_t source_write_generation, vcpu;
+    uint64_t mapping_epoch, guest_store_generation, parent_mapping_epoch;
+    uint64_t source_writer_mapping_epoch;
+    unsigned backing_kind;
+    bool backing_shared;
+    uint64_t backing_offset, descriptor_epoch, backing_content_epoch;
+    uint64_t written_begin, written_end;
+    uint32_t entry_size;
+    uint64_t code_page;
+    uint8_t *code_page_bytes;
     ProgramCapture capture;
 } oep_cand_t;
 
 static oep_cand_t *g_selected_candidate;
 static uint64_t g_candidate_count;
+/* Mapping lifetimes and STORE ordinals are separate from code generations. */
+static uint64_t g_stage_syscall_ordinal, g_stage_guest_store_ordinal;
+static bool g_stage_mapping_identity;
+static bool g_stage_file_mapping_profile;
+static uint64_t g_stage_self_fd_epoch[64];
+/* Local memfd identities are never recycled with numeric descriptors. They
+ * describe this observation only; replay separately proves their contents. */
+static bool g_stage_mutable_file_profile;
+static bool g_stage_shared_file_profile;
+static bool g_stage_tail_file_profile;
+static unsigned g_stage_memfd_file[64], g_stage_next_memfd_file = 1;
+static uint64_t g_stage_memfd_fd_epoch[64], g_stage_memfd_cursor[64];
+/* Per-file shadow pages contain only guest-STORE ownership, never observed
+ * file values. Coordinates are file offsets. Syscall copy-ins erase ownership
+ * instead of being promoted to a guest STORE. */
+typedef struct {
+    bool valid, tail_dirty;
+    uint64_t size, content_epoch;
+    page_t *store_pages[256];
+} StageMemfd;
+static StageMemfd g_stage_memfd_files[32];
+static struct {
+    bool active, supported;
+    int64_t number;
+    uint64_t args[3], ordinal;
+} g_stage_pending_mutable;
+static struct { bool active, supported; } g_stage_pending_msync;
+/* Execution-phase ownership is intentionally narrow: one observed candidate's
+ * cached entry page, unchanged writer/transfer instruction bytes, one vCPU.
+ * It is evidence about this run, never a semantic unpacker classification. */
+static __thread oep_cand_t *g_active_candidate;
+static __thread uint64_t prev_jump_owner_id;
 
 typedef struct {
     uint64_t pc;
@@ -592,6 +655,7 @@ static __thread bool prev_jump_pending = false;
 static __thread uint64_t prev_mem_target_value = 0;
 static __thread bool prev_mem_target_valid = false;
 static __thread bool prev_target_tainted = false;
+static __thread bool prev_jump_direct = false;
 
 typedef struct {
     uint64_t pc;
@@ -912,6 +976,7 @@ typedef struct {
     uint32_t flags;
     int32_t fd;
     uint64_t offset;
+    uint64_t syscall_ordinal;
 } pending_mmap_t;
 
 static __thread pending_mmap_t g_pending_mmap;
@@ -2640,18 +2705,12 @@ static void dse_on_mem_impl(unsigned int vcpu, qemu_plugin_meminfo_t info, uint6
             }
         }
     } else if (meta && meta->insn_id == X86_INS_LEAVE) {
-        RegSlice ebp_slice = reg_slice_from_x86(X86_REG_EBP, 4);
-        RegSlice esp_slice = reg_slice_from_x86(X86_REG_ESP, 4);
-        ProvLabelId old_ebp_labels[4];
-        bool leave_valid = size == 4 && effective_labels_valid && reg_slice_is_valid(ebp_slice) &&
-                           reg_slice_is_valid(esp_slice) &&
-                           reg_slice_load_labels(&transfer->pre_regs, ebp_slice, old_ebp_labels);
-        if (leave_valid) {
-            (void)reg_slice_store_labels(regs, esp_slice, old_ebp_labels, 4,
-                                         vcpu_state->current_ip);
-            (void)reg_slice_store_labels(regs, ebp_slice, effective_labels, 4,
-                                         vcpu_state->current_ip);
-        } else {
+        bool leave_valid = size == 4 && context_valid && effective_labels_valid &&
+                           dta_apply_leave32_labels(regs, &transfer->pre_regs, effective_labels,
+                                                      vcpu_state->current_ip);
+        if (!leave_valid) {
+            RegSlice ebp_slice = reg_slice_from_x86(X86_REG_EBP, 4);
+            RegSlice esp_slice = reg_slice_from_x86(X86_REG_ESP, 4);
             ProvLabelId incomplete =
                 dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
             if (reg_slice_is_valid(esp_slice)) {
@@ -2771,6 +2830,383 @@ static void lib_update_mapping(uint32_t fd, uint64_t addr, uint64_t size) {
     }
 }
 
+static bool stage_readonly_self_path(const char *path, uint32_t flags) {
+    return path && flags == 0 && !strcmp(path, "/proc/self/exe");
+}
+
+static bool stage_self_fd(int32_t fd) {
+    return fd >= 3 && fd < 64 && g_stage_self_fd_epoch[fd] != 0;
+}
+
+static void stage_bind_open_descriptor(int32_t fd, const char *path, uint32_t flags,
+                                       uint64_t ordinal) {
+    if (fd < 0 || fd >= 64)
+        return;
+    g_stage_memfd_file[fd] = 0;
+    g_stage_memfd_fd_epoch[fd] = g_stage_memfd_cursor[fd] = 0;
+    g_stage_self_fd_epoch[fd] = fd >= 3 && ordinal && stage_readonly_self_path(path, flags)
+                                  ? ordinal : 0;
+}
+
+static void stage_forget_descriptor(int32_t fd) {
+    if (fd >= 0 && fd < 64) {
+        g_stage_self_fd_epoch[fd] = 0;
+        g_stage_memfd_file[fd] = 0;
+        g_stage_memfd_fd_epoch[fd] = g_stage_memfd_cursor[fd] = 0;
+    }
+}
+
+static unsigned stage_memfd_file(int32_t fd) {
+    if (fd < 3 || fd >= 64 || !g_stage_memfd_fd_epoch[fd])
+        return 0;
+    unsigned file = g_stage_memfd_file[fd];
+    return file && file < 32 && g_stage_memfd_files[file].valid ? file : 0;
+}
+
+static bool stage_memfd_live_mapping(unsigned file) {
+    if (!file || !pages)
+        return false;
+    GHashTableIter iterator;
+    gpointer value;
+    g_hash_table_iter_init(&iterator, pages);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        const page_t *page = value;
+        if (page->backing_kind == file + 2)
+            return true;
+    }
+    return false;
+}
+
+static bool stage_memfd_private_mapping(unsigned file) {
+    if (!file || !pages)
+        return false;
+    GHashTableIter iterator;
+    gpointer value;
+    g_hash_table_iter_init(&iterator, pages);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        const page_t *page = value;
+        if (page->backing_kind == file + 2 && !page->backing_shared)
+            return true;
+    }
+    return false;
+}
+
+static void stage_clear_page_store(page_t *page) {
+    if (!page)
+        return;
+    g_clear_pointer(&page->wbitmap, g_free);
+    page->written = page->exec_after_write = false;
+    page->producer_valid = false;
+    page->guest_store_generation = 0;
+}
+
+/* A copied kernel interval may cover an old guest-written entry. Retain no
+ * older interval from an overlapping file page, even if some bytes survived. */
+static void stage_forget_file_store(unsigned file, uint64_t begin, uint64_t end,
+                                    uint64_t content_epoch) {
+    if (!file || file >= 32 || begin >= end)
+        return;
+    StageMemfd *state = &g_stage_memfd_files[file];
+    for (unsigned i = 0; i < 256; ++i)
+        if ((uint64_t)i * 4096 < end && begin < (uint64_t)(i + 1) * 4096)
+            stage_clear_page_store(state->store_pages[i]);
+    if (!pages)
+        return;
+    GHashTableIter iterator;
+    gpointer key, value;
+    g_hash_table_iter_init(&iterator, pages);
+    while (g_hash_table_iter_next(&iterator, &key, &value)) {
+        page_t *page = value;
+        if (page->backing_kind != file + 2 || !page->backing_shared)
+            continue;
+        page->backing_content_epoch = content_epoch;
+        if (page->backing_offset >= end || begin >= page->backing_offset + page_size)
+            continue;
+        if (page->exec_seen || page->exec_after_write)
+            phase1_invalidate((uint64_t)(uintptr_t)key, next_code_generation(),
+                              "shared_file_kernel_write_to_code");
+        stage_clear_page_store(page);
+        page->gen_written = next_code_generation();
+        page->exec_seen = false;
+    }
+}
+
+/* Project file-coordinate provenance into an alias, preserving its independent
+ * address, protection, mapping lifetime, descriptor lifetime and backing. */
+static void stage_project_file_store(page_t *page, uint64_t address) {
+    unsigned file = page->backing_kind >= 3 && page->backing_kind <= 33
+                        ? page->backing_kind - 2 : 0;
+    if (!file || page->backing_offset % 4096 || page->backing_offset / 4096 >= 256)
+        return;
+    const page_t *stored = g_stage_memfd_files[file].store_pages[page->backing_offset / 4096];
+    if (!stored || !stored->written)
+        return;
+    page->written = true;
+    page->write_count = stored->write_count;
+    page->last_write = stored->last_write;
+    page->gen_written = stored->gen_written;
+    page->guest_store_generation = stored->guest_store_generation;
+    page->wbitmap = stored->wbitmap ? g_memdup2(stored->wbitmap, page_size / 8U) : NULL;
+    page->producer_valid = stored->producer_valid;
+    page->producer_candidate_id = stored->producer_candidate_id;
+    page->producer_begin = address + stored->producer_begin - page->backing_offset;
+    page->producer_end = address + stored->producer_end - page->backing_offset;
+    page->producer_write_pc = stored->producer_write_pc;
+    page->producer_write_seq = stored->producer_write_seq;
+    page->producer_write_generation = stored->producer_write_generation;
+    page->producer_vcpu = stored->producer_vcpu;
+    page->producer_writer_mapping_epoch = stored->producer_writer_mapping_epoch;
+    page->exec_after_write = (page->prot & 4) != 0;
+}
+
+static bool stage_memfd_name(uint64_t address) {
+    for (unsigned i = 0; i < 64; ++i) {
+        uint8_t value;
+        if (address > UINT32_MAX - i || !guest_read_bytes(address + i, &value, 1))
+            return false;
+        if (!value)
+            return true;
+    }
+    return false;
+}
+
+static bool stage_preserve_mutable_owner(int64_t number, uint64_t first,
+                                         uint64_t second, uint64_t third) {
+    if (!is_i386)
+        return false;
+    uint32_t fd = (uint32_t)first;
+    if (number == 356)
+        return ((uint32_t)second <= 1 || (uint32_t)second == 16 || (uint32_t)second == 17) &&
+               stage_memfd_name((uint32_t)first);
+    unsigned file = stage_memfd_file((int32_t)fd);
+    if (!file)
+        return false;
+    if (number == 6)
+        return true;
+    if (number == 19)
+        return (uint32_t)third == 0 && (uint32_t)second <= 1048576;
+    if (number != 4 && number != 93)
+        return false;
+    bool live = stage_memfd_live_mapping(file);
+    if (live && (number == 93 || !g_stage_shared_file_profile || stage_memfd_private_mapping(file)))
+        return false;
+    if (number == 93)
+        return !g_stage_memfd_files[file].tail_dirty && (uint32_t)second <= 1048576;
+    if ((live || g_stage_memfd_files[file].tail_dirty) &&
+        ((uint32_t)third > g_stage_memfd_files[file].size ||
+                 g_stage_memfd_cursor[fd] > g_stage_memfd_files[file].size - (uint32_t)third))
+        return false;
+    return (uint32_t)third <= 1048576 && g_stage_memfd_cursor[fd] <= 1048576 &&
+           (uint64_t)(uint32_t)second + (uint32_t)third <= (UINT64_C(1) << 32);
+}
+
+/* A bounded local shmem MS_SYNC has no byte or mapping effect. Only the
+ * observed successful return authorizes retaining earlier STORE ancestry. */
+static bool stage_preserve_msync_owner(int64_t number, uint64_t address,
+                                        uint64_t size, uint64_t flags) {
+    if (!is_i386 || !g_stage_shared_file_profile || number != 144 || !pages ||
+        page_size != 4096 || address < 0x10000 || address > UINT32_MAX ||
+        !size || size > 1048576 || flags != 4 || (address & 4095) ||
+        address + size > (UINT64_C(1) << 32))
+        return false;
+    uint64_t end = (address + size + 4095) & ~UINT64_C(4095);
+    for (uint64_t current = address; current < end; current += 4096) {
+        const page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)current);
+        unsigned file = page && page->backing_kind >= 3 && page->backing_kind <= 33
+                            ? page->backing_kind - 2 : 0;
+        if (!file || !page->backing_shared || !g_stage_memfd_files[file].valid ||
+            !g_stage_memfd_files[file].size || (page->backing_offset & 4095) ||
+            page->backing_offset + 4096 >
+                ((g_stage_memfd_files[file].size + 4095) & ~UINT64_C(4095)))
+            return false;
+    }
+    return true;
+}
+
+static void stage_pending_msync_return(int64_t number, int64_t returned) {
+    if (!g_stage_pending_msync.active)
+        return;
+    bool supported = g_stage_pending_msync.supported;
+    memset(&g_stage_pending_msync, 0, sizeof g_stage_pending_msync);
+    if (number != 144 || !supported || (uint32_t)returned) {
+        stage_clear_producers();
+        tf_phase1_profile_lost(&g_phase1, "shared_file_msync_unsupported");
+        return;
+    }
+    g_stage_tail_file_profile = true;
+}
+
+static void stage_pending_mutable_begin(int64_t number, uint64_t first,
+                                        uint64_t second, uint64_t third) {
+    memset(&g_stage_pending_mutable, 0, sizeof(g_stage_pending_mutable));
+    if (!is_i386 || (number != 356 && number != 4 && number != 93 && number != 19))
+        return;
+    /* Ordinary stdout writes remain outside this bounded file profile. */
+    if (number != 356 && !g_stage_memfd_file[(uint32_t)first < 64 ? (uint32_t)first : 0])
+        return;
+    g_stage_pending_mutable.active = true;
+    g_stage_pending_mutable.supported = stage_preserve_mutable_owner(number, first, second, third);
+    g_stage_pending_mutable.number = number;
+    g_stage_pending_mutable.args[0] = (uint32_t)first;
+    g_stage_pending_mutable.args[1] = (uint32_t)second;
+    g_stage_pending_mutable.args[2] = (uint32_t)third;
+    g_stage_pending_mutable.ordinal = g_stage_syscall_ordinal;
+}
+
+static void stage_poison_memfd(unsigned file) {
+    if (!file || file >= 32)
+        return;
+    g_stage_memfd_files[file].valid = false;
+    if (pages) {
+        GHashTableIter iterator;
+        gpointer value;
+        g_hash_table_iter_init(&iterator, pages);
+        while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+            page_t *page = value;
+            if (page->backing_kind == file + 2) {
+                page->backing_kind = 2;
+                page->descriptor_epoch = page->backing_content_epoch = 0;
+            }
+        }
+    }
+    for (GList *item = oep_cands; item; item = item->next) {
+        oep_cand_t *candidate = item->data;
+        if (candidate->backing_kind == file + 2)
+            candidate->stale = true;
+    }
+    stage_clear_producers();
+}
+
+static void stage_pending_mutable_return(int64_t number, int64_t returned) {
+    if (!g_stage_pending_mutable.active)
+        return;
+    bool supported = g_stage_pending_mutable.supported;
+    uint32_t first = (uint32_t)g_stage_pending_mutable.args[0];
+    uint32_t second = (uint32_t)g_stage_pending_mutable.args[1];
+    uint32_t third = (uint32_t)g_stage_pending_mutable.args[2];
+    uint64_t ordinal = g_stage_pending_mutable.ordinal;
+    bool matches = number == g_stage_pending_mutable.number;
+    g_stage_pending_mutable.active = false;
+    uint32_t result = (uint32_t)returned;
+    unsigned file = first < 64 ? g_stage_memfd_file[first] : 0;
+    if (!matches || !supported || result >= UINT32_C(0xfffff001)) {
+        stage_poison_memfd(file);
+        stage_clear_producers();
+        tf_phase1_profile_lost(&g_phase1, "mutable_file_effect_unsupported");
+        return;
+    }
+    if (number == 356) {
+        if (result < 3 || result >= 64 || g_stage_self_fd_epoch[result] ||
+            g_stage_memfd_file[result] || g_stage_next_memfd_file >= 32 || !ordinal) {
+            stage_clear_producers();
+            tf_phase1_profile_lost(&g_phase1, "mutable_file_descriptor_identity");
+            return;
+        }
+        file = g_stage_next_memfd_file++;
+        g_stage_memfd_file[result] = file;
+        g_stage_memfd_fd_epoch[result] = ordinal;
+        g_stage_memfd_cursor[result] = 0;
+        g_stage_memfd_files[file] = (StageMemfd){.valid=true, .size=0, .content_epoch=ordinal};
+        g_stage_mutable_file_profile = g_stage_file_mapping_profile = true;
+        if (second == 16 || second == 17)
+            g_stage_shared_file_profile = true;
+        g_stage_mapping_identity = true;
+        return;
+    }
+    if (!file || file >= 32 || !g_stage_memfd_files[file].valid) {
+        stage_clear_producers();
+        tf_phase1_profile_lost(&g_phase1, "mutable_file_lifetime_lost");
+        return;
+    }
+    StageMemfd *state = &g_stage_memfd_files[file];
+    if (number == 19 && third == 0 && result == second) {
+        g_stage_memfd_cursor[first] = result;
+        return;
+    }
+    if (number == 93 && !result) {
+        if (state->size != second) {
+            stage_forget_file_store(file, MIN(state->size, second), 1048576, ordinal);
+            state->size = second;
+            state->content_epoch = ordinal;
+        }
+        return;
+    }
+    if (number == 4 && result <= third &&
+        result <= 1048576 - g_stage_memfd_cursor[first]) {
+        if (result) {
+            stage_forget_file_store(file, g_stage_memfd_cursor[first],
+                                    g_stage_memfd_cursor[first] + result, ordinal);
+            g_stage_memfd_cursor[first] += result;
+            if (state->size < g_stage_memfd_cursor[first])
+                state->size = g_stage_memfd_cursor[first];
+            state->content_epoch = ordinal;
+        }
+        return;
+    }
+    stage_poison_memfd(file);
+    tf_phase1_profile_lost(&g_phase1, "mutable_file_return_contract");
+}
+
+static bool stage_preserve_file_owner(int64_t number, uint64_t first, uint64_t second) {
+    if (!is_i386)
+        return false;
+    if (number == 6)
+        return stage_self_fd((int32_t)(uint32_t)first);
+    if (number == 5 && (uint32_t)second == 0) {
+        static const char self[] = "/proc/self/exe";
+        uint8_t path[sizeof self];
+        return (uint32_t)first <= UINT32_MAX - sizeof self &&
+               guest_read_bytes((uint32_t)first, path, sizeof path) &&
+               !memcmp(path, self, sizeof self);
+    }
+    return false;
+}
+
+static int stage_backing_file_id(unsigned kind) {
+    return kind == 1 ? 0 : kind == 2 ? -2 :
+           kind >= 3 && kind <= 33 ? (int)kind - 2 : -1;
+}
+
+static void stage_mapping_backing(page_t *page, const pending_mmap_t *pending,
+                                  uint64_t page_delta) {
+    page->backing_kind = 0;
+    page->backing_shared = false;
+    page->backing_offset = page->descriptor_epoch = page->backing_content_epoch = 0;
+    if ((pending->syscall_num != 90 && pending->syscall_num != 192) ||
+        (pending->flags & GUEST_MAP_ANONYMOUS))
+        return;
+    g_stage_file_mapping_profile = true;
+    page->backing_kind = stage_self_fd(pending->fd) ? 1 : 2;
+    if (pending->fd >= 3 && pending->fd < 64) {
+        unsigned file = g_stage_memfd_file[pending->fd];
+        if (file && file < 32 && g_stage_memfd_files[file].valid &&
+            g_stage_memfd_fd_epoch[pending->fd]) {
+            page->backing_kind = file + 2;
+            page->backing_shared = (pending->flags & 3U) == 1U;
+            if (page->backing_shared)
+                g_stage_shared_file_profile = true;
+            page->descriptor_epoch = g_stage_memfd_fd_epoch[pending->fd];
+            page->backing_content_epoch = g_stage_memfd_files[file].content_epoch;
+        }
+    }
+    if (pending->offset > UINT64_MAX - page_delta) {
+        page->backing_kind = 2;
+        page->descriptor_epoch = page->backing_content_epoch = 0;
+        tf_phase1_profile_lost(&g_phase1, "file_mapping_offset_overflow");
+        return;
+    }
+    page->backing_offset = pending->offset + page_delta;
+    if (page->backing_kind == 1)
+        page->descriptor_epoch = g_stage_self_fd_epoch[pending->fd];
+}
+
+static void stage_reset_mapping_page(page_t *page, int prot, uint64_t mapping_epoch) {
+    g_free(page->wbitmap);
+    memset(page, 0, sizeof(*page));
+    page->prot = prot;
+    page->mapping_epoch = mapping_epoch;
+}
+
 static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_addr) {
     if (!pending || !pending->active || pending->size == 0) {
         return;
@@ -2800,6 +3236,21 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
             name, (unsigned long)pending->requested_addr, (unsigned long)mapped_addr,
             (unsigned long)pending->size, pending->prot, pending->flags, pending->fd,
             (unsigned long)pending->offset);
+    if ((pending->flags & 3U) == 1U) {
+        unsigned file = stage_memfd_file(pending->fd);
+        uint64_t rounded = (pending->size + 4095U) & ~UINT64_C(4095);
+        bool supported = is_i386 && page_size == 4096 && file &&
+            pending->size <= 1048576 && pending->prot <= 7 && (pending->prot & 1) &&
+            (pending->flags == 1 || pending->flags == 0x11) && !(pending->offset & 4095) &&
+            pending->offset < g_stage_memfd_files[file].size &&
+            pending->offset + rounded <= ((g_stage_memfd_files[file].size + 4095) & ~UINT64_C(4095));
+        if (!supported) {
+            stage_clear_producers();
+            tf_phase1_profile_lost(&g_phase1, "shared_file_mapping_unsupported");
+            return;
+        }
+        g_stage_shared_file_profile = true;
+    }
     lib_update_mapping((uint32_t)pending->fd, mapped_addr, pending->size);
     uint64_t page_mask = (uint64_t)page_size - 1U;
     uint64_t last_addr = mapped_addr + pending->size - 1U;
@@ -2823,9 +3274,14 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         }
     }
     bool fixed = (pending->flags & GUEST_MAP_FIXED) != 0;
-    if (!fixed && !(pending->prot & 0x2) && !(pending->prot & 0x4)) {
-        return;
+    if (pending->syscall_num == 90 || pending->syscall_num == 192) {
+        if (!pending->syscall_ordinal) {
+            tf_phase1_profile_lost(&g_phase1, "mapping_syscall_identity_missing");
+            return;
+        }
+        g_stage_mapping_identity = true;
     }
+    stage_invalidate_mapping_range(page_start, mapped_size);
     uint32_t remap_generation = 0;
     for (uint64_t addr = page_start;; addr += page_size) {
         gpointer key = (gpointer)(uintptr_t)addr;
@@ -2834,13 +3290,15 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         if (page) {
             if (page->exec_seen || page->exec_after_write)
                 phase1_invalidate(addr, next_code_generation(), "executed_mapping_replaced");
-            page->exec_seen = false;
-            page->prot = pending->prot;
+            /* Replacement destroys old entry coverage and producer cells. */
+            stage_reset_mapping_page(page, pending->prot, pending->syscall_ordinal);
         } else {
             page = g_new0(page_t, 1);
             page->prot = pending->prot;
             g_hash_table_insert(pages, key, page);
         }
+        page->mapping_epoch = pending->syscall_ordinal;
+        stage_mapping_backing(page, pending, addr - page_start);
         if (fixed || ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key))) {
             if (pending->prot & 0x4)
                 page->dyn_exec = true;
@@ -2858,6 +3316,8 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
                 g_layer_dirty = true;
             }
         }
+        if (g_stage_shared_file_profile)
+            stage_project_file_store(page, addr);
         if (addr == page_last) {
             break;
         }
@@ -2938,6 +3398,7 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
     uint64_t page_last = last_addr & ~page_mask;
     uint64_t unmapped_size = (page_last - page_start) + (uint64_t)page_size;
 
+    stage_invalidate_mapping_range(page_start, unmapped_size);
     shadow_untaint_range(g_shadow, page_start, unmapped_size);
 
     for (uint64_t page_addr = page_start;; page_addr += page_size) {
@@ -3038,11 +3499,243 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
     return file;
 }
 
+static oep_cand_t *stage_candidate_by_id(uint64_t id) {
+    if (!id)
+        return NULL;
+    for (GList *l = oep_cands; l; l = l->next) {
+        oep_cand_t *candidate = l->data;
+        if (candidate->candidate_id == id)
+            return candidate;
+    }
+    return NULL;
+}
+
+static bool stage_entry_covered(const page_t *page, uint64_t pc, uint32_t size) {
+    return page && page->producer_valid && size && size <= MAX_INSN_BYTES &&
+           pc <= UINT64_MAX - size && pc >= page->producer_begin &&
+           pc + size <= page->producer_end;
+}
+
+static bool stage_is_new_entry(const page_t *page, uint64_t pc, uint32_t size,
+                                 uint64_t seq, bool unpacked, bool adjacent_transfer) {
+    if (!page || !unpacked || !adjacent_transfer || !seq)
+        return false;
+    if (!page->candidate_seen)
+        return !page->exec_seen;
+    /* A page already represented by a candidate needs a later code-writing
+     * occurrence covering this whole entry instruction. Clearing exec_seen
+     * after an unrelated write elsewhere on the page must not reuse old entry
+     * bitmap bits or identify an earlier same-PC generation as a new stage. */
+    return page->gen_written > page->candidate_generation &&
+           page->gen_written != UINT32_MAX &&
+           stage_entry_covered(page, pc, size) &&
+           page->producer_write_seq > page->candidate_seq &&
+           page->producer_write_seq < seq;
+}
+
+static oep_cand_t *stage_owner_for_instruction(const InsnExecCtx *instruction,
+                                               uint64_t seq, uint32_t vcpu) {
+    oep_cand_t *owner = g_active_candidate;
+    if (!owner || !owner->code_page_bytes || owner->vcpu != vcpu || !instruction ||
+        !instruction->size || instruction->size > MAX_INSN_BYTES ||
+        instruction->pc < owner->code_page ||
+        instruction->pc - owner->code_page > page_size - instruction->size ||
+        !seq || seq < owner->observed_seq)
+        return NULL;
+    if (g_stage_mapping_identity) {
+        const page_t *mapped = pages ? g_hash_table_lookup(pages,
+            (gpointer)(uintptr_t)owner->code_page) : NULL;
+        if (!mapped || mapped->mapping_epoch != owner->mapping_epoch)
+            return NULL;
+    }
+    const TraceEntry *entry = trace_find_seq(g_trace, seq, NULL);
+    if (!entry || entry->vcpu_index != vcpu || entry->pc != instruction->pc ||
+        entry->size != instruction->size ||
+        entry->code_generation != instruction->code_generation ||
+        memcmp(entry->instr_bytes, instruction->instr_bytes, instruction->size) ||
+        memcmp(owner->code_page_bytes + (instruction->pc - owner->code_page),
+               instruction->instr_bytes, instruction->size))
+        return NULL;
+    uint8_t current[MAX_INSN_BYTES];
+    if (!guest_read_bytes(instruction->pc, current, instruction->size) ||
+        memcmp(current, instruction->instr_bytes, instruction->size))
+        return NULL;
+    return owner;
+}
+
+static void stage_record_write(page_t *page, uint64_t address, uint32_t size,
+                                const oep_cand_t *owner, const InsnExecCtx *writer,
+                                uint64_t seq, uint32_t generation, uint32_t vcpu) {
+    if (!page || !size || address > UINT64_MAX - size || !seq || !generation ||
+        generation == UINT32_MAX || !writer) {
+        if (page)
+            page->producer_valid = false;
+        return;
+    }
+    uint64_t id = owner ? owner->candidate_id : 0;
+    uint64_t end = address + size;
+    if (page->producer_valid && page->producer_candidate_id == id &&
+        page->producer_vcpu == vcpu && address <= page->producer_end &&
+        end >= page->producer_begin) {
+        if (address < page->producer_begin)
+            page->producer_begin = address;
+        if (end > page->producer_end)
+            page->producer_end = end;
+    } else {
+        page->producer_begin = address;
+        page->producer_end = end;
+    }
+    page->producer_valid = true;
+    page->producer_candidate_id = id;
+    page->producer_write_pc = writer->pc;
+    page->producer_write_seq = seq;
+    page->producer_write_generation = generation;
+    page->producer_vcpu = vcpu;
+    const page_t *writer_page = pages ? g_hash_table_lookup(pages,
+        (gpointer)(uintptr_t)(writer->pc & ~((uint64_t)page_size - 1U))) : NULL;
+    page->producer_writer_mapping_epoch = writer_page ? writer_page->mapping_epoch : 0;
+}
+
+static oep_cand_t *stage_candidate_parent(const page_t *page, uint64_t pc,
+                                          uint32_t size, uint64_t seq, uint32_t vcpu) {
+    if (!stage_entry_covered(page, pc, size) || !page->producer_candidate_id ||
+        !prev_jump_pending || !prev_jump_owner_id ||
+        prev_jump_owner_id != page->producer_candidate_id ||
+        page->producer_vcpu != vcpu || !prev_jump_seq_id ||
+        prev_jump_seq_id == UINT64_MAX || prev_jump_seq_id + 1 != seq ||
+        page->producer_write_seq >= prev_jump_seq_id ||
+        !page->producer_write_generation || page->producer_write_generation == UINT32_MAX ||
+        page->producer_write_generation != page->gen_written ||
+        (prev_mem_target_valid && (uint32_t)pc != (uint32_t)prev_mem_target_value))
+        return NULL;
+    oep_cand_t *parent = stage_candidate_by_id(page->producer_candidate_id);
+    return parent && (!g_stage_tail_file_profile || parent->guest_store_generation) &&
+           parent->vcpu == vcpu && parent->observed_seq <= page->producer_write_seq &&
+           (!g_stage_mapping_identity ||
+            page->producer_writer_mapping_epoch == parent->mapping_epoch) &&
+           (parent->addr != pc || page->gen_written > parent->code_generation)
+               ? parent : NULL;
+}
+
+static void stage_clear_producers(void) {
+    if (pages) {
+        GHashTableIter iter;
+        gpointer value;
+        g_hash_table_iter_init(&iter, pages);
+        while (g_hash_table_iter_next(&iter, NULL, &value))
+            ((page_t *)value)->producer_valid = false;
+    }
+    for (unsigned file = 1; file < 32; ++file)
+        for (unsigned i = 0; i < 256; ++i)
+            if (g_stage_memfd_files[file].store_pages[i])
+                g_stage_memfd_files[file].store_pages[i]->producer_valid = false;
+    g_active_candidate = NULL;
+    prev_jump_owner_id = 0;
+}
+
+/* Destroyed target or writer lifetimes cannot lend ownership to new bytes. */
+static void stage_invalidate_mapping_range(uint64_t address, uint64_t size) {
+    if (!size || address > UINT64_MAX - size) {
+        stage_clear_producers();
+        return;
+    }
+    uint64_t end = address + size;
+    if (pages) {
+        GHashTableIter iter; gpointer key, value;
+        g_hash_table_iter_init(&iter, pages);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            uint64_t base = (uint64_t)(uintptr_t)key;
+            page_t *page = value;
+            if ((base < end && address < base + page_size) ||
+                (page->producer_write_pc >= address && page->producer_write_pc < end))
+                page->producer_valid = false;
+        }
+    }
+    for (unsigned file = 1; file < 32; ++file)
+        for (unsigned i = 0; i < 256; ++i) {
+            page_t *stored = g_stage_memfd_files[file].store_pages[i];
+            if (stored && stored->producer_write_pc >= address && stored->producer_write_pc < end)
+                stored->producer_valid = false;
+        }
+    if (g_active_candidate && g_active_candidate->code_page < end &&
+        address < g_active_candidate->code_page + page_size) {
+        g_active_candidate = NULL;
+        prev_jump_owner_id = 0;
+    }
+}
+
+/* Shared STORE callbacks describe one actual guest STORE, regardless of the
+ * number of virtual aliases. Use the same ordinal and code generation for all
+ * aliases; never manufacture additional STORE occurrences while mirroring. */
+static void stage_record_shared_store(page_t *source, uint64_t source_address, uint32_t size,
+                                       const oep_cand_t *owner, const InsnExecCtx *writer,
+                                       uint64_t seq, uint32_t generation, uint32_t vcpu) {
+    unsigned file = source->backing_kind >= 3 && source->backing_kind <= 33
+                        ? source->backing_kind - 2 : 0;
+    uint64_t offset = source->backing_offset + (source_address & 4095U);
+    uint64_t logical = file ? g_stage_memfd_files[file].size : 0;
+    uint64_t cache_end = (logical + 4095) & ~UINT64_C(4095);
+    if (!file || !g_stage_memfd_files[file].valid || stage_memfd_private_mapping(file) ||
+        !logical || offset > cache_end || size > cache_end - offset ||
+        page_size != 4096 || (source->backing_offset & 4095) ||
+        (offset & 4095) + size > 4096 || offset / 4096 >= 256) {
+        stage_poison_memfd(file);
+        tf_phase1_profile_lost(&g_phase1, "shared_file_store_unsupported");
+        return;
+    }
+    /* Bytes in the final partial page belong to the shmem page cache, not
+     * the logical file. Do not grow the file or create a kernel source leaf. */
+    if (offset + size > logical) {
+        g_stage_memfd_files[file].tail_dirty = true;
+        g_stage_tail_file_profile = true;
+    }
+    page_t **slot = &g_stage_memfd_files[file].store_pages[offset / 4096];
+    if (!*slot)
+        *slot = g_new0(page_t, 1);
+    page_t *stored = *slot;
+    if (!stored->wbitmap)
+        stored->wbitmap = g_malloc0(page_size / 8U);
+    for (uint32_t i = 0; i < size; ++i) {
+        unsigned bit = (unsigned)(offset & 4095U) + i;
+        stored->wbitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
+    }
+    stored->written = true;
+    stored->write_count++;
+    stored->last_write = g_icount;
+    stored->gen_written = generation;
+    stored->guest_store_generation = g_stage_guest_store_ordinal;
+    stage_record_write(stored, offset, size, owner, writer, seq, generation, vcpu);
+    GHashTableIter iterator;
+    gpointer key, value;
+    g_hash_table_iter_init(&iterator, pages);
+    while (g_hash_table_iter_next(&iterator, &key, &value)) {
+        page_t *alias = value;
+        if (alias == source || !alias->backing_shared || alias->backing_kind != file + 2 ||
+            alias->backing_offset != source->backing_offset)
+            continue;
+        uint64_t base = (uint64_t)(uintptr_t)key;
+        if (alias->exec_seen || alias->exec_after_write)
+            phase1_invalidate(base, generation, "shared_alias_write_to_executed_code");
+        g_clear_pointer(&alias->wbitmap, g_free);
+        stage_project_file_store(alias, base);
+        alias->exec_seen = false;
+    }
+}
+
 //mark write
-static void mark_written(uint64_t vaddr, uint32_t size) {
+static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *writer,
+                           uint64_t seq, uint32_t vcpu) {
     if (size == 0)
         return;
+    if (g_stage_guest_store_ordinal == UINT64_MAX) {
+        tf_phase1_profile_lost(&g_phase1, "guest_store_ordinal_exhausted");
+        return;
+    }
+    ++g_stage_guest_store_ordinal;
     uint32_t write_generation = next_code_generation();
+    if (write_generation == UINT32_MAX)
+        tf_phase1_profile_lost(&g_phase1, "code_generation_exhausted");
+    oep_cand_t *owner = stage_owner_for_instruction(writer, seq, vcpu);
     while (size > 0) {
         uint64_t page_addr = vaddr & ~((uint64_t)page_size - 1U);
         uint32_t offset = (uint32_t)(vaddr & ((uint64_t)page_size - 1U));
@@ -3066,6 +3759,10 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
         page->write_count++;
         page->last_write = g_icount;
         page->gen_written = write_generation;
+        page->guest_store_generation = g_stage_guest_store_ordinal;
+        stage_record_write(page, vaddr, chunk, owner, writer, seq, write_generation, vcpu);
+        if (page->backing_shared)
+            stage_record_shared_store(page, vaddr, chunk, owner, writer, seq, write_generation, vcpu);
         page->exec_seen = false;
         if (g_layer_has_cand) {
             g_layer_dirty = true;
@@ -3079,10 +3776,8 @@ static void on_mem_write_impl(unsigned int vcpu_idx, qemu_plugin_meminfo_t info,
                               void *userdata) {
     if (!tf_phase1_active(&g_phase1))
         return;
-    (void)vcpu_idx;
-    (void)userdata;
     uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
-    mark_written(vaddr, size);
+    mark_written(vaddr, size, userdata, g_phase1.trace_seq, vcpu_idx);
 }
 
 static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr,
@@ -3223,11 +3918,27 @@ static double cand_confidence(const oep_cand_t *c) {
     return cand_score(c) / W_ACTIVE;
 }
 
+/* V7 retains kernel-constructed/unknown candidates as observations, but
+ * they cannot be selected or used as guest-STORE stage proof endpoints. */
+static bool cand_selection_eligible(const oep_cand_t *candidate) {
+    return candidate && !candidate->stale && !candidate->superseded &&
+           (!g_stage_tail_file_profile || candidate->guest_store_generation);
+}
+
+static const char *cand_write_origin(const oep_cand_t *candidate) {
+    return candidate && candidate->guest_store_generation
+               ? "observed_guest_store_page" : "kernel_or_unknown_page";
+}
+
 static bool cand_rank_better(const oep_cand_t *a, const oep_cand_t *b) {
     if (!a)
         return false;
     if (!b)
         return true;
+    bool a_eligible = cand_selection_eligible(a);
+    bool b_eligible = cand_selection_eligible(b);
+    if (a_eligible != b_eligible)
+        return a_eligible;
     bool a_in_main = cand_in_main_image(a);
     bool b_in_main = cand_in_main_image(b);
     if (a_in_main != b_in_main) {
@@ -3242,7 +3953,7 @@ static oep_cand_t *choose_oep_cand(void) {
     oep_cand_t *best = NULL;
     for (GList *l = oep_cands; l; l = l->next) {
         oep_cand_t *c = (oep_cand_t *)l->data;
-        if (c->stale)
+        if (!cand_selection_eligible(c))
             continue;
         if (!best || cand_rank_better(c, best)) {
             best = c;
@@ -3673,7 +4384,7 @@ static void do_dump_impl(uint64_t oep) {
         return;
     }
     oep_cand_t *chosen = g_selected_candidate;
-    if (!chosen || chosen->stale) {
+    if (!cand_selection_eligible(chosen)) {
         g_capture_status = chosen ? "stale" : "not_available";
         return;
     }
@@ -3747,6 +4458,11 @@ static void write_report(void) {
     fprintf(f_json, "  \"oep_confidence\": %.4f,\n", g_oep_confidence);
     fprintf(f_json, "  \"oep_scoring_policy\": \"semantic_evidence_v1\",\n"
                     "  \"oep_confidence_kind\": \"heuristic_not_probability\",\n");
+    fprintf(f_json, "  \"oep_selection_policy\":\"observed_write_transfer_leaf_semantic_evidence_v2\",\n"
+                    "  \"selection_scope\":\"observed_stage_leaf_candidate\",\n"
+                    "  \"oep_proven\":false,\n"
+                    "  \"historical_originality_proven\":false,\n"
+                    "  \"complete_stage_chain\":false,\n");
     fprintf(f_json, "  \"dse_control_pruning\": %s,\n",
             g_dse_control_pruning_enabled ? "true" : "false");
     if (g_oep_scoring)
@@ -3853,7 +4569,104 @@ static void write_report(void) {
     }
 }
 
-//collect top-3 candidates by weighted score
+/* Preserve every bounded observed candidate and causal edge without expanding
+ * all DSE diagnostics 10000 times. The shared 2 MiB serialized budget stays
+ * below the capture consumer's 4 MiB report limit. Exceeding it invalidates
+ * the capture profile and explicitly withholds the incomplete history. */
+static void append_stage_history(GString *output, const oep_cand_t *chosen) {
+    const size_t budget = 2U * 1024U * 1024U;
+    GString *nodes = g_string_new("[");
+    GString *edges = g_string_new("[");
+    bool first_node = true, first_edge = true, limited = false;
+    if (g_stage_mapping_identity)
+        g_string_append(output, "  \"observed_stage_mapping_identity_version\":1,\n");
+    if (g_stage_file_mapping_profile)
+        g_string_append_printf(output, "  \"file_mapping_profile_version\":%u,\n",
+                               g_stage_tail_file_profile ? 7 : g_stage_shared_file_profile ? 6 : g_stage_mutable_file_profile ? 5 : 4);
+    for (GList *l = oep_cands; l; l = l->next) {
+        const oep_cand_t *c = l->data;
+        g_string_append_printf(nodes,
+            "%s{\"candidate_id\":%" PRIu64 ",\"address\":%" PRIu64
+            ",\"entry_seq\":%" PRIu64 ",\"code_generation\":%u,\"epoch\":%" PRIu64
+            ",\"vcpu\":%u,\"parent_candidate_id\":%" PRIu64
+            ",\"superseded\":%s,\"superseded_by_candidate_id\":%" PRIu64
+            ",\"stale\":%s,\"selected\":%s,\"selection_eligible\":%s"
+            ",\"source_write_pc\":%" PRIu64 ",\"source_write_seq\":%" PRIu64
+            ",\"source_write_generation\":%u,\"transfer_seq\":%" PRIu64
+            ",\"transfer_pc\":%" PRIu64 ",\"written_begin\":%" PRIu64
+            ",\"written_end\":%" PRIu64 ",\"entry_size\":%u",
+            first_node ? "" : ",", c->candidate_id, c->addr, c->observed_seq,
+            c->code_generation, c->epoch, c->vcpu, c->parent_candidate_id,
+            c->superseded ? "true" : "false", c->superseded_by_candidate_id,
+            c->stale ? "true" : "false", c == chosen ? "true" : "false",
+            cand_selection_eligible(c) ? "true" : "false", c->source_write_pc,
+            c->source_write_seq, c->source_write_generation, c->transfer_seq, c->jump_site,
+            c->written_begin, c->written_end, c->entry_size);
+        if (g_stage_mapping_identity)
+            g_string_append_printf(nodes,
+                ",\"mapping_epoch\":%" PRIu64 ",\"guest_store_generation\":%" PRIu64
+                ",\"parent_mapping_epoch\":%" PRIu64 ",\"source_writer_mapping_epoch\":%" PRIu64,
+                c->mapping_epoch, c->guest_store_generation, c->parent_mapping_epoch,
+                c->source_writer_mapping_epoch);
+        if (g_stage_file_mapping_profile)
+            g_string_append_printf(nodes,
+                ",\"file_mapping_profile_version\":%u,\"backing_file_id\":%d"
+                ",\"backing_offset\":%" PRIu64 ",\"descriptor_epoch\":%" PRIu64,
+                g_stage_tail_file_profile ? 7 : g_stage_shared_file_profile ? 6 : g_stage_mutable_file_profile ? 5 : 4,
+                stage_backing_file_id(c->backing_kind), c->backing_offset, c->descriptor_epoch);
+        if (g_stage_mutable_file_profile)
+            g_string_append_printf(nodes, ",\"backing_content_epoch\":%" PRIu64,
+                                   c->backing_content_epoch);
+        if (g_stage_shared_file_profile)
+            g_string_append_printf(nodes, ",\"backing_shared\":%s", c->backing_shared ? "true" : "false");
+        if (g_stage_tail_file_profile)
+            g_string_append_printf(nodes, ",\"write_origin\":\"%s\"", cand_write_origin(c));
+        g_string_append_c(nodes, '}');
+        first_node = false;
+        if (c->parent_candidate_id) {
+            g_string_append_printf(edges,
+                "%s{\"parent_candidate_id\":%" PRIu64 ",\"child_candidate_id\":%" PRIu64
+                ",\"writer_pc\":%" PRIu64 ",\"write_seq\":%" PRIu64
+                ",\"write_generation\":%u,\"transfer_seq\":%" PRIu64
+                ",\"transfer_pc\":%" PRIu64 ",\"entry_seq\":%" PRIu64
+                ",\"target_code_generation\":%u,\"vcpu\":%u"
+                ",\"written_begin\":%" PRIu64 ",\"written_end\":%" PRIu64
+                ",\"relation\":\"observed_contiguous_write_then_adjacent_transfer\"",
+                first_edge ? "" : ",", c->parent_candidate_id, c->candidate_id,
+                c->source_write_pc, c->source_write_seq, c->source_write_generation,
+                c->transfer_seq, c->jump_site, c->observed_seq, c->code_generation, c->vcpu,
+                c->written_begin, c->written_end);
+            if (g_stage_mapping_identity)
+                g_string_append_printf(edges,
+                    ",\"target_mapping_epoch\":%" PRIu64 ",\"parent_mapping_epoch\":%" PRIu64
+                    ",\"writer_mapping_epoch\":%" PRIu64 ",\"guest_store_generation\":%" PRIu64,
+                    c->mapping_epoch, c->parent_mapping_epoch, c->source_writer_mapping_epoch,
+                    c->guest_store_generation);
+            g_string_append_c(edges, '}');
+            first_edge = false;
+        }
+        if (nodes->len + edges->len > budget) {
+            limited = true;
+            tf_phase1_profile_lost(&g_phase1, "stage_history_budget_exhausted");
+            break;
+        }
+    }
+    g_string_append_printf(output, "  \"observed_stage_history_status\":\"%s\",\n",
+        limited ? "resource_limit" : g_phase1.profile_lost ? "incomplete" : "complete");
+    if (limited) {
+        g_string_append(output, "  \"observed_stage_candidates\":[],\n"
+                                "  \"observed_stage_edges\":[],\n");
+    } else {
+        g_string_append_c(nodes, ']');
+        g_string_append_c(edges, ']');
+        g_string_append_printf(output, "  \"observed_stage_candidates\":%s,\n"
+                                       "  \"observed_stage_edges\":%s,\n", nodes->str, edges->str);
+    }
+    g_string_free(nodes, TRUE);
+    g_string_free(edges, TRUE);
+}
+
+//collect top-3 detailed candidates, with eligible leaves ranked first
 static void build_oep_scoring(oep_cand_t *chosen) {
     g_oep_confidence = chosen ? cand_confidence(chosen) : 0.0;
     guint count = g_list_length(oep_cands);
@@ -3949,13 +4762,35 @@ static void build_oep_scoring(oep_cand_t *chosen) {
             g_oep_scoring,
             ",\"candidate_id\":%" PRIu64 ",\"observed_trace_seq\":%" PRIu64 ","
             "\"code_generation\":%u,\"analysis_epoch\":%" PRIu64 ","
-            "\"stale\":%s,\"selected\":%s}%s\n",
+            "\"stale\":%s,\"selected\":%s,\"superseded\":%s,"
+            "\"parent_candidate_id\":%" PRIu64 ",\"superseded_by_candidate_id\":%" PRIu64,
             candidate->candidate_id, candidate->observed_seq, candidate->code_generation,
             candidate->epoch, candidate->stale ? "true" : "false",
-            candidate == chosen ? "true" : "false", i + 1 < top_count ? "," : "");
+            candidate == chosen ? "true" : "false", candidate->superseded ? "true" : "false",
+            candidate->parent_candidate_id, candidate->superseded_by_candidate_id);
+        if (g_stage_mapping_identity)
+            g_string_append_printf(g_oep_scoring,
+                ",\"mapping_epoch\":%" PRIu64 ",\"guest_store_generation\":%" PRIu64,
+                candidate->mapping_epoch, candidate->guest_store_generation);
+        if (g_stage_file_mapping_profile)
+            g_string_append_printf(g_oep_scoring,
+                ",\"file_mapping_profile_version\":%u,\"backing_file_id\":%d"
+                ",\"backing_offset\":%" PRIu64 ",\"descriptor_epoch\":%" PRIu64,
+                g_stage_tail_file_profile ? 7 : g_stage_shared_file_profile ? 6 : g_stage_mutable_file_profile ? 5 : 4,
+                stage_backing_file_id(candidate->backing_kind), candidate->backing_offset,
+                candidate->descriptor_epoch);
+        if (g_stage_mutable_file_profile)
+            g_string_append_printf(g_oep_scoring, ",\"backing_content_epoch\":%" PRIu64,
+                                   candidate->backing_content_epoch);
+        if (g_stage_shared_file_profile)
+            g_string_append_printf(g_oep_scoring, ",\"backing_shared\":%s", candidate->backing_shared ? "true" : "false");
+        if (g_stage_tail_file_profile)
+            g_string_append_printf(g_oep_scoring, ",\"write_origin\":\"%s\"", cand_write_origin(candidate));
+        g_string_append_printf(g_oep_scoring, "}%s\n", i + 1 < top_count ? "," : "");
     }
 
     g_string_append(g_oep_scoring, "  ],\n");
+    append_stage_history(g_oep_scoring, chosen);
     g_free(candidates);
 }
 
@@ -3965,16 +4800,50 @@ static void phase1_candidate_event(const char *event, oep_cand_t *candidate, boo
         "\"observed_trace_seq\":%" PRIu64 ",\"observed_icount\":%" PRIu64 ","
         "\"observed_code_generation\":%u,\"observed_epoch\":%" PRIu64 ","
         "\"decision_trace_seq\":%" PRIu64 ",\"retrospective\":%s,"
+        "\"parent_candidate_id\":%" PRIu64 ",\"superseded\":%s,"
+        "\"superseded_by_candidate_id\":%" PRIu64 ","
         "\"checkpoint_id\":null,\"confidence\":%.6f,\"confidence_kind\":\"heuristic\","
         "\"dse_verdict\":\"%s\",\"dse_reason\":\"%s\",\"oep_proven\":false}",
         candidate->candidate_id, candidate->addr, candidate->observed_seq, candidate->icount,
         candidate->code_generation, candidate->epoch, g_phase1.trace_seq,
-        retrospective ? "true" : "false", cand_confidence(candidate),
+        retrospective ? "true" : "false", candidate->parent_candidate_id,
+        candidate->superseded ? "true" : "false", candidate->superseded_by_candidate_id,
+        cand_confidence(candidate),
         dse_verdict_name(candidate->dse.verdict), dse_verify_reason_name(candidate->dse.reason));
     tf_phase1_event(&g_phase1, event, candidate->stale ? "stale" : "candidate",
                     candidate->dse.verdict == DSE_VERDICT_UNKNOWN ? "dse_incomplete" : NULL,
                     payload);
     g_free(payload);
+}
+
+static void stage_retract_selection(const char *reason) {
+    if (g_selected_candidate) {
+        phase1_candidate_event("oep_candidate_selection_retracted", g_selected_candidate, true);
+        tf_phase1_event(&g_phase1, "oep_selection_retracted", "candidate", reason, NULL);
+    }
+    g_selected_candidate = NULL;
+    oep_found = false;
+    oep_addr = 0;
+}
+
+static void stage_link_candidate(oep_cand_t *child, oep_cand_t *parent, const page_t *page) {
+    if (!child || !parent || !page || child == parent ||
+        !child->candidate_id || !parent->candidate_id ||
+        (g_stage_tail_file_profile && (!child->guest_store_generation || !parent->guest_store_generation)))
+        return;
+    child->parent_candidate_id = parent->candidate_id;
+    child->parent_mapping_epoch = parent->mapping_epoch;
+    child->source_writer_mapping_epoch = page->producer_writer_mapping_epoch;
+    child->source_write_pc = page->producer_write_pc;
+    child->source_write_seq = page->producer_write_seq;
+    child->source_write_generation = page->producer_write_generation;
+    child->written_begin = page->producer_begin;
+    child->written_end = page->producer_end;
+    parent->superseded = true;
+    parent->superseded_by_candidate_id = child->candidate_id;
+    phase1_candidate_event("oep_candidate_superseded", parent, true);
+    if (g_selected_candidate == parent)
+        stage_retract_selection("observed_causal_descendant_entry");
 }
 
 static void phase1_invalidate(uint64_t address, uint32_t generation, const char *reason) {
@@ -3992,9 +4861,7 @@ static void phase1_invalidate(uint64_t address, uint32_t generation, const char 
     if (!changed)
         return;
     ++g_phase1.epoch;
-    g_selected_candidate = NULL;
-    oep_found = false;
-    oep_addr = 0;
+    stage_retract_selection(reason);
     char *payload =
         g_strdup_printf("{\"address\":%" PRIu64 ",\"new_generation\":%u}", address, generation);
     tf_phase1_event(&g_phase1, "code_generation_changed", "observed", reason, payload);
@@ -4136,18 +5003,24 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     }
     //oep choose
     oep_cand_t *chosen = NULL;
-    if (oep_found) {
-        chosen = g_selected_candidate;
-    }
-
-    if (!g_phase1.profile_lost && !oep_found && oep_cands) {
+    /* A quiet-window selection is provisional. Recompute at finalization so
+     * a later causal descendant or stronger independent leaf is considered. */
+    if (!g_phase1.profile_lost && oep_cands) {
         chosen = choose_oep_cand();
         if (chosen) {
+            if (g_selected_candidate && g_selected_candidate != chosen)
+                stage_retract_selection("final_observed_leaf_selection_changed");
             oep_addr = chosen->addr;
             oep_found = true;
-            g_selected_candidate = chosen;
-            phase1_candidate_event("oep_candidate_selected", chosen, true);
+            if (g_selected_candidate != chosen) {
+                g_selected_candidate = chosen;
+                phase1_candidate_event("oep_candidate_selected", chosen, true);
+            }
+        } else if (g_selected_candidate && !cand_selection_eligible(g_selected_candidate)) {
+            stage_retract_selection("candidate_without_eligible_store_origin");
         }
+    } else if (g_phase1.profile_lost) {
+        stage_retract_selection("capture_profile_incomplete");
     }
     if (oep_cands) {
         build_oep_scoring(chosen);
@@ -4237,9 +5110,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
         if (candidate->capture.committed)
             unlink(candidate->capture.path);
         capture_clear(&candidate->capture);
+        g_free(candidate->code_page_bytes);
     }
     g_list_free_full(oep_cands, g_free);
     oep_cands = NULL;
+    g_active_candidate = NULL;
+    prev_jump_owner_id = 0;
     //got
     g_list_free_full(resolved_imports, g_free);
     resolved_imports = NULL;
@@ -4591,6 +5467,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         prev_mem_target_value = 0;
         prev_mem_target_valid = false;
         prev_target_tainted = false;
+        prev_jump_direct = false;
+        prev_jump_owner_id = 0;
         return;
     }
     //detect mov to upacked code
@@ -4601,18 +5479,20 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         cur_pg = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
     }
 
-    bool prev_jump_matches = prev_jump_pending;
+    bool prev_jump_matches = prev_jump_pending && prev_jump_seq_id &&
+                             prev_jump_seq_id != UINT64_MAX &&
+                             prev_jump_seq_id + 1 == current_trace_seq_id;
     if (prev_jump_matches && prev_mem_target_valid) {
         prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
     }
 
-    bool heuristic_transfers = !g_dse_check_enabled && !g_ir_enabled;
     /* A removed/rewritten unpacker invalidates the old epoch. Its tail and the
-     * original entry can share a page, so that page needs another candidate. */
-    bool retry_epoch = heuristic_transfers && cur_pg && cur_pg->candidate_seen &&
-                       cur_pg->candidate_epoch != g_phase1.epoch;
-    bool new_layer = now_unpacked && cur_pg && (!cur_pg->exec_seen || retry_epoch) &&
-                     prev_jump_matches;
+     * original entry can share a page. Retry only an instruction wholly covered
+     * by a fresh contiguous write interval; old page bitmap bits cannot turn an
+     * unchanged internal jump into a new stage. Discovery is mode-independent. */
+    bool new_layer = stage_is_new_entry(cur_pg, vaddr, meta->size,
+                                        current_trace_seq_id, now_unpacked,
+                                        prev_jump_matches);
     if (cur_pg)
         cur_pg->exec_seen = true;
 
@@ -4621,6 +5501,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         return;
     }
     if (new_layer) {
+        oep_cand_t *parent = stage_candidate_parent(cur_pg, vaddr, meta->size,
+                                                     current_trace_seq_id, cpu_index);
         oep_cand_t *candidate = g_new0(oep_cand_t, 1);
         candidate->addr = vaddr;
         candidate->has_prologue = cand_has_prologue(vaddr);
@@ -4640,9 +5522,33 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->candidate_id = ++g_candidate_count;
         candidate->observed_seq = current_trace_seq_id;
         candidate->code_generation = cur_pg->gen_written;
+        candidate->mapping_epoch = cur_pg->mapping_epoch;
+        candidate->guest_store_generation = cur_pg->guest_store_generation;
+        candidate->backing_kind = cur_pg->backing_kind;
+        candidate->backing_shared = cur_pg->backing_shared;
+        candidate->backing_offset = cur_pg->backing_offset;
+        candidate->descriptor_epoch = cur_pg->descriptor_epoch;
+        candidate->backing_content_epoch = cur_pg->backing_content_epoch;
         candidate->epoch = g_phase1.epoch;
+        candidate->vcpu = cpu_index;
+        candidate->entry_size = meta->size;
+        candidate->transfer_seq = prev_jump_seq_id;
+        candidate->code_page = vaddr & ~((uint64_t)page_size - 1U);
+        /* The bounded causal policy supports ordinary 4 KiB i386 pages. A
+         * missing snapshot leaves producer ownership unknown; it never turns
+         * a later observation into a semantic proof. */
+        if (page_size == 4096) {
+            candidate->code_page_bytes = g_try_malloc(page_size);
+            if (candidate->code_page_bytes &&
+                !guest_read_bytes(candidate->code_page, candidate->code_page_bytes, page_size))
+                g_clear_pointer(&candidate->code_page_bytes, g_free);
+        }
         cur_pg->candidate_seen = true;
         cur_pg->candidate_epoch = g_phase1.epoch;
+        cur_pg->candidate_seq = current_trace_seq_id;
+        cur_pg->candidate_generation = cur_pg->gen_written;
+        if (parent)
+            stage_link_candidate(candidate, parent, cur_pg);
         candidate->target_tainted = prev_target_tainted;
         ir_plugin_check(vcpu_state, cpu_index, prev_jump_seq_id, IR_RUNTIME_CANDIDATE, vaddr,
                         prev_target_reg);
@@ -4664,7 +5570,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 candidate->dse = dse_verify_oep_candidate_with_relevance(
                     g_trace, g_aux, prev_jump_seq_id, prev_target_reg, vaddr, g_shadow, cs_handle,
                     &relevance_context);
-            } else if (prev_mem_target_valid) {
+            } else if (prev_mem_target_valid && !prev_jump_direct) {
                 candidate->dse = dse_verify_oep_candidate_mem_with_relevance(
                     g_trace, g_aux, prev_jump_seq_id, prev_mem_taddr, vaddr, g_shadow, cs_handle,
                     &relevance_context);
@@ -4710,6 +5616,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         }
         phase1_candidate_event("oep_candidate_evaluated", candidate, false);
         oep_cands = g_list_append(oep_cands, candidate);
+        g_active_candidate = candidate;
         g_layer_has_cand = true;
         g_last_cand_icount = g_icount;
     }
@@ -4721,6 +5628,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     prev_mem_target_value = 0;
     prev_mem_target_valid = false;
     prev_target_tainted = false;
+    prev_jump_direct = false;
+    prev_jump_owner_id = 0;
     //if we are too long in unpacked code without proceeding further - we end the cycle
     if (now_unpacked && !oep_found && g_last_cand_icount &&
         (g_icount - g_last_cand_icount) > g_phase1.selection_delay) {
@@ -4774,11 +5683,14 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
             }
         }
         if (target_resolved) {
+            oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id,
+                                                             cpu_index);
             prev_jump_site = vaddr;
             prev_jump_seq_id = current_trace_seq_id;
             prev_jump_pending = true;
             prev_target_reg = meta->branch_target_reg;
             prev_target_tainted = target_tainted;
+            prev_jump_owner_id = owner ? owner->candidate_id : 0;
             if (mem_target_valid) {
                 prev_mem_taddr = taddr;
                 prev_mem_target_value = (uint64_t)(uint32_t)tval;
@@ -4789,12 +5701,15 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 prev_mem_target_valid = false;
             }
         }
-    } else if (heuristic_transfers && meta->insn_id == X86_INS_JMP && meta->direct_target_valid) {
+    } else if (meta->insn_id == X86_INS_JMP && meta->direct_target_valid) {
+        oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id, cpu_index);
         prev_jump_site = vaddr;
         prev_jump_seq_id = current_trace_seq_id;
         prev_jump_pending = true;
         prev_mem_target_value = meta->direct_target;
         prev_mem_target_valid = true;
+        prev_jump_direct = true;
+        prev_jump_owner_id = owner ? owner->candidate_id : 0;
     }
     //got
     if (meta->is_indirect_branch && meta->branch_target_reg == REG_INVALID &&
@@ -4852,6 +5767,9 @@ static void apply_pending_fd_success(int64_t syscall_num, int64_t syscall_ret) {
     switch (operation.kind) {
     case PENDING_FD_DUP: {
         int32_t new_fd = (int32_t)(uint32_t)syscall_ret;
+        /* Duplication has no V4 open occurrence. Do not borrow a numeric
+         * descriptor's previous open lifetime even when the path is shared. */
+        stage_forget_descriptor(new_fd);
         file_dep_t *file =
             file_fd ? g_hash_table_lookup(file_fd, GINT_TO_POINTER(operation.fd)) : NULL;
         if (file) {
@@ -4864,6 +5782,7 @@ static void apply_pending_fd_success(int64_t syscall_num, int64_t syscall_ret) {
         break;
     }
     case PENDING_FD_CLOSE:
+        stage_forget_descriptor(operation.fd);
         if (file_fd) {
             g_hash_table_remove(file_fd, GINT_TO_POINTER(operation.fd));
         }
@@ -4905,6 +5824,26 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
     (void)a8;
     if (!tf_phase1_active(&g_phase1))
         return;
+    if (g_stage_syscall_ordinal == UINT64_MAX) {
+        tf_phase1_profile_lost(&g_phase1, "mapping_syscall_ordinal_exhausted");
+        return;
+    }
+    ++g_stage_syscall_ordinal;
+    /* Read-only self-open and a tracked close do not modify guest code. A
+     * narrow exact pathname check includes its NUL without over-reading. */
+    bool safe_msync = stage_preserve_msync_owner(num, a1, a2, a3);
+    bool safe_file_call = stage_preserve_file_owner(num, a1, a2) ||
+                          stage_preserve_mutable_owner(num, a1, a2, a3) || safe_msync;
+    memset(&g_stage_pending_msync, 0, sizeof g_stage_pending_msync);
+    if (is_i386 && num == 144 && g_stage_shared_file_profile) {
+        g_stage_pending_msync.active = true;
+        g_stage_pending_msync.supported = safe_msync;
+    }
+    stage_pending_mutable_begin(num, a1, a2, a3);
+    /* Mapping returns invalidate only the affected lifetimes. Other kernel
+     * copy-ins may bypass guest STORE callbacks. */
+    if (!is_i386 || (!safe_file_call && num != 125 && num != 90 && num != 192 && num != 91))
+        stage_clear_producers();
     /* Kernel writes and mapping changes need not pass the instruction memory callback. */
     if (g_trace)
         g_code_history_start = g_trace->next_seq_id;
@@ -5358,6 +6297,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
 
         g_pending_mmap.active = true;
         g_pending_mmap.syscall_num = num;
+        g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
         g_pending_mmap.requested_addr = (uint32_t)a1;
         g_pending_mmap.size = (uint32_t)a2;
         g_pending_mmap.prot = (int)a3;
@@ -5372,6 +6312,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
             memcpy(args, buf->data, sizeof(args));
             g_pending_mmap.active = true;
             g_pending_mmap.syscall_num = num;
+            g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
             g_pending_mmap.requested_addr = args[0];
             g_pending_mmap.size = args[1];
             g_pending_mmap.prot = (int)args[2];
@@ -5387,6 +6328,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         memset(&g_pending_mmap, 0, sizeof(g_pending_mmap));
         g_pending_mmap.active = true;
         g_pending_mmap.syscall_num = num;
+        g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
         g_pending_mmap.requested_addr = (uint32_t)a1;
         g_pending_mmap.size = (uint32_t)a2;
         g_pending_mmap.prot = (num == 91) ? 0 : (int)(uint32_t)a3;
@@ -5490,8 +6432,17 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
         tf_concolic_return_bytes(g_concolic, vcpu_idx, num, ret, valid ? bytes : NULL,
                                  valid ? size : 0);
     }
+    stage_pending_mutable_return(num, ret);
+    stage_pending_msync_return(num, ret);
     const bool syscall_failed = syscall_ret_is_error(ret);
     if (syscall_failed) {
+        if (is_i386 && num == 6 && g_pending_fd.active &&
+            g_pending_fd.kind == PENDING_FD_CLOSE) {
+            /* Failed close can leave descriptor state unspecified. Never
+             * retain its old lifetime as a new file mapping's source. */
+            stage_forget_descriptor(g_pending_fd.fd);
+            stage_clear_producers();
+        }
         pending_input_reset();
     } else {
         apply_pending_input(num, ret);
@@ -5505,6 +6456,19 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
                     "mismatch: expected=%ld actual=%ld\n",
                     (long)pending.syscall_num, (long)num);
         } else if (syscall_failed) {
+            /* Other errors can follow partial kernel modifications. */
+            bool no_effect = is_i386 && page_size && (uint32_t)ret == UINT32_C(0xffffffea) &&
+                (((pending.syscall_num == 90 || pending.syscall_num == 192) &&
+                  (!pending.size || ((pending.flags & GUEST_MAP_FIXED) &&
+                                      (pending.requested_addr & (page_size - 1U))))) ||
+                 (pending.syscall_num == 91 && (!pending.size ||
+                                      (pending.requested_addr & (page_size - 1U)))) ||
+                 (pending.syscall_num == 125 &&
+                                      (pending.requested_addr & (page_size - 1U))));
+            if (!no_effect) {
+                stage_clear_producers();
+                tf_phase1_profile_lost(&g_phase1, "memory_error_effects_unmodeled");
+            }
             fprintf(stderr,
                     "[SYSCALL] memory operation "
                     "failed: num=%ld ret=%ld\n",
@@ -5528,6 +6492,8 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
     }
     if (pending_open_path) {
         int32_t fd = (int32_t)(uint32_t)ret;
+        stage_bind_open_descriptor(fd, is_i386 && num == 5 ? pending_open_path : NULL,
+                                   pending_open_flags, g_stage_syscall_ordinal);
         file_dep_t *file = add_file_dep(pending_open_path, pending_open_is_lib);
         if (file) {
             file->write |= pending_open_write;

@@ -10,6 +10,31 @@ typedef struct IrReplay IrReplay;
 #define IR_PROC_EXE_API 1
 #define IR_REPLAY_CHECKPOINT_REUSE_API 1
 #define IR_PROC_EXE_INPUT_KEY UINT64_C(0x20000)
+#define IR_REPLAY_STDIN_API 1
+#define IR_STDIN_INPUT_KEY UINT64_C(0x20001)
+#define IR_REPLAY_STDIN_MAX_READS 4U
+#define IR_REPLAY_STDIN_MAX_READ 4096U
+#define IR_REPLAY_STDIN_MAX_BYTES (IR_REPLAY_STDIN_MAX_READS * IR_REPLAY_STDIN_MAX_READ)
+#define IR_REPLAY_STDIN_MAX_FILE (1024U * 1024U)
+
+/* Explicit immutable regular-file stdin provider. This is a source relation
+ * supplied by the caller, not inferred from provenance labels or guest RAM.
+ * The caller must bind fd 0 identity, cursor and delivered bytes independently.
+ * Reads start at file offset zero and advance consecutively. Each ledger item
+ * must match the exact captured i386 INT 80 read boundary. All copy-in effects
+ * execute chronologically, including overlapping guest buffers.
+ * The provider is borrowed only during build; the replay owns the consumed
+ * prefix and ledger after this call. Only consumed source offsets become IR
+ * input cells. A retained/reused replay never dereferences these pointers. */
+typedef struct {
+    uint64_t seq;
+    uint32_t address, offset, requested, returned;
+} IrReplayStdinRead;
+typedef struct {
+    const uint8_t *bytes;
+    uint32_t size, count;
+    const IrReplayStdinRead *reads;
+} IrReplayStdinSource;
 
 typedef enum {
     IR_REPLAY_READY,
@@ -48,6 +73,7 @@ typedef struct {
     uint32_t modeled_mprotect;
     IrEnvironmentStats files;
     uint32_t modeled_readlink, readlink_bytes, executable_snapshot_bytes;
+    uint32_t modeled_stdin_reads, stdin_bytes;
     const char *environment_reason; /* Static reason; never an owned pointer. */
     bool syscall_present;
     DseSyscallObservation stopped_syscall;
@@ -85,6 +111,12 @@ typedef struct {
     bool observed_proc_exe;
     uint32_t max_executable_bytes;
     uint32_t max_file_objects, max_file_content_cells;
+    /* Opt-in one immutable regular stdin source, at most four serialized
+     * read(0,buffer,1..4096) calls, fixed observed read geometry and outcomes.
+     * Requires flat32_ram and a fragment starting at the first read. Source
+     * bytes remain original MEM32 leaves; guest copy-in is never a new initial
+     * RAM premise. No lseek, writes, pipes, sockets or mixed syscall models. */
+    const IrReplayStdinSource *stdin_source;
 } IrReplayOptions;
 
 typedef enum {
@@ -171,6 +203,9 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
 void ir_replay_destroy(IrReplay *replay);
 IrModule *ir_replay_module(IrReplay *replay);
 const IrX86State *ir_replay_state(const IrReplay *replay);
+/* Zero unless an explicit stdin provider was accepted. Select source bytes by
+ * this state and original file offset, never by overwritten guest addresses. */
+IrStateId ir_replay_stdin_state(const IrReplay *replay);
 const IrInputs *ir_replay_inputs(const IrReplay *replay);
 IrInputInfo ir_replay_input_info(const IrReplay *replay);
 /* Query the current module, never a cached ValueId map. Requires trace SSA

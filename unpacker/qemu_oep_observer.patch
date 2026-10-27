@@ -1,0 +1,422 @@
+diff --git a/include/plugins/qemu-plugin.h b/include/plugins/qemu-plugin.h
+index 3e913cd..33abce7 100644
+--- a/include/plugins/qemu-plugin.h
++++ b/include/plugins/qemu-plugin.h
+@@ -1178,6 +1178,72 @@ QEMU_PLUGIN_API
+ bool qemu_plugin_read_memory_vaddr(uint64_t addr,
+                                    GByteArray *data, size_t len);
+
++/**
++ * qemu_plugin_taintforge_user_vmas_v1() - bounded linux-user guest map snapshot
++ * @start: inclusive page-aligned guest address
++ * @end: exclusive page-aligned guest address, at most 2^32
++ * @records: caller buffer for four uint64_t values per mapped interval
++ * @capacity: interval capacity, at most 4096; zero performs a count-only query
++ * @count: number of returned intervals; zero on failure
++ * @page_size: guest target page size; zero on failure
++ *
++ * Custom TaintForge ABI v1, for vCPU execution or syscall callbacks after
++ * target initialization. Each interval is [start, end, raw page flags, RWX].
++ * Unmapped gaps are omitted; mapped PROT_NONE intervals are included. RWX uses
++ * bits 1/2/4; write is derived from PAGE_WRITE_ORG, not the SMC write-trap bit.
++ * The mmap lock keeps map metadata consistent across count/fill. This does not
++ * stop other vCPUs or provide an atomic RAM/register/process checkpoint.
++ *
++ * Returns 0, -EINVAL for invalid arguments, -ENOSPC for insufficient capacity,
++ * -EIO for a walk failure, or -ENOTSUP in system mode. Ignore buffer contents
++ * on failure. Count-only results are not bound to a later query.
++ */
++QEMU_PLUGIN_API
++int qemu_plugin_taintforge_user_vmas_v1(uint64_t start, uint64_t end,
++                                       uint64_t *records, size_t capacity,
++                                       size_t *count, uint32_t *page_size);
++
++/**
++ * qemu_plugin_taintforge_user_entry_v1() - bounded ELF table producer receipt
++ * @records: caller buffer for three uint64_t values per constructor word
++ * @capacity: record capacity, at most 1024; zero performs a count-only query
++ * @count: number of records returned; zero on failure
++ * @metadata: caller buffer for eight uint64_t metadata words
++ * @metadata_capacity: metadata buffer capacity in uint64_t words, at least eight
++ *
++ * Custom TaintForge ABI v1 for the initial static IA-32 Linux ELF entry. Each
++ * record is [guest address, written value, kind], in constructor write order;
++ * kind is 1 argc, 2 argv, 3 envp, or 4 auxv, including terminators. Metadata is
++ * [1, word_bytes, initial_sp, argc, envc, entry, phdr_address, has_interpreter].
++ * The receipt records values at loader writes, not by reading the later stack.
++ * It does not authenticate host launch inputs or establish a Linux kernel proof.
++ * Call only from the first original-entry vCPU callback; later calls return the
++ * same construction receipt and do not describe the current guest state.
++ *
++ * Returns 0, -EINVAL for invalid arguments, -ENOSPC for insufficient capacity,
++ * or -ENOTSUP before completion, on unsupported ELF/target, on a failed loader
++ * write or overflow, and in system mode. Ignore records on failure; count and
++ * the first eight metadata words (when provided) are cleared on failure.
++ */
++QEMU_PLUGIN_API
++int qemu_plugin_taintforge_user_entry_v1(uint64_t *records, size_t capacity,
++                                        size_t *count, uint64_t *metadata,
++                                        size_t metadata_capacity);
++
++/**
++ * qemu_plugin_taintforge_user_brk_v1() - observe 32-bit linux-user brk state
++ * @initial: initial guest program break recorded by the ELF loader
++ * @current: current guest program break maintained by syscall emulation
++ *
++ * Custom TaintForge ABI v1. Use from a vCPU execution or syscall callback in
++ * the selected single-vCPU process. This observes emulator state without a
++ * guest syscall; it does not establish a process checkpoint or kernel proof.
++ * Returns 0, -EINVAL for null outputs, or -ENOTSUP outside 32-bit linux-user.
++ * Non-null outputs are zero on failure.
++ */
++QEMU_PLUGIN_API
++int qemu_plugin_taintforge_user_brk_v1(uint64_t *initial, uint64_t *current);
++
+ /**
+  * qemu_plugin_write_memory_vaddr() - write to memory using a virtual address
+  *
+diff --git a/linux-user/elfload.c b/linux-user/elfload.c
+index c4bdaa1..b471821 100644
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -22,6 +22,7 @@
+ #include "qemu/queue.h"
+ #include "qemu/guest-random.h"
+ #include "qemu/units.h"
++#include "plugins/qemu-plugin.h"
+ #include "qemu/lockable.h"
+ #include "qapi/error.h"
+ #include "qemu/error-report.h"
+@@ -547,6 +548,90 @@ static abi_ulong loader_build_fdpic_loadmap(struct image_info *info, abi_ulong s
+     return sp;
+ }
+
++/* Bounded producer receipt for the selected static IA-32 entry table. */
++#define TF_USER_ENTRY_WORDS_V1 1024
++static struct {
++    uint64_t records[3 * TF_USER_ENTRY_WORDS_V1];
++    uint64_t metadata[8];
++    size_t count;
++    bool collecting, valid;
++} tf_user_entry_v1;
++
++static void tf_user_entry_begin_v1(abi_ulong sp, int argc, int envc,
++                                   abi_ulong entry, abi_ulong phdr,
++                                   unsigned word_bytes, bool interpreter,
++                                   bool supported)
++{
++    tf_user_entry_v1.count = 0;
++    tf_user_entry_v1.valid = false;
++    tf_user_entry_v1.collecting = supported && argc >= 0 && envc >= 0;
++    tf_user_entry_v1.metadata[0] = 1;
++    tf_user_entry_v1.metadata[1] = word_bytes;
++    tf_user_entry_v1.metadata[2] = sp;
++    tf_user_entry_v1.metadata[3] = argc;
++    tf_user_entry_v1.metadata[4] = envc;
++    tf_user_entry_v1.metadata[5] = entry;
++    tf_user_entry_v1.metadata[6] = phdr;
++    tf_user_entry_v1.metadata[7] = interpreter;
++}
++
++static void tf_user_entry_record_v1(abi_ulong value, abi_ulong address,
++                                    uint64_t kind, int rc)
++{
++    uint64_t *record;
++
++    if (!tf_user_entry_v1.collecting) {
++        return;
++    }
++    if (rc != 0 || tf_user_entry_v1.count == TF_USER_ENTRY_WORDS_V1) {
++        tf_user_entry_v1.collecting = false;
++        return;
++    }
++    record = tf_user_entry_v1.records + 3 * tf_user_entry_v1.count++;
++    record[0] = address;
++    record[1] = value;
++    record[2] = kind;
++}
++
++/* Preserve put_user_ual's lazy value evaluation on failed access checks. */
++#define tf_user_entry_put_v1(value, address, kind) do {                       \
++    abi_ulong tf_entry_address = (address);                                  \
++    abi_ulong tf_entry_value = 0;                                            \
++    int tf_entry_rc = put_user_ual((tf_entry_value = (value)),                \
++                                  tf_entry_address);                        \
++    tf_user_entry_record_v1(tf_entry_value, tf_entry_address,                 \
++                            (kind), tf_entry_rc);                            \
++} while (0)
++
++int qemu_plugin_taintforge_user_entry_v1(uint64_t *records, size_t capacity,
++                                        size_t *count, uint64_t *metadata,
++                                        size_t metadata_capacity)
++{
++    if (count) {
++        *count = 0;
++    }
++    if (metadata && metadata_capacity >= 8) {
++        memset(metadata, 0, 8 * sizeof(*metadata));
++    }
++    if (!count || !metadata || metadata_capacity < 8 ||
++        capacity > TF_USER_ENTRY_WORDS_V1 || (capacity && !records)) {
++        return -EINVAL;
++    }
++    if (!tf_user_entry_v1.valid) {
++        return -ENOTSUP;
++    }
++    if (capacity && capacity < tf_user_entry_v1.count) {
++        return -ENOSPC;
++    }
++    if (capacity) {
++        memcpy(records, tf_user_entry_v1.records,
++               3 * tf_user_entry_v1.count * sizeof(*records));
++    }
++    memcpy(metadata, tf_user_entry_v1.metadata, 8 * sizeof(*metadata));
++    *count = tf_user_entry_v1.count;
++    return 0;
++}
++
+ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
+                                    struct elfhdr *exec,
+                                    struct image_info *info,
+@@ -562,6 +647,7 @@ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
+     abi_ulong u_platform, u_base_platform;
+     const char *k_platform, *k_base_platform;
+     const int n = sizeof(elf_addr_t);
++    bool tf_supported = false;
+
+     sp = p;
+
+@@ -678,12 +764,19 @@ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
+     info->argv = u_argv;
+     info->envp = u_envp;
+
++#if defined(TARGET_I386) && !defined(TARGET_X86_64)
++    tf_supported = n == 4 && STACK_GROWS_DOWN && !interp_info &&
++                   !elf_is_fdpic(exec);
++#endif
++    tf_user_entry_begin_v1(sp, argc, envc, info->entry, info->phdr_addr, n,
++                           interp_info != NULL, tf_supported);
++
+     /* This is correct because Linux defines
+      * elf_addr_t as Elf32_Off / Elf64_Off
+      */
+ #define NEW_AUX_ENT(id, val) do {               \
+-        put_user_ual(id, u_auxv);  u_auxv += n; \
+-        put_user_ual(val, u_auxv); u_auxv += n; \
++        tf_user_entry_put_v1((id), u_auxv, 4);  u_auxv += n; \
++        tf_user_entry_put_v1((val), u_auxv, 4); u_auxv += n; \
+     } while(0)
+
+ #ifdef ARCH_DLINFO
+@@ -733,26 +826,29 @@ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
+      */
+     assert(info->auxv_len == u_auxv - info->saved_auxv);
+
+-    put_user_ual(argc, u_argc);
++    tf_user_entry_put_v1(argc, u_argc, 1);
+
+     p = info->arg_strings;
+     for (i = 0; i < argc; ++i) {
+-        put_user_ual(p, u_argv);
++        tf_user_entry_put_v1(p, u_argv, 2);
+         u_argv += n;
+         p += target_strlen(p) + 1;
+     }
+-    put_user_ual(0, u_argv);
++    tf_user_entry_put_v1(0, u_argv, 2);
+
+     p = info->env_strings;
+     for (i = 0; i < envc; ++i) {
+-        put_user_ual(p, u_envp);
++        tf_user_entry_put_v1(p, u_envp, 3);
+         u_envp += n;
+         p += target_strlen(p) + 1;
+     }
+-    put_user_ual(0, u_envp);
++    tf_user_entry_put_v1(0, u_envp, 3);
+
++    tf_user_entry_v1.valid = tf_user_entry_v1.collecting;
++    tf_user_entry_v1.collecting = false;
+     return sp;
+ }
++#undef tf_user_entry_put_v1
+
+ void linux_probe_guest_base(const char *image_name,
+                             const PGBRange *image_range)
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 91de33d..f612971 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -865,6 +865,28 @@ void target_brk_snapshot(abi_ulong *initial, abi_ulong *current)
+     *current = target_brk;
+ }
+
++int qemu_plugin_taintforge_user_brk_v1(uint64_t *initial, uint64_t *current)
++{
++    abi_ulong initial_brk, current_brk;
++
++    if (initial) {
++        *initial = 0;
++    }
++    if (current) {
++        *current = 0;
++    }
++    if (!initial || !current) {
++        return -EINVAL;
++    }
++    if (sizeof(abi_ulong) != 4) {
++        return -ENOTSUP;
++    }
++    target_brk_snapshot(&initial_brk, &current_brk);
++    *initial = initial_brk;
++    *current = current_brk;
++    return 0;
++}
++
+ void target_set_brk(abi_ulong new_brk)
+ {
+     target_brk = TARGET_PAGE_ALIGN(new_brk);
+diff --git a/plugins/api-system.c b/plugins/api-system.c
+index fbf905c..e8c1b20 100644
+--- a/plugins/api-system.c
++++ b/plugins/api-system.c
+@@ -129,3 +129,46 @@ void qemu_plugin_update_ns(const void *handle, int64_t new_time)
+                          RUN_ON_CPU_HOST_ULONG(new_time));
+     }
+ }
++
++int qemu_plugin_taintforge_user_vmas_v1(uint64_t start, uint64_t end,
++                                       uint64_t *records, size_t capacity,
++                                       size_t *count, uint32_t *page_size)
++{
++    (void)start;
++    (void)end;
++    (void)records;
++    (void)capacity;
++    if (count) {
++        *count = 0;
++    }
++    if (page_size) {
++        *page_size = 0;
++    }
++    return -ENOTSUP;
++}
++
++int qemu_plugin_taintforge_user_entry_v1(uint64_t *records, size_t capacity,
++                                        size_t *count, uint64_t *metadata,
++                                        size_t metadata_capacity)
++{
++    (void)records;
++    (void)capacity;
++    if (count) {
++        *count = 0;
++    }
++    if (metadata && metadata_capacity >= 8) {
++        memset(metadata, 0, 8 * sizeof(*metadata));
++    }
++    return -ENOTSUP;
++}
++
++int qemu_plugin_taintforge_user_brk_v1(uint64_t *initial, uint64_t *current)
++{
++    if (initial) {
++        *initial = 0;
++    }
++    if (current) {
++        *current = 0;
++    }
++    return -ENOTSUP;
++}
+diff --git a/plugins/api-user.c b/plugins/api-user.c
+index 28704a8..b303938 100644
+--- a/plugins/api-user.c
++++ b/plugins/api-user.c
+@@ -13,6 +13,10 @@
+ #include "qemu/osdep.h"
+ #include "qemu/plugin.h"
+ #include "exec/log.h"
++#include "exec/mmap-lock.h"
++#include "exec/page-protection.h"
++#include "exec/target_page.h"
++#include "user/page-protection.h"
+
+ /*
+  * Virtual Memory queries - these are all NOPs for user-mode which
+@@ -55,3 +59,77 @@ void qemu_plugin_update_ns(const void *handle, int64_t new_time)
+ {
+     qemu_log_mask(LOG_UNIMP, "user-mode can't control time");
+ }
++
++/* Selected 32-bit guest map metadata, never host /proc mappings. */
++typedef struct {
++    uint64_t start, end;
++    uint64_t *records;
++    size_t count;
++} TfUserVmasV1;
++
++static int tf_user_vma_v1(void *opaque, vaddr start, vaddr end, int flags)
++{
++    TfUserVmasV1 *query = opaque;
++    uint64_t lo = MAX((uint64_t)start, query->start);
++    /* walk_memory_regions computes last + 1, which may wrap at UINT64_MAX. */
++    uint64_t hi = end ? MIN((uint64_t)end, query->end) : query->end;
++    uint64_t *record;
++
++    if (!(flags & PAGE_VALID) || lo >= hi) {
++        return 0;
++    }
++    if (query->count == 4096) {
++        return -ENOSPC;
++    }
++    if (query->records) {
++        record = query->records + 4 * query->count;
++        record[0] = lo;
++        record[1] = hi;
++        record[2] = (unsigned int)flags;
++        /* PAGE_WRITE can be cleared internally for self-modifying code. */
++        record[3] = (flags & (PAGE_READ | PAGE_EXEC)) |
++                    (flags & PAGE_WRITE_ORG ? PAGE_WRITE : 0);
++    }
++    query->count++;
++    return 0;
++}
++
++int qemu_plugin_taintforge_user_vmas_v1(uint64_t start, uint64_t end,
++                                       uint64_t *records, size_t capacity,
++                                       size_t *count, uint32_t *page_size)
++{
++    TfUserVmasV1 query = { .start = start, .end = end };
++    size_t page = qemu_target_page_size();
++    int rc;
++
++    if (count) {
++        *count = 0;
++    }
++    if (page_size) {
++        *page_size = 0;
++    }
++    if (!count || !page_size || !page || page > UINT32_MAX ||
++        (page & (page - 1)) || start >= end || end > (UINT64_C(1) << 32) ||
++        start % page || end % page || capacity > 4096 ||
++        (capacity && !records)) {
++        return -EINVAL;
++    }
++    /* The lock is recursive, including calls made from syscall callbacks. */
++    mmap_lock();
++    rc = walk_memory_regions(&query, tf_user_vma_v1);
++    if (rc == 0 && capacity && query.count > capacity) {
++        rc = -ENOSPC;
++    }
++    if (rc == 0 && capacity) {
++        query.records = records;
++        query.count = 0;
++        rc = walk_memory_regions(&query, tf_user_vma_v1);
++    }
++    mmap_unlock();
++    if (rc != 0) {
++        return rc == -ENOSPC ? -ENOSPC : -EIO;
++    }
++    *count = query.count;
++    *page_size = page;
++    return 0;
++}

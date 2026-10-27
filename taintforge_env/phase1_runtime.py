@@ -142,9 +142,27 @@ class Phase1Run:
         options.extend(f"tf-{'ir-report' if key == 'ir' else key}={path}" for key, path in self.paths.items())
         options.append(f"ir-check={'on' if ir else 'off'}")
         allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-tls32", "ir-observed-munmap", "ir-observed-mprotect", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates"}
+        capture_choices = {"tf-capture": {"entry", "exit"}, "dse-check": {"off"},
+                           "runtime-log": {"summary"}}
+        capture_budgets = {"tf-max-capture-bytes": (1, 1024 * 1024 * 1024),
+                           "ir-trace-capacity": (2, 512 * 1024)}
+        capture_seen = set()
         for option in extra:
-            if option.split("=", 1)[0] not in allowed or "=" not in option:
+            if not isinstance(option, str):
+                raise Phase1RuntimeError("per-run analysis options must be strings")
+            key, separator, value = option.partition("=")
+            if not separator or key not in allowed | capture_choices.keys() | capture_budgets.keys():
                 raise Phase1RuntimeError(f"not an allowed per-run analysis option: {option}")
+            if key in capture_choices or key in capture_budgets:
+                if key in capture_seen:
+                    raise Phase1RuntimeError(f"duplicate per-run capture option: {key}")
+                capture_seen.add(key)
+            if key in capture_choices and value not in capture_choices[key]:
+                raise Phase1RuntimeError(f"invalid per-run capture option: {option}")
+            if key in capture_budgets:
+                minimum, maximum = capture_budgets[key]
+                if re.fullmatch(r"[0-9]{1,10}", value) is None or not minimum <= int(value) <= maximum:
+                    raise Phase1RuntimeError(f"invalid per-run capture budget: {option}")
         options.extend(extra)
         if any("," in value or "\n" in value for value in options):
             raise Phase1RuntimeError("QEMU plugin arguments cannot contain commas or newlines")

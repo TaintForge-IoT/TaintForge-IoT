@@ -39,6 +39,236 @@ def integer(value, name):
     raise CaptureError('INVALID_CAPTURE', f'{name}: expected an integer')
 
 
+def validate_stage_selection(report):
+    """Check the bounded observed-stage graph without inferring originality.
+
+    Legacy captures have no stage inventory. New-policy captures must retain
+    the whole bounded inventory and an eligible selected leaf, even when the
+    detailed scoring table contains only three candidates.
+    """
+    policy = 'observed_write_transfer_leaf_semantic_evidence_v2'
+    stage_fields = ('observed_stage_candidates', 'observed_stage_edges',
+                    'observed_stage_history_status', 'selection_scope',
+                    'historical_originality_proven', 'complete_stage_chain')
+    if (not any(key in report for key in stage_fields) and
+            report.get('oep_selection_policy') != policy):
+        return
+
+    def reject(message):
+        raise CaptureError('INVALID_STAGE_SELECTION', message)
+
+    def number(row, key, maximum=2**64 - 1):
+        value = row.get(key)
+        if type(value) is not int or not 0 <= value <= maximum:
+            reject('Invalid stage integer: ' + key)
+        return value
+
+    if (report.get('oep_selection_policy') != policy or
+            report.get('observed_stage_history_status') != 'complete' or
+            report.get('selection_scope') != 'observed_stage_leaf_candidate' or
+            report.get('oep_proven') is not False or
+            report.get('historical_originality_proven') is not False or
+            report.get('complete_stage_chain') is not False):
+        reject('Incomplete inventory or promoted stage-selection scope')
+    nodes = report.get('observed_stage_candidates')
+    edges = report.get('observed_stage_edges')
+    if (not isinstance(nodes, list) or not 1 <= len(nodes) <= 10000 or
+            not isinstance(edges, list) or len(edges) > len(nodes) - 1):
+        reject('Missing or oversized stage inventory')
+    mapping_version = report.get('observed_stage_mapping_identity_version')
+    mapping_keys = ('mapping_epoch', 'guest_store_generation', 'parent_mapping_epoch',
+                    'source_writer_mapping_epoch')
+    has_mapping = any(isinstance(row, dict) and any(key in row for key in mapping_keys)
+                      for row in nodes)
+    if (mapping_version is not None or has_mapping) and (
+            type(mapping_version) is not int or mapping_version != 1):
+        reject('Missing or unsupported stage mapping identity version')
+    mapping_identity = mapping_version == 1
+    file_version = report.get('file_mapping_profile_version')
+    file_keys = ('file_mapping_profile_version', 'backing_file_id',
+                 'backing_offset', 'descriptor_epoch')
+    if file_version in (5, 6, 7):
+        file_keys += ('backing_content_epoch',)
+    if file_version in (6, 7):
+        file_keys += ('backing_shared',)
+    if file_version == 7:
+        file_keys += ('write_origin',)
+    file_rows = nodes + (report.get('oep_candidates') if isinstance(report.get('oep_candidates'), list) else [])
+    has_file = any(isinstance(row, dict) and any(key in row for key in (*file_keys, 'backing_content_epoch', 'backing_shared', 'write_origin'))
+                   for row in file_rows)
+    if (file_version is not None or has_file) and (
+            type(file_version) is not int or file_version not in (4, 5, 6, 7) or not mapping_identity):
+        reject('Missing or unsupported file mapping profile version')
+    file_identity = file_version in (4, 5, 6, 7)
+    for row in file_rows:
+        if not isinstance(row, dict):
+            continue
+        if file_version == 7:
+            if row.get('write_origin') not in ('observed_guest_store_page', 'kernel_or_unknown_page'):
+                reject('Missing or unknown V7 page-write origin')
+        elif 'write_origin' in row:
+            reject('Page-write origin classification requires V7')
+    by_id, children, previous_id, previous_seq = {}, {}, 0, 0
+    last_generation_at_pc = {}
+    last_store_at_pc = {}
+    for row in nodes:
+        if not isinstance(row, dict):
+            reject('Invalid stage row')
+        ident, seq = number(row, 'candidate_id'), number(row, 'entry_seq')
+        address = number(row, 'address', 2**32 - 1)
+        size = number(row, 'entry_size', 15)
+        generation = number(row, 'code_generation', 2**32 - 1)
+        number(row, 'epoch')
+        number(row, 'vcpu', 2**32 - 1)
+        parent = number(row, 'parent_candidate_id')
+        number(row, 'superseded_by_candidate_id')
+        if (ident <= previous_id or seq <= previous_seq or not size or
+                generation in (0, 2**32 - 1) or
+                address + size > 2**32 or parent >= ident or
+                any(type(row.get(key)) is not bool for key in
+                    ('stale', 'superseded', 'selected', 'selection_eligible'))):
+            reject('Invalid stage order, identity or state')
+        if address in last_generation_at_pc and generation <= last_generation_at_pc[address]:
+            reject('Repeated stage PC lacks a later code generation')
+        last_generation_at_pc[address] = generation
+        if mapping_identity:
+            for key in mapping_keys:
+                number(row, key)
+            observation_only = file_version == 7 and row['write_origin'] == 'kernel_or_unknown_page'
+            if ((not row['guest_store_generation'] and not observation_only) or
+                    (not parent and (row['parent_mapping_epoch'] or
+                                     row['source_writer_mapping_epoch']))):
+                reject('Invalid stage mapping or STORE identity')
+            if observation_only:
+                if (row['guest_store_generation'] or parent or row['selected'] or row['selection_eligible'] or
+                        any(number(row,key) for key in ('source_write_pc','source_write_seq',
+                            'source_write_generation','written_begin','written_end'))):
+                    reject('Kernel or unknown page cannot supply guest STORE evidence')
+            if (not observation_only and address in last_store_at_pc and
+                    row['guest_store_generation'] <= last_store_at_pc[address]):
+                reject('Repeated stage PC lacks a later guest STORE')
+            if not observation_only:
+                last_store_at_pc[address] = row['guest_store_generation']
+        if file_identity:
+            if (type(row.get('file_mapping_profile_version')) is not int or
+                    row['file_mapping_profile_version'] != file_version):
+                reject('Incomplete file mapping stage profile')
+            file_id = row.get('backing_file_id')
+            offset = number(row, 'backing_offset')
+            descriptor = number(row, 'descriptor_epoch')
+            if (type(file_id) is not int or file_id not in range(-2, 32 if file_version in (5, 6, 7) else 1) or
+                    offset % PAGE or offset > 2**64 - PAGE or
+                    (file_id >= 0 and not 0 < descriptor < row['mapping_epoch']) or
+                    (file_id < 0 and descriptor) or
+                    (file_id == -1 and offset)):
+                reject('Invalid file mapping source or descriptor lifetime')
+            if file_version in (5, 6, 7):
+                content_epoch = number(row, 'backing_content_epoch')
+                # V6 permits a kernel write while a shared map remains live.
+                # Its constructor ordinal may therefore follow the map ordinal.
+                # Exact chronology is checked by the fresh-prefix bindings.
+                content_limit = row['entry_seq'] if file_version in (6, 7) else row['mapping_epoch']
+                if (file_id <= 0 and content_epoch or
+                        file_id > 0 and not descriptor <= content_epoch < content_limit):
+                    reject('Invalid mutable file content lifetime')
+            elif 'backing_content_epoch' in row:
+                reject('Mutable content lifetime requires the V5 profile')
+            if file_version in (6, 7):
+                if (type(row.get('backing_shared')) is not bool or
+                        row['backing_shared'] and file_id <= 0):
+                    reject('Shared backing requires a local mutable file')
+            elif 'backing_shared' in row:
+                reject('Shared backing requires the V6 profile')
+        by_id[ident], children[ident] = row, set()
+        previous_id, previous_seq = ident, seq
+    incoming = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            reject('Invalid stage edge')
+        parent_id, child_id = (number(edge, key) for key in
+                              ('parent_candidate_id', 'child_candidate_id'))
+        parent, child = by_id.get(parent_id), by_id.get(child_id)
+        if file_version == 7 and any(node is not None and node['write_origin'] != 'observed_guest_store_page'
+                                     for node in (parent, child)):
+            reject('Observed guest-STORE edges cannot use a kernel or unknown page')
+        if (parent is None or child is None or parent_id >= child_id or child_id in incoming or
+                child['parent_candidate_id'] != parent_id or
+                edge.get('relation') != 'observed_contiguous_write_then_adjacent_transfer'):
+            reject('Orphan, duplicate or inconsistent stage edge')
+        writer = number(edge, 'writer_pc', 2**32 - 1)
+        transfer = number(edge, 'transfer_pc', 2**32 - 1)
+        write_seq, transfer_seq, entry_seq = (number(edge, key) for key in
+                                             ('write_seq', 'transfer_seq', 'entry_seq'))
+        begin = number(edge, 'written_begin', 2**32 - 1)
+        end = number(edge, 'written_end', 2**32)
+        page_begin = child['address'] // PAGE * PAGE
+        if (not parent['entry_seq'] <= write_seq < transfer_seq or
+                transfer_seq == 2**64 - 1 or transfer_seq + 1 != entry_seq or
+                entry_seq != child['entry_seq'] or
+                not page_begin <= begin < end <= page_begin + PAGE or
+                not begin <= child['address'] < child['address'] + child['entry_size'] <= end or
+                writer // PAGE != parent['address'] // PAGE or
+                transfer // PAGE != parent['address'] // PAGE or
+                number(edge, 'vcpu', 2**32 - 1) != parent['vcpu'] or
+                parent['vcpu'] != child['vcpu'] or
+                number(edge, 'write_generation', 2**32 - 1) != child['code_generation'] or
+                number(edge, 'target_code_generation', 2**32 - 1) != child['code_generation']):
+            reject('Stage producer, byte interval or transfer boundary differs')
+        for key, edge_key in (('source_write_pc', 'writer_pc'), ('source_write_seq', 'write_seq'),
+                              ('source_write_generation', 'write_generation'),
+                              ('transfer_seq', 'transfer_seq'), ('transfer_pc', 'transfer_pc'),
+                              ('written_begin', 'written_begin'), ('written_end', 'written_end')):
+            if number(child, key) != edge[edge_key]:
+                reject('Stage row differs from its causal edge')
+        if mapping_identity:
+            bindings = (('target_mapping_epoch', child['mapping_epoch']),
+                        ('parent_mapping_epoch', parent['mapping_epoch']),
+                        ('writer_mapping_epoch', parent['mapping_epoch']),
+                        ('guest_store_generation', child['guest_store_generation']))
+            if (any(number(edge, key) != wanted for key, wanted in bindings) or
+                    child['parent_mapping_epoch'] != parent['mapping_epoch'] or
+                    child['source_writer_mapping_epoch'] != parent['mapping_epoch']):
+                reject('Stage edge crosses a stale or different mapping lifetime')
+        incoming[child_id] = parent_id
+        children[parent_id].add(child_id)
+    selected = []
+    for ident, row in by_id.items():
+        if (bool(row['parent_candidate_id']) != (ident in incoming) or
+                row['superseded'] != bool(children[ident]) or
+                (row['superseded_by_candidate_id'] not in children[ident]
+                 if children[ident] else row['superseded_by_candidate_id'] != 0) or
+                row['selection_eligible'] != (not row['stale'] and not row['superseded'] and
+                    (file_version != 7 or row['write_origin'] == 'observed_guest_store_page'))):
+            reject('Stage eligibility or supersession differs from observed edges')
+        if row['selected']:
+            if not row['selection_eligible']:
+                reject('Selected stage is stale or has an observed successor')
+            selected.append(row)
+    details = report.get('oep_candidates')
+    if len(selected) != 1 or not isinstance(details, list):
+        reject('A successful capture requires one selected stage')
+    detail = [row for row in details if isinstance(row, dict) and row.get('selected') is True]
+    row = selected[0]
+    if (len(detail) != 1 or
+            integer(report.get('oep'), 'oep') != row['address'] or
+            number(detail[0], 'candidate_id') != row['candidate_id'] or
+            integer(detail[0].get('addr'), 'candidate addr') != row['address'] or
+            number(detail[0], 'code_generation', 2**32 - 1) != row['code_generation'] or
+            detail[0].get('stale') is not False or
+            ('superseded' in detail[0] and detail[0]['superseded'] is not False)):
+        reject('Selected stage is absent from or differs from detailed capture metadata')
+    if mapping_identity and any(number(detail[0], key) != row[key]
+                                for key in ('mapping_epoch', 'guest_store_generation')):
+        reject('Selected stage mapping differs from detailed capture metadata')
+    if file_version == 4 and 'backing_content_epoch' in detail[0]:
+        reject('Mutable detailed lifetime requires the V5 profile')
+    if file_version not in (6, 7) and 'backing_shared' in detail[0]:
+        reject('Shared detailed backing requires the V6 profile')
+    if file_identity and any(type(detail[0].get(key)) is not type(row[key]) or detail[0][key] != row[key]
+                             for key in file_keys):
+        reject('Selected stage file backing differs from detailed capture metadata')
+
+
 def read_elf(path):
     path = Path(path)
     if not ELF_HEADER.size <= path.stat().st_size <= MAX_BYTES:
@@ -125,6 +355,7 @@ def load_capture(report_path, dump_path):
                        or integer(selected[0].get('addr'), 'candidate addr') != entry
                        or selected[0].get('code_generation') != executable['code_generation']):
         raise CaptureError('STALE_CANDIDATE', 'Selected candidate does not identify the captured entry generation')
+    validate_stage_selection(report)
     return report, checked
 
 

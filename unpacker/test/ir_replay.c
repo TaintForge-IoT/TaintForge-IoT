@@ -26,6 +26,12 @@ struct IrReplay {
     uint16_t executable_link_size;
     uint8_t executable_link[DSE_SYSCALL_PATH_BYTES];
     IrOrigin executable_origin;
+    IrStateId stdin_state;
+    uint8_t *stdin_bytes;
+    uint32_t stdin_size, stdin_count, stdin_done;
+    IrReplayStdinRead stdin_reads[IR_REPLAY_STDIN_MAX_READS];
+    IrOrigin stdin_origin;
+    uint64_t stdin_boundary;
     IrBits initial_gpr[IR_X86_GPR_COUNT];
     IrBits initial_flags[IR_X86_FLAG_COUNT];
     IrBits initial_tls[IR_X86_TLS_COUNT];
@@ -54,7 +60,7 @@ size_t ir_replay_allocated_bytes(const IrReplay *r) {
     return sizeof(*r) + ir_module_allocated_bytes(r->module) +
            (size_t)r->observation_capacity * sizeof(*r->observations) +
            (size_t)r->memory_capacity * sizeof(*r->memory) + ir_inputs_bytes(r->inputs) +
-           ir_environment_bytes(r->environment) + r->executable_size;
+           ir_environment_bytes(r->environment) + r->executable_size + r->stdin_size;
 }
 
 static const unsigned flag_bit[IR_X86_FLAG_COUNT] = {0, 2, 4, 6, 7, 11, 10};
@@ -83,6 +89,7 @@ void ir_replay_destroy(IrReplay *r) {
     free(r->observations);
     free(r->memory);
     free(r->executable_bytes);
+    free(r->stdin_bytes);
     free(r);
 }
 
@@ -92,6 +99,10 @@ IrModule *ir_replay_module(IrReplay *r) {
 
 const IrX86State *ir_replay_state(const IrReplay *r) {
     return r ? &r->state : NULL;
+}
+
+IrStateId ir_replay_stdin_state(const IrReplay *r) {
+    return r ? r->stdin_state : 0;
 }
 
 const IrInputs *ir_replay_inputs(const IrReplay *r) {
@@ -434,6 +445,93 @@ static bool kernel_write(IrReplay *r,IrX86Frontend *f,IrBlockId b,IrOrigin o,
     return observe_memory(r,o,lift,&occurrence,NULL);
 }
 
+static uint32_t lift_stdin_read(IrReplay *r, IrX86Frontend *f, IrBlockId b,
+                                const ReplayStep *step, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (r->stdin_done >= r->stdin_count) {
+        r->info.environment_reason = "stdin_read_not_in_ledger";
+        return IR_REPLAY_SYSCALL_MODEL;
+    }
+    const IrReplayStdinRead *read = &r->stdin_reads[r->stdin_done];
+    if (step->entry.seq_id != read->seq || s->number != 3 || s->args[0] ||
+        s->args[1] != read->address || s->args[2] != read->requested ||
+        s->result != read->returned) {
+        r->info.environment_reason = "stdin_read_ledger_mismatch";
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    /* The syscall's modeled architectural contract is independently observed
+     * at the next instruction, not guessed from its return callback. */
+    if (!aux->valid || aux->seq_id != step->entry.seq_id ||
+        aux->meta_id != step->entry.meta_id || aux->pc != step->entry.pc ||
+        !aux->execution_complete || !aux->next_pc_valid ||
+        aux->next_pc != (uint32_t)(step->entry.pc + 2U) ||
+        (aux->reg_value_valid_mask & 255U) != 255U ||
+        !aux->eflags_valid || (aux->eflags_before & (1U << 17)) ||
+        !s->post_observed || (s->post_valid_mask & 255U) != 255U ||
+        !s->post_eflags_valid || s->post_eflags != aux->eflags_before ||
+        s->post_regs[REG_RAX] != s->result || !s->boundary_id ||
+        !s->boundary_ordered || (r->stdin_boundary &&
+         (r->stdin_boundary == UINT64_MAX || s->boundary_id != r->stdin_boundary + 1U)) ||
+        aux->has_mem_read || aux->has_mem_write || aux->mem_read_count ||
+        aux->mem_write_count || aux->mem_read_total || aux->mem_write_total ||
+        aux->mem_read_overflow || aux->mem_write_overflow) {
+        r->info.environment_reason = "stdin_architectural_contract_missing";
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    const unsigned regs[] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX};
+    const uint32_t expected[] = {3, 0, read->address, read->requested};
+    for (unsigned i = 0; i < 4; ++i) {
+        if (aux->reg_vals[regs[i]] != expected[i]) {
+            r->info.environment_reason = "stdin_entry_register_mismatch";
+            return IR_REPLAY_SYSCALL_OBSERVATION;
+        }
+    }
+    for (unsigned i = 1; i < 8; ++i) {
+        if (aux->reg_vals[i] != s->post_regs[i]) {
+            r->info.environment_reason = "stdin_preserved_register_mismatch";
+            return IR_REPLAY_SYSCALL_OBSERVATION;
+        }
+    }
+    IrOrigin o = origin_of(step);
+    for (unsigned i = 0; i < 4; ++i) {
+        IrValueId value = ir_emit_value(r->module, b, (IrInstSpec){
+            .op=IR_OP_READ_STATE, .type=ir_type_bv(32),
+            .state=r->state.gpr[regs[i]], .origin=o});
+        replay_guard(r, b, o, value, 32, expected[i]);
+    }
+    IrValueId source = 0;
+    if (read->returned)
+        source = ir_emit_value(r->module, b, (IrInstSpec){
+            .op=IR_OP_READ_STATE, .type=ir_type_mem(32), .state=r->stdin_state, .origin=o});
+    for (uint32_t i = 0; i < read->returned; ++i) {
+        IrValueId offset = replay_constant(r, b, o, 32, read->offset+i);
+        IrValueId byte = ir_emit_value(r->module, b, (IrInstSpec){
+            .op=IR_OP_LOAD, .type=ir_type_bv(8), .args={source,offset},
+            .endian=IR_ENDIAN_LE, .origin=o});
+        IrValueId address = replay_constant(r, b, o, 32, read->address+i);
+        if (!byte || !ir_x86_memory_write(f, b, o, address, 1, byte))
+            return IR_REPLAY_BUDGET;
+        /* Mark these as chronological stores. A later guest load must never
+         * reintroduce a read's observed output as fresh boundary memory. */
+        IrX86LiftResult lift = {.memory_count=1, .memory={{true,1,address,byte}}};
+        InsnOccurrence occurrence = {.dynamic_effects_available=true, .execution_complete=true,
+            .mem_write_count=1, .mem_write_total=1,
+            .mem_writes={{.kind=TRACE_MEM_WRITE,.address=read->address+i,.size=1,
+                .value=r->stdin_bytes[read->offset+i],.value_valid=true}}};
+        if (!observe_memory(r, o, lift, &occurrence, NULL)) return IR_REPLAY_BUDGET;
+    }
+    IrValueId result = replay_constant(r, b, o, 32, read->returned);
+    (void)ir_emit_effect(r->module, b, (IrInstSpec){.op=IR_OP_WRITE_STATE,
+        .type=ir_type_void(), .state=r->state.gpr[REG_RAX], .args={result}, .origin=o});
+    r->stdin_boundary = s->boundary_id;
+    ++r->stdin_done;
+    ++r->info.modeled_stdin_reads;
+    r->info.stdin_bytes += read->returned;
+    r->info.syscall_present = false;
+    r->info.stopped_syscall = (DseSyscallObservation){0};
+    return 0;
+}
+
 static uint32_t environment_failure(IrReplay *r) {
     r->info.environment_reason=ir_environment_issue(r->environment);
     return ir_environment_budget(r->environment)?IR_REPLAY_BUDGET:IR_REPLAY_SYSCALL_MODEL;
@@ -600,6 +698,10 @@ static uint32_t lift_syscall(IrReplay *r, IrX86Frontend *f, IrBlockId block, con
         e->pc != t->pc || e->vcpu_index != t->vcpu_index || e->descriptor_id != t->insn_desc_id ||
         e->bytes_hash != t->bytes_hash || e->code_generation != t->code_generation)
         return IR_REPLAY_SYSCALL_OBSERVATION;
+    if (r->stdin_state && e->number == 3 && r->options.x86.flat32_ram &&
+        step->descriptor.size == 2 && step->descriptor.bytes[0] == 0xcd &&
+        step->descriptor.bytes[1] == 0x80)
+        return lift_stdin_read(r, f, block, step, aux);
     if(r->options.observed_proc_exe && r->environment && (e->number==5 || e->number==85) &&
         r->options.x86.flat32_ram && step->descriptor.size==2 &&
         step->descriptor.bytes[0]==0xcd && step->descriptor.bytes[1]==0x80)
@@ -1008,7 +1110,7 @@ static bool build_inputs(IrReplay *r, const ReplayInput *input, const ReplayStep
     const InsnAux *aux =
         identity_issues(first, first->entry.vcpu_index) ? NULL : saved_aux(input, first);
     const DseSourceObservation *sources = dse_aux_sources(aux);
-    IrInputState states[IR_X86_GPR_COUNT + IR_X86_FLAG_COUNT + IR_X86_TLS_COUNT + 2U];
+    IrInputState states[IR_X86_GPR_COUNT + IR_X86_FLAG_COUNT + IR_X86_TLS_COUNT + 3U];
     uint32_t nstates = 0, count = IR_X86_GPR_COUNT * 4U + IR_X86_FLAG_COUNT;
     for (unsigned i = 0; i < IR_X86_GPR_COUNT; ++i)
         states[nstates++] = (IrInputState){
@@ -1028,6 +1130,11 @@ static bool build_inputs(IrReplay *r, const ReplayInput *input, const ReplayStep
     if(r->executable_state) {
         states[nstates++]=(IrInputState){.state=r->executable_state,.type=ir_type_mem(32),.key=IR_PROC_EXE_INPUT_KEY};
         count+=r->executable_size;
+    }
+    if (r->stdin_state) {
+        states[nstates++] = (IrInputState){.state=r->stdin_state, .type=ir_type_mem(32),
+                                           .key=IR_STDIN_INPUT_KEY};
+        count += r->stdin_size;
     }
     /* Account both hash-table scans separately from catalogue operations. */
     IrInputLimits limits = r->options.inputs;
@@ -1122,11 +1229,58 @@ static bool build_inputs(IrReplay *r, const ReplayInput *input, const ReplayStep
          * guest RAM cells, infer provenance or certify externally replayable inputs. */
         if(!ir_inputs_add(r->inputs,cell)) goto fail;
     }
+    for (uint32_t i = 0; i < r->stdin_size; ++i) {
+        IrInputCell cell = {.kind=IR_INPUT_MEMORY_BYTE, .state=r->stdin_state,
+            .address=i, .width=8, .observed=ir_bits_known(r->stdin_bytes[i],8),
+            .observation_origin=r->stdin_origin};
+        if (!ir_inputs_add(r->inputs, cell)) goto fail;
+    }
     if (ir_inputs_seal(r->inputs))
         return true;
 fail:
     r->input_status = ir_inputs_info(r->inputs).status;
     return false;
+}
+
+static bool stdin_source_shape(const ReplayInput *input, const IrReplayOptions *options,
+                                uint32_t *prefix) {
+    const IrReplayStdinSource *source = options->stdin_source;
+    *prefix = 0;
+    if (!source) return true;
+    if (!options->x86.flat32_ram || options->observed_files || options->observed_proc_exe ||
+        options->observed_munmap || options->observed_mprotect || !source->bytes ||
+        !source->size || source->size > IR_REPLAY_STDIN_MAX_FILE || !source->reads ||
+        !source->count || source->count > IR_REPLAY_STDIN_MAX_READS ||
+        !replay_input_count(input) || replay_input_count(input) > options->max_steps) return false;
+    const ReplayStep *first = replay_input_step(input, 0);
+    if (!first || first->entry.seq_id != source->reads[0].seq) return false;
+    for (uint32_t i = 0; i < source->count; ++i) {
+        const IrReplayStdinRead *read = &source->reads[i];
+        if (!read->seq || read->seq == UINT64_MAX ||
+            (i && read->seq <= source->reads[i-1U].seq) ||
+            read->offset != *prefix || !read->requested ||
+            read->requested > IR_REPLAY_STDIN_MAX_READ || read->returned > read->requested ||
+            read->offset > source->size || read->returned > source->size-read->offset ||
+            (uint64_t)read->address+read->requested > (UINT64_C(1)<<32) ||
+            (uint64_t)*prefix+read->returned > IR_REPLAY_STDIN_MAX_BYTES) return false;
+        const ReplayStep *occurrence = replay_input_find(input, read->seq);
+        if (!occurrence || occurrence->entry.vcpu_index != first->entry.vcpu_index) return false;
+        *prefix += read->returned;
+        /* The frontend decodes saved descriptor bytes. This narrow source
+         * model refuses copy-in over any executed instruction rather than
+         * treating a changed future instruction as the old captured code.
+         * Include the trigger boundary and full byte intervals, not only PCs. */
+        uint64_t end = (uint64_t)read->address+read->returned;
+        for (uint32_t j = 0; read->returned && j <= replay_input_count(input); ++j) {
+            const ReplayStep *step = j == replay_input_count(input)
+                ? replay_input_trigger(input) : replay_input_step(input, j);
+            if (!step || step->entry.pc > UINT32_MAX ||
+                step->entry.pc+(uint64_t)step->entry.size > (UINT64_C(1)<<32)) return false;
+            if ((uint64_t)read->address < step->entry.pc+step->entry.size &&
+                step->entry.pc < end) return false;
+        }
+    }
+    return true;
 }
 
 IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *options,
@@ -1142,6 +1296,8 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
     /* Explicit upper bounds also keep growth arithmetic valid on 32-bit hosts. */
     if (opts.observed_proc_exe && (!opts.observed_files || !opts.x86.flat32_ram)) return NULL;
     if (opts.max_executable_bytes>DSE_EXECUTABLE_SNAPSHOT_BYTES) return NULL;
+    uint32_t stdin_prefix = 0;
+    if (!stdin_source_shape(input, &opts, &stdin_prefix)) return NULL;
     if (opts.max_memory_bytes > UINT32_C(0x1000000) ||
         opts.max_observations > UINT32_C(0x1000000) || opts.module.instructions == UINT32_MAX ||
         opts.module.values == UINT32_MAX || opts.module.blocks == UINT32_MAX ||
@@ -1172,6 +1328,20 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
     if (!frontend)
         goto fatal;
     r->state = *ir_x86_frontend_state(frontend);
+    if (opts.stdin_source) {
+        r->stdin_state = ir_state_add(r->module, ir_type_mem(32), IR_STDIN_INPUT_KEY, false);
+        if (!r->stdin_state) goto fatal;
+        r->stdin_size = stdin_prefix;
+        r->stdin_bytes = stdin_prefix ? malloc(stdin_prefix) : NULL;
+        if (stdin_prefix && !r->stdin_bytes) { r->allocation_failed=true; goto fatal; }
+        if (stdin_prefix) memcpy(r->stdin_bytes, opts.stdin_source->bytes, stdin_prefix);
+        r->stdin_count = opts.stdin_source->count;
+        memcpy(r->stdin_reads, opts.stdin_source->reads,
+               (size_t)r->stdin_count*sizeof(*r->stdin_reads));
+        r->stdin_origin = r->current_origin;
+        /* No borrowed provider pointer escapes the build. */
+        r->options.stdin_source = NULL;
+    }
     if(opts.observed_files) {
         r->environment=ir_environment_create(r->module,r->state.memory,
                                                opts.max_file_objects,opts.max_file_content_cells);
@@ -1443,6 +1613,11 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
     r->current_origin = origin_of(trigger);
     ir_module_build_origin(r->module, r->current_origin);
     ir_module_build_phase(r->module, IR_BUILD_FETCH);
+    if (r->stdin_state && r->stdin_done != r->stdin_count) {
+        r->info.environment_reason = "stdin_ledger_not_consumed";
+        stop(r, block, IR_REPLAY_SYSCALL_OBSERVATION, origin_of(trigger));
+        goto complete;
+    }
     if (!ir_x86_range_permitted(frontend, (uint32_t)trigger->entry.pc, trigger->entry.size,
                                 IR_X86_ACCESS_EXEC)) {
         stop(r, block, IR_REPLAY_MEMORY_MODEL, origin_of(trigger));
@@ -1553,6 +1728,9 @@ static IrBits observed_bv(void *user, IrBindingKind kind, uint64_t key, uint8_t 
 
 static IrBits observed_byte(void *user, IrBindingKind kind, uint64_t key, uint64_t address) {
     const IrReplay *r = user;
+    if (kind==IR_BIND_STATE && key==IR_STDIN_INPUT_KEY && r->stdin_state)
+        return address<r->stdin_size ? ir_bits_known(r->stdin_bytes[address],8)
+                                    : ir_bits_unknown(IR_REASON_MEMORY);
     if(kind==IR_BIND_STATE && key==IR_PROC_EXE_INPUT_KEY && r->executable_state)
         return address<r->executable_size?ir_bits_known(r->executable_bytes[address],8):ir_bits_unknown(IR_REASON_MEMORY);
     if (kind != IR_BIND_STATE || key != IR_X86_MEMORY_KEY || address > UINT32_MAX ||

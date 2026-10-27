@@ -331,6 +331,10 @@ bool dta_effective_mem_read_labels(const RegShadow *pre_regs, const InsnMeta *me
 
 bool dta_address_mask_is_tainted(const RegShadow *pre_regs, uint32_t address_reg_mask);
 
+/* Narrow 32-bit LEAVE effect. Register writes commit together on success. */
+bool dta_apply_leave32_labels(RegShadow *regs, const RegShadow *pre_regs,
+                               const ProvLabelId *popped_labels, uint64_t ip);
+
 void meta_init(void);
 void meta_free(void);
 InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle);

@@ -23,38 +23,20 @@ static IrConcolicReadResult unknown(const char *reason) {
     return (IrConcolicReadResult){.status = "UNKNOWN", .reason = reason};
 }
 
-IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolicRead *source,
-                                      bool solve, const IrInvertOptions *limits) {
-    IrConcolicReadResult out = unknown("direct_read_evidence_missing");
-    IrReplay *replay = NULL;
+/* The inversion policy is shared by post-read and chronological-source replay.
+ * Only the selected catalogue cells vary; every other boundary cell stays fixed. */
+static IrConcolicReadResult invert_replay(const ReplayInput *input, IrReplay *replay,
+                                          IrReplayBuildInfo build,
+                                          const IrConcolicRead *source,
+                                          IrStateId source_state, bool solve,
+                                          const IrInvertOptions *limits) {
+    IrConcolicReadResult out;
     IrBranches *branches = NULL;
     IrInvertResult inverted = {.status = IR_INVERT_UNKNOWN};
     uint32_t count = replay_input_count(input);
-    if (!source || !source->completed_read || !source->read_seq || source->read_seq == UINT64_MAX ||
-        !count || count > CONCOLIC_MAX_STEPS || !source->count ||
-        source->count > IR_CONCOLIC_MAX_BYTES || !source->read_size ||
-        source->read_size > IR_CONCOLIC_MAX_READ ||
-        (uint64_t)source->address + source->read_size > (UINT64_C(1) << 32))
-        return out;
-    for (uint32_t i = 0; i < source->count; ++i) {
-        if (source->offsets[i] >= source->read_size ||
-            (i && source->offsets[i] <= source->offsets[i - 1]))
-            return unknown("invalid_byte_selection");
-    }
+    const ReplayStep *last = count ? replay_input_step(input, count - 1) : NULL;
     IrInputId ids[IR_CONCOLIC_MAX_BYTES] = {0}, symbolic[IR_CONCOLIC_MAX_BYTES] = {0};
     uint32_t symbolic_count = 0;
-    if (!source->flags_verified)
-        return unknown("flag_observations_unverified");
-    const ReplayStep *first = replay_input_step(input, 0);
-    const ReplayStep *last = replay_input_step(input, count - 1);
-    if (first->entry.seq_id != source->read_seq + 1 || first->entry.vcpu_index != source->vcpu ||
-        last->entry.vcpu_index != source->vcpu)
-        return unknown("read_boundary_identity");
-    IrReplayOptions options = ir_replay_default_options();
-    options.x86.flat32_ram = true;
-    options.max_steps = CONCOLIC_MAX_STEPS;
-    IrReplayBuildInfo build;
-    replay = ir_replay_x86_build(input, &options, &build);
     out = unknown("replay_incomplete");
     if (!replay || build.status != IR_REPLAY_READY || build.lifted_steps != count)
         goto done;
@@ -63,7 +45,7 @@ IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolic
         goto done;
     const IrInputs *inputs = ir_replay_inputs(replay);
     for (uint32_t i = 0; i < source->count; ++i) {
-        IrInputId id = ir_inputs_find_byte(inputs, ir_replay_state(replay)->memory,
+        IrInputId id = ir_inputs_find_byte(inputs, source_state,
                                            source->address + source->offsets[i]);
         const IrInputCell *cell = ir_inputs_cell(inputs, id);
         /* An unused/overwritten byte has no boundary cell. Keep it fixed.
@@ -177,6 +159,81 @@ done:
     return out;
 }
 
+IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolicRead *source,
+                                      bool solve, const IrInvertOptions *limits) {
+    IrConcolicReadResult out = unknown("direct_read_evidence_missing");
+    uint32_t count = replay_input_count(input);
+    if (!source || !source->completed_read || !source->read_seq || source->read_seq == UINT64_MAX ||
+        !count || count > CONCOLIC_MAX_STEPS || !source->count ||
+        source->count > IR_CONCOLIC_MAX_BYTES || !source->read_size ||
+        source->read_size > IR_CONCOLIC_MAX_READ ||
+        (uint64_t)source->address + source->read_size > (UINT64_C(1) << 32))
+        return out;
+    for (uint32_t i = 0; i < source->count; ++i) {
+        if (source->offsets[i] >= source->read_size ||
+            (i && source->offsets[i] <= source->offsets[i - 1]))
+            return unknown("invalid_byte_selection");
+    }
+    if (!source->flags_verified)
+        return unknown("flag_observations_unverified");
+    const ReplayStep *first = replay_input_step(input, 0);
+    const ReplayStep *last = replay_input_step(input, count - 1);
+    if (first->entry.seq_id != source->read_seq + 1 || first->entry.vcpu_index != source->vcpu ||
+        last->entry.vcpu_index != source->vcpu)
+        return unknown("read_boundary_identity");
+    IrReplayOptions options = ir_replay_default_options();
+    options.x86.flat32_ram = true;
+    options.max_steps = CONCOLIC_MAX_STEPS;
+    IrReplayBuildInfo build;
+    IrReplay *replay = ir_replay_x86_build(input, &options, &build);
+    IrStateId state = replay ? ir_replay_state(replay)->memory : 0;
+    return invert_replay(input, replay, build, source, state, solve, limits);
+}
+
+IrConcolicReadResult ir_concolic_stdin_sequence(const ReplayInput *input,
+                                                const IrConcolicSequence *source,
+                                                bool solve, const IrInvertOptions *limits) {
+    if (!source || !source->flags_verified)
+        return unknown("flag_observations_unverified");
+    const IrReplayStdinSource *file = &source->source;
+    uint32_t count = replay_input_count(input);
+    if (!count || count > CONCOLIC_MAX_STEPS || !source->count ||
+        source->count > IR_CONCOLIC_MAX_BYTES || !file->bytes || !file->size ||
+        file->size > IR_CONCOLIC_MAX_FILE || !file->reads || !file->count ||
+        file->count > IR_CONCOLIC_MAX_READS)
+        return unknown("stdin_sequence_evidence_missing");
+    const ReplayStep *first = replay_input_step(input, 0);
+    const ReplayStep *last = replay_input_step(input, count - 1);
+    if (!file->reads[0].seq || first->entry.seq_id != file->reads[0].seq ||
+        first->entry.vcpu_index || last->entry.vcpu_index)
+        return unknown("read_boundary_identity");
+    uint64_t delivered = 0;
+    for (uint32_t i = 0; i < file->count; ++i) {
+        const IrReplayStdinRead *read = &file->reads[i];
+        if (read->offset != delivered || read->returned > read->requested ||
+            !read->requested || read->requested > IR_CONCOLIC_MAX_READ ||
+            (uint64_t)read->offset + read->returned > file->size)
+            return unknown("stdin_sequence_evidence_missing");
+        delivered += read->returned;
+    }
+    IrConcolicRead selection = {.count = source->count};
+    for (uint32_t i = 0; i < source->count; ++i) {
+        uint32_t offset = source->offsets[i];
+        if (offset >= delivered || (i && offset <= source->offsets[i - 1]))
+            return unknown("mutable_byte_not_read");
+        selection.offsets[i] = offset;
+        selection.bytes[i] = file->bytes[offset];
+    }
+    IrReplayOptions options = ir_replay_default_options();
+    options.x86.flat32_ram = true;
+    options.max_steps = CONCOLIC_MAX_STEPS;
+    options.stdin_source = file;
+    IrReplayBuildInfo build;
+    IrReplay *replay = ir_replay_x86_build(input, &options, &build);
+    IrStateId state = replay ? ir_replay_stdin_state(replay) : 0;
+    return invert_replay(input, replay, build, &selection, state, solve, limits);
+}
+
 IrConcolicResult ir_concolic_byte(const ReplayInput *input, IrConcolicByte source, bool solve,
                                   const IrInvertOptions *limits) {
     IrConcolicRead bytes = {.read_seq = source.read_seq,
@@ -215,7 +272,9 @@ struct TfConcolic {
     char file_sha256[65];
     dev_t file_device;
     ino_t file_inode;
-    bool opened;
+    bool opened, stdin_span, stdin_sequence;
+    IrReplayStdinRead reads[IR_CONCOLIC_MAX_READS];
+    uint32_t read_count;
     uint32_t fd, cursor, read_offset, requested;
     IrConcolicRead read;
     ConcolicSyscall syscalls[CONCOLIC_MAX_SYSCALLS];
@@ -258,9 +317,8 @@ static bool guest_path_valid(const char *path) {
     }
 }
 
-static bool file_options(TfConcolic *run, const char *guest, const char *seed,
-                         const char *offsets) {
-    if (!guest_path_valid(guest) || !seed || !offsets || !*offsets)
+static bool seed_options(TfConcolic *run, const char *seed, const char *offsets) {
+    if (!seed || !*seed || !offsets || !*offsets)
         return false;
     FILE *f = fopen(seed, "rb");
     if (!f)
@@ -273,8 +331,7 @@ static bool file_options(TfConcolic *run, const char *guest, const char *seed,
         run->file_device = st.st_dev;
         run->file_inode = st.st_ino;
         run->file_bytes = malloc(run->file_size);
-        run->guest_file = strdup(guest);
-        ok = run->file_bytes && run->guest_file &&
+        ok = run->file_bytes &&
              fread(run->file_bytes, 1, run->file_size, f) == run->file_size && fgetc(f) == EOF &&
              !ferror(f);
     }
@@ -314,13 +371,31 @@ static bool file_options(TfConcolic *run, const char *guest, const char *seed,
     return ok;
 }
 
+static bool file_options(TfConcolic *run, const char *guest, const char *seed,
+                         const char *offsets) {
+    if (!guest_path_valid(guest) || !seed_options(run, seed, offsets))
+        return false;
+    run->guest_file = strdup(guest);
+    return run->guest_file != NULL;
+}
+
+/* This is a direct host-fd relation for serialized Linux-user execution.
+ * A seed path or provenance label alone does not identify the guest input. */
+static bool stdin_identity(const TfConcolic *run, off_t position) {
+    struct stat st;
+    return !fstat(STDIN_FILENO, &st) && S_ISREG(st.st_mode) &&
+           st.st_dev == run->file_device && st.st_ino == run->file_inode &&
+           st.st_size == run->file_size && lseek(STDIN_FILENO, 0, SEEK_CUR) == position;
+}
+
 bool tf_concolic_configure(TfConcolic **out, int argc, char **argv) {
     if (!out)
         return false;
     *out = NULL;
     TfConcolic options = {.occurrence = 1, .max_steps = 256, .solve = true};
     const char *path = NULL;
-    const char *guest_file = NULL, *seed = NULL, *offsets = NULL;
+    const char *guest_file = NULL, *seed = NULL, *offsets = NULL, *stdin_seed = NULL,
+               *stdin_sequence_seed = NULL;
     unsigned fields = 0;
     for (int i = 0; i < argc; ++i) {
         if (strncmp(argv[i], "concolic-", 9))
@@ -369,6 +444,12 @@ bool tf_concolic_configure(TfConcolic **out, int argc, char **argv) {
         } else if (OPTION("concolic-offsets")) {
             field = 256;
             offsets = value;
+        } else if (OPTION("concolic-stdin")) {
+            field = 512;
+            stdin_seed = value;
+        } else if (OPTION("concolic-stdin-reads")) {
+            field = 1024;
+            stdin_sequence_seed = value;
         } else
             return false;
 #undef OPTION
@@ -378,15 +459,23 @@ bool tf_concolic_configure(TfConcolic **out, int argc, char **argv) {
     }
     if (!fields)
         return true;
-    unsigned file_fields = fields & (64 | 128 | 256);
-    if ((fields & 3) != 3 ||
-        (file_fields ? file_fields != (64 | 128 | 256) || (fields & 4) : !(fields & 4)))
+    unsigned file_fields = fields & (64 | 128);
+    bool stdin_span = (fields & 512) != 0;
+    bool stdin_sequence = (fields & 1024) != 0;
+    if ((fields & 3) != 3 || (stdin_span && stdin_sequence) ||
+        (stdin_span || stdin_sequence ? !(fields & 256) || file_fields || (fields & 4)
+                    : file_fields ? file_fields != (64 | 128) || !(fields & 256) || (fields & 4)
+                                  : !(fields & 4) || (fields & 256)))
         return false;
     TfConcolic *run = calloc(1, sizeof(*run));
     if (!run)
         return false;
     *run = options;
-    if (file_fields && !file_options(run, guest_file, seed, offsets)) {
+    run->stdin_span = stdin_span;
+    run->stdin_sequence = stdin_sequence;
+    if ((file_fields && !file_options(run, guest_file, seed, offsets)) ||
+        (stdin_span && !seed_options(run, stdin_seed, offsets)) ||
+        (stdin_sequence && !seed_options(run, stdin_sequence_seed, offsets))) {
         free(run->guest_file);
         free(run->file_bytes);
         free(run);
@@ -413,7 +502,7 @@ void tf_concolic_syscall(TfConcolic *run, const TraceBuffer *trace, uint64_t seq
     if (!run || run->finished || run->failure)
         return;
     const TraceEntry *entry = trace_find_seq(trace, seq, NULL);
-    if (run->pending || run->armed || run->source.completed_read || num != 3 || fd != 0 ||
+    if (run->stdin_span || run->stdin_sequence || run->pending || run->armed || run->source.completed_read || num != 3 || fd != 0 ||
         count != 1 || address > UINT32_MAX || vcpu != 0 || !seq || !entry ||
         entry->vcpu_index != vcpu || entry->size != 2 || entry->instr_bytes[0] != 0xcd ||
         entry->instr_bytes[1] != 0x80) {
@@ -452,6 +541,63 @@ void tf_concolic_syscall_ex(TfConcolic *run, const TraceBuffer *trace, uint64_t 
         return;
     if (!args) {
         fail(run, "syscall_arguments_missing");
+        return;
+    }
+    if (run->stdin_sequence) {
+        const TraceEntry *entry = trace_find_seq(trace, seq, NULL);
+        if (run->pending || num != 3 || args[0] != 0 || !args[2] ||
+            args[2] > IR_CONCOLIC_MAX_READ || args[1] > UINT32_MAX ||
+            args[1] + args[2] > (UINT64_C(1) << 32) || vcpu || !seq || !entry ||
+            entry->vcpu_index || entry->size != 2 || entry->instr_bytes[0] != 0xcd ||
+            entry->instr_bytes[1] != 0x80) {
+            fail(run, "unsupported_syscall_prefix");
+            return;
+        }
+        if (run->read_count == IR_CONCOLIC_MAX_READS) {
+            fail(run, "stdin_read_budget");
+            return;
+        }
+        if (!stdin_identity(run, (off_t)run->cursor)) {
+            fail(run, "stdin_resource_identity");
+            return;
+        }
+        if (!run->source.read_seq)
+            run->source.read_seq = seq;
+        run->source.address = (uint32_t)args[1];
+        run->requested = (uint32_t)args[2];
+        run->read_offset = run->cursor;
+        run->fd = 0;
+        ConcolicSyscall *event = &run->syscalls[run->syscall_count++];
+        *event = (ConcolicSyscall){.seq = seq, .number = 3};
+        for (unsigned i = 0; i < 6; ++i)
+            event->args[i] = (uint32_t)args[i];
+        run->pending = true;
+        return;
+    }
+    if (run->stdin_span) {
+        const TraceEntry *entry = trace_find_seq(trace, seq, NULL);
+        if (run->pending || run->armed || run->source.completed_read || run->syscall_count ||
+            num != 3 || args[0] != 0 || !args[2] || args[2] > IR_CONCOLIC_MAX_READ ||
+            args[1] > UINT32_MAX || args[1] + args[2] > (UINT64_C(1) << 32) || vcpu ||
+            !seq || !entry || entry->vcpu_index || entry->size != 2 ||
+            entry->instr_bytes[0] != 0xcd || entry->instr_bytes[1] != 0x80) {
+            fail(run, "unsupported_syscall_prefix");
+            return;
+        }
+        if (!stdin_identity(run, 0)) {
+            fail(run, "stdin_resource_identity");
+            return;
+        }
+        run->source = (IrConcolicByte){.read_seq = seq, .vcpu = vcpu,
+                                       .address = (uint32_t)args[1]};
+        run->requested = (uint32_t)args[2];
+        run->fd = 0;
+        run->read_offset = 0;
+        ConcolicSyscall *event = &run->syscalls[run->syscall_count++];
+        *event = (ConcolicSyscall){.seq = seq, .number = (uint32_t)num};
+        for (unsigned i = 0; i < 6; ++i)
+            event->args[i] = (uint32_t)args[i];
+        run->pending = true;
         return;
     }
     if (!run->guest_file) {
@@ -510,7 +656,7 @@ bool tf_concolic_read_span(const TfConcolic *run, int64_t returned, uint32_t *ad
     if (!run || run->failure || run->finished || !run->pending || !address || !size ||
         returned <= 0 || returned > IR_CONCOLIC_MAX_READ)
         return false;
-    if (run->guest_file) {
+    if (run->guest_file || run->stdin_span || run->stdin_sequence) {
         if (!run->syscall_count || run->syscalls[run->syscall_count - 1].number != 3 ||
             (uint64_t)returned > run->requested)
             return false;
@@ -525,6 +671,76 @@ void tf_concolic_return_bytes(TfConcolic *run, unsigned vcpu, int64_t num, int64
                               const uint8_t *bytes, uint32_t size) {
     if (!run || run->finished || run->failure)
         return;
+    if (run->stdin_sequence) {
+        if (!run->pending || !run->syscall_count || vcpu || num != 3 ||
+            run->syscall_count != run->read_count + 1 ||
+            run->syscalls[run->syscall_count - 1].number != 3 ||
+            run->syscalls[run->syscall_count - 1].returned) {
+            fail(run, "syscall_return_identity");
+            return;
+        }
+        ConcolicSyscall *event = &run->syscalls[run->syscall_count - 1];
+        event->result = (uint32_t)returned;
+        event->returned = true;
+        run->pending = false;
+        if (returned < 0 || returned > run->requested || returned > IR_CONCOLIC_MAX_READ ||
+            (uint64_t)run->cursor + (uint64_t)returned > run->file_size ||
+            size != (uint64_t)returned || (size && (!bytes ||
+            memcmp(bytes, run->file_bytes + run->cursor, size)))) {
+            fail(run, "input_read_mismatch");
+            return;
+        }
+        if (!stdin_identity(run, (off_t)((uint64_t)run->cursor + size))) {
+            fail(run, "stdin_resource_identity");
+            return;
+        }
+        run->reads[run->read_count++] = (IrReplayStdinRead){
+            .seq = event->seq, .address = run->source.address, .offset = run->cursor,
+            .requested = run->requested, .returned = size};
+        run->cursor += size;
+        run->source.completed_read = true;
+        run->armed = true;
+        return;
+    }
+    if (run->stdin_span) {
+        if (!run->pending || run->syscall_count != 1 || vcpu || num != 3 ||
+            run->syscalls[0].number != 3 || run->syscalls[0].returned) {
+            fail(run, "syscall_return_identity");
+            return;
+        }
+        ConcolicSyscall *event = &run->syscalls[0];
+        event->result = (uint32_t)returned;
+        event->returned = true;
+        run->pending = false;
+        if (returned <= 0 || returned > run->requested || returned > IR_CONCOLIC_MAX_READ ||
+            (uint64_t)returned > run->file_size || size != (uint64_t)returned || !bytes ||
+            memcmp(bytes, run->file_bytes, size)) {
+            fail(run, "input_read_mismatch");
+            return;
+        }
+        if (!stdin_identity(run, (off_t)returned)) {
+            fail(run, "stdin_resource_identity");
+            return;
+        }
+        run->read = (IrConcolicRead){.read_seq = event->seq,
+                                     .address = run->source.address,
+                                     .read_size = size,
+                                     .count = run->byte_count,
+                                     .completed_read = true};
+        for (uint32_t i = 0; i < run->byte_count; ++i) {
+            uint32_t offset = run->file_offsets[i];
+            if (offset >= size) {
+                fail(run, "mutable_byte_not_read");
+                return;
+            }
+            run->read.offsets[i] = offset;
+            run->read.bytes[i] = run->file_bytes[offset];
+        }
+        run->cursor = size;
+        run->source.completed_read = true;
+        run->armed = true;
+        return;
+    }
     if (!run->guest_file) {
         tf_concolic_return(run, vcpu, num, returned, bytes && size == 1,
                            bytes && size == 1 ? bytes[0] : 0);
@@ -664,7 +880,11 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
         fail(run, "prefix_observation_missing");
         return;
     }
-    if (run->guest_file && !syscall_evidence(run, trace, aux)) {
+    if ((run->guest_file || run->stdin_span || run->stdin_sequence) &&
+        ((run->stdin_span && run->syscall_count != 1) ||
+         (run->stdin_sequence && (!run->read_count || run->pending ||
+                                  run->syscall_count != run->read_count)) ||
+         !syscall_evidence(run, trace, aux))) {
         fail(run, "syscall_observation_missing");
         return;
     }
@@ -682,17 +902,23 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
         fail(run, "observed_dcfg_edge_missing");
         return;
     }
+    if (run->stdin_sequence &&
+        run->file_offsets[run->byte_count - 1] >= run->cursor) {
+        fail(run, "mutable_byte_not_read");
+        return;
+    }
     uint64_t seqs[CONCOLIC_MAX_STEPS];
-    uint64_t n = run->selected_seq - run->source.read_seq;
+    uint64_t start = run->source.read_seq + (run->stdin_sequence ? 0 : 1);
+    uint64_t n = run->selected_seq - start + 1;
     if (!n || n > CONCOLIC_MAX_STEPS) {
         fail(run, "instruction_budget");
         return;
     }
     for (uint32_t i = 0; i < n; ++i)
-        seqs[i] = run->source.read_seq + 1 + i;
+        seqs[i] = start + i;
     ReplayInput *input =
         replay_input_capture(trace, aux, seqs, (uint32_t)n, trigger, 16U * 1024U * 1024U, NULL);
-    IrConcolicRead source = run->guest_file
+    IrConcolicRead source = run->guest_file || run->stdin_span
                                 ? run->read
                                 : (IrConcolicRead){.read_seq = run->source.read_seq,
                                                    .address = run->source.address,
@@ -701,18 +927,66 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
                                                    .bytes = {run->source.byte},
                                                    .completed_read = run->source.completed_read};
     source.flags_verified = run->source.flags_verified;
-    IrConcolicReadResult result = ir_concolic_read(input, &source, run->solve, NULL);
+    IrConcolicReadResult result;
+    if (run->stdin_sequence) {
+        IrConcolicSequence sequence = {
+            .source = {.bytes = run->file_bytes, .size = run->file_size,
+                       .count = run->read_count, .reads = run->reads},
+            .count = run->byte_count, .flags_verified = run->source.flags_verified};
+        memcpy(sequence.offsets, run->file_offsets, sizeof(sequence.offsets));
+        result = ir_concolic_stdin_sequence(input, &sequence, run->solve, NULL);
+        source.read_seq = run->reads[0].seq;
+        source.address = run->reads[0].address;
+    } else
+        result = ir_concolic_read(input, &source, run->solve, NULL);
     replay_input_destroy(input);
     FILE *f = run->report;
-    fprintf(f, "{\"schema\":%u,\"status\":\"%s\",\"reason\":\"%s\",", run->guest_file ? 2U : 1U,
+    fprintf(f, "{\"schema\":%u,\"status\":\"%s\",\"reason\":\"%s\",",
+            run->stdin_sequence ? 4U : run->stdin_span ? 3U : run->guest_file ? 2U : 1U,
             result.status, result.reason);
-    if (run->guest_file) {
-        fputs("\"relation\":\"environment_file_read_identity\",\"host_identity_verified\":true,"
-              "\"file\":{\"guest_path\":",
-              f);
-        json_string(f, run->guest_file);
+    if (run->stdin_sequence) {
         fprintf(f,
-                ",\"sha256\":\"%s\",\"size\":%u},\"read_offset\":%u,"
+                "\"relation\":\"stdin_read_sequence_identity\",\"host_identity_verified\":true,"
+                "\"stdin_file\":{\"sha256\":\"%s\",\"size\":%u},"
+                "\"max_reads\":%u,\"read_count\":%u,\"fd\":0,\"reads\":[",
+                run->file_sha256, run->file_size, IR_CONCOLIC_MAX_READS, run->read_count);
+        for (uint32_t i = 0; i < run->read_count; ++i) {
+            const IrReplayStdinRead *read = &run->reads[i];
+            fprintf(f,
+                    "%s{\"seq\":%" PRIu64 ",\"address\":%u,\"read_offset\":%u,"
+                    "\"read_size\":%u,\"requested\":%u}",
+                    i ? "," : "", read->seq, read->address, read->offset,
+                    read->returned, read->requested);
+        }
+        fputs("],\"bindings\":[", f);
+        for (uint32_t i = 0; i < run->byte_count; ++i) {
+            fprintf(f,
+                    "%s{\"offset\":%u,\"byte\":%u,\"candidate\":%u,\"input_id\":%u}",
+                    i ? "," : "", run->file_offsets[i], run->file_bytes[run->file_offsets[i]],
+                    result.candidates[i], result.inputs[i]);
+        }
+        fputs("],\"syscalls\":[", f);
+        for (uint32_t i = 0; i < run->syscall_count; ++i) {
+            const ConcolicSyscall *event = &run->syscalls[i];
+            fprintf(f, "%s{\"seq\":%" PRIu64 ",\"number\":%u,\"args\":[",
+                    i ? "," : "", event->seq, event->number);
+            for (unsigned j = 0; j < 6; ++j)
+                fprintf(f, "%s%u", j ? "," : "", event->args[j]);
+            fprintf(f, "],\"result\":%u}", event->result);
+        }
+        fputs("],", f);
+    } else if (run->guest_file || run->stdin_span) {
+        if (run->stdin_span) {
+            fputs("\"relation\":\"stdin_read_span_identity\",\"host_identity_verified\":true,"
+                  "\"stdin_file\":{", f);
+        } else {
+            fputs("\"relation\":\"environment_file_read_identity\",\"host_identity_verified\":true,"
+                  "\"file\":{\"guest_path\":", f);
+            json_string(f, run->guest_file);
+            fputc(',', f);
+        }
+        fprintf(f,
+                "\"sha256\":\"%s\",\"size\":%u},\"read_offset\":%u,"
                 "\"read_size\":%u,\"requested\":%u,\"fd\":%u,\"bindings\":[",
                 run->file_sha256, run->file_size, run->read_offset, run->read.read_size,
                 run->requested, run->fd);
@@ -805,7 +1079,7 @@ void tf_concolic_destroy(TfConcolic *run) {
         return;
     if (!run->finished)
         fprintf(run->report, "{\"schema\":%u,\"status\":\"UNKNOWN\",\"reason\":\"%s\"}\n",
-                run->guest_file ? 2U : 1U,
+                run->stdin_sequence ? 4U : run->stdin_span ? 3U : run->guest_file ? 2U : 1U,
                 run->failure ? run->failure : "selected_branch_not_reached");
     if (fclose(run->report))
         fprintf(stderr, "[CONCOLIC] report close failed\n");

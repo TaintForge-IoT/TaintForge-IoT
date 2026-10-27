@@ -453,6 +453,18 @@ static IrX86LiftStatus preflight(const IrX86Frontend *f, const cs_insn *insn) {
         return f->options.flat32_ram ? IR_X86_LIFT_OK : IR_X86_LIFT_MEMORY_MODEL;
     if (insn->id == X86_INS_NOP || insn->id == X86_INS_CLD || insn->id == X86_INS_STD)
         return IR_X86_LIFT_OK;
+    if (insn->id == X86_INS_IMUL) {
+        if (x->op_count != 2 && x->op_count != 3)
+            return IR_X86_LIFT_UNSUPPORTED;
+        const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
+        if (!register_ok(dst) || (dst->size != 2 && dst->size != 4) ||
+            src->size != dst->size)
+            return IR_X86_LIFT_UNSUPPORTED;
+        if (x->op_count == 3 && (x->operands[2].type != X86_OP_IMM ||
+                               x->operands[2].size != dst->size))
+            return IR_X86_LIFT_UNSUPPORTED;
+        return operand_status(f, x, src, false);
+    }
     if (unary_arithmetic(insn->id) || insn->id == X86_INS_NOT) {
         if (x->op_count != 1)
             return IR_X86_LIFT_UNSUPPORTED;
@@ -1053,6 +1065,28 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
         r.control = IR_X86_CONDITIONAL;
         r.direct_target = (uint32_t)x->operands[0].imm;
         r.condition = unary(&l, IR_OP_NOT, 1, binary(&l, IR_OP_EQ, 1, count, constant(&l, bits, 0)), 0);
+    } else if (insn->id == X86_INS_IMUL) {
+        const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
+        unsigned width = dst->size * 8U, wide = width * 2U;
+        /* Read all sources before replacing an aliased destination. Capstone
+         * exposes the signed imm8/imm16/imm32 at the destination width. */
+        IrValueId a = read_operand(&l, x, x->op_count == 2 ? dst : src, &r);
+        IrValueId b = x->op_count == 2 && src->type == X86_OP_REG && src->reg == dst->reg
+            ? a : read_operand(&l, x, &x->operands[x->op_count - 1U], &r);
+        IrValueId product = binary(&l, IR_OP_MUL, wide,
+            unary(&l, IR_OP_SEXT, wide, a, 0), unary(&l, IR_OP_SEXT, wide, b, 0));
+        IrValueId value = unary(&l, IR_OP_EXTRACT, width, product, 0);
+        IrBuildPhase previous = ir_module_build_phase(f->module, IR_BUILD_ARITHMETIC_FLAGS);
+        IrValueId overflow = unary(&l, IR_OP_NOT, 1, binary(&l, IR_OP_EQ, 1, product,
+            unary(&l, IR_OP_SEXT, wide, value, 0)), 0);
+        r.flags_written = 0x3f;
+        r.flags_undefined = 0x1e; /* PF/AF/ZF/SF are architecturally undefined. */
+        for (unsigned i = 0; i < 6; ++i)
+            write_state(&l, f->state.flags[i], (i == X86_SPECIAL_STATE_CF ||
+                i == X86_SPECIAL_STATE_OF) ? overflow : emit(&l, (IrInstSpec){
+                .op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
+        ir_module_build_phase(f->module, previous);
+        write_operand(&l, x, dst, value, &r);
     } else if (insn->id == X86_INS_NOT || insn->id == X86_INS_BSWAP) {
         const cs_x86_op *dst = &x->operands[0];
         IrValueId old = read_operand(&l, x, dst, &r), value;

@@ -9,6 +9,7 @@
 #define IR_CONCOLIC_MAX_BYTES 16U
 #define IR_CONCOLIC_MAX_READ 4096U
 #define IR_CONCOLIC_MAX_FILE (1024U * 1024U)
+#define IR_CONCOLIC_MAX_READS 4U
 
 /* Exact bytes delivered by one completed read. Offsets are buffer-relative,
  * strictly increasing, and bounded by read_size. Other initial bytes remain
@@ -38,6 +39,18 @@ typedef struct {
 IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolicRead *source,
                                       bool solve, const IrInvertOptions *limits);
 
+/* Borrowed immutable file bytes and chronological read contracts. The caller
+ * must independently verify fd identity, offsets and delivered bytes. Offsets
+ * select original file cells, never a checkpoint after the final read. */
+typedef struct {
+    IrReplayStdinSource source;
+    uint32_t count, offsets[IR_CONCOLIC_MAX_BYTES];
+    bool flags_verified;
+} IrConcolicSequence;
+IrConcolicReadResult ir_concolic_stdin_sequence(const ReplayInput *input,
+                                                const IrConcolicSequence *source,
+                                                bool solve, const IrInvertOptions *limits);
+
 /* A collector-issued direct read relation, not a provenance label. The host
  * must separately pin fd 0 to offset zero of a one-byte regular file. */
 typedef struct {
@@ -66,7 +79,18 @@ IrConcolicResult ir_concolic_byte(const ReplayInput *input, IrConcolicByte sourc
 
 typedef struct TfConcolic TfConcolic;
 /* Optional concolic-* CLI. Disabled returns success with *out == NULL.
- * The report is created exclusively; existing results are never overwritten. */
+ * The report is created exclusively; existing results are never overwritten.
+ * Legacy concolic-byte remains one stdin byte. concolic-stdin=HOST_SEED plus
+ * concolic-offsets selects 1..16 increasing offsets from a 1..1 MiB regular
+ * seed. It requires the first syscall to be one read(0,buffer,1..4096), checks
+ * the host fd's identity/offset and delivered prefix, and emits schema 3.
+ * A second syscall before the selected branch remains unsupported; this is
+ * a post-read boundary relation, not a multi-read environment model.
+ * concolic-stdin-reads=HOST_SEED selects the separate schema-4 model: one to
+ * four sequential read(0,buffer,1..4096) calls, including EOF, from the same
+ * immutable regular seed. Chronological source LOADs and guest STOREs preserve
+ * computations between reads. Other syscalls and changed read geometry remain
+ * unsupported. The host must externally replay every candidate before using it. */
 bool tf_concolic_configure(TfConcolic **out, int argc, char **argv);
 void tf_concolic_vcpu(TfConcolic *run, unsigned vcpu, unsigned previous_vcpus);
 void tf_concolic_instruction(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *aux,
