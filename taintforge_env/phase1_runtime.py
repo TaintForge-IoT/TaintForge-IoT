@@ -127,7 +127,10 @@ class Phase1Run:
                 "dump": self.directory / "unpacked.bin", "report": self.directory / "unpacked.json",
                 "ir": self.directory / "ir_runtime.jsonl"}
 
-    def plugin_argument(self, *, ir: bool = True, extra: tuple[str, ...] = ()) -> str:
+    def plugin_argument(self, *, ir: bool = True, extra: tuple[str, ...] = (),
+                        diagnostic_roots: bool = False) -> str:
+        if type(diagnostic_roots) is not bool:
+            raise Phase1RuntimeError("diagnostic_roots must be an explicit boolean")
         self.directory.mkdir(parents=True, exist_ok=True)
         for path in self.paths.values():
             if path.exists() or path.is_symlink():
@@ -143,7 +146,7 @@ class Phase1Run:
         options.append(f"ir-check={'on' if ir else 'off'}")
         allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-tls32", "ir-observed-munmap", "ir-observed-mprotect", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates"}
         capture_choices = {"tf-capture": {"entry", "exit"}, "dse-check": {"off"},
-                           "runtime-log": {"summary"}}
+                           "runtime-log": {"summary", "roots"} if diagnostic_roots else {"summary"}}
         capture_budgets = {"tf-max-capture-bytes": (1, 1024 * 1024 * 1024),
                            "ir-trace-capacity": (2, 512 * 1024)}
         capture_seen = set()

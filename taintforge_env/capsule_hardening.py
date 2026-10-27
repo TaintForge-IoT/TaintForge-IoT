@@ -273,11 +273,15 @@ def verify_ledger(binding, release, report=None):
     return item
 
 
-def launch(binding, argv):
+def launch(binding, argv, *, direct_qemu=False):
+    p.require(type(direct_qemu) is bool, 'Invalid M4 direct-QEMU mode')
+    p.require(not direct_qemu or binding.get('profile') == 'dse-file-analysis-v1',
+              'Direct QEMU launch requires the isolated DSE profile')
     c = config(binding)
     p.require(os.geteuid() == 0, 'M4 launcher must enter the chroot before dropping privileges')
     root = Path(binding['rootfs'])
-    p.require(root.is_dir() and not root.is_symlink() and argv[0] == '/__taintforge/bin/loader', 'Invalid M4 launch root/loader')
+    executable = '/__taintforge/bin/qemu-i386' if direct_qemu else '/__taintforge/bin/loader'
+    p.require(root.is_dir() and not root.is_symlink() and argv[0] == executable, 'Invalid M4 launch root/loader')
     libc = ctypes.CDLL(None, use_errno=True)
     prctl_call, capset = libc.prctl, libc.capset
     class Header(ctypes.Structure):
@@ -307,7 +311,10 @@ def launch(binding, argv):
         raise OSError(ctypes.get_errno(), 'M4 capability clear failed')
     p.require(os.getresuid() == (c['uid'],)*3 and os.getresgid() == (c['gid'],)*3 and not os.getgroups(),
               'M4 credential drop failed')
-    os.execve(argv[0], argv, {'PATH':'/usr/bin:/bin','HOME':'/','LANG':'C','LC_ALL':'C'})
+    env = {'PATH':'/usr/bin:/bin','HOME':'/','LANG':'C','LC_ALL':'C'}
+    if direct_qemu:
+        env['LD_LIBRARY_PATH'] = '/__taintforge/lib'
+    os.execve(argv[0], argv, env)
 
 
 def main():
