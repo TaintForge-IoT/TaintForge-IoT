@@ -19,8 +19,8 @@ static inline InsnAux of_registers(void) {
     InsnAux a = {0};
     a.reg_value_valid_mask = 0xff;
     dse_aux_set_eflags(&a, 0x202, true, true);
-    a.reg_vals[REG_RAX] = 8;
-    a.reg_vals[REG_RSP] = 0x3000;
+    a.reg_vals[DTA_REG_RAX] = 8;
+    a.reg_vals[DTA_REG_RSP] = 0x3000;
     /* The legacy comparison imports the exact selected cells itself. Keep
      * later normalization from concretizing those expressions via DTA. */
     memset(a.reg_taint, 0x0f, sizeof(a.reg_taint));
@@ -47,8 +47,8 @@ static inline uint64_t of_emit(FrontFixture *f, uint32_t pc, const uint8_t *byte
 
 static inline OepFixture of_fixture(unsigned kind) {
     FrontFixture f = ff_new(32);
-    OepFixture out = {.variable_count = 1, .target_register = REG_RAX, .target_address = 9};
-    out.variables[0] = of_register_byte(REG_RAX, 0);
+    OepFixture out = {.variable_count = 1, .target_register = DTA_REG_RAX, .target_address = 9};
+    out.variables[0] = of_register_byte(DTA_REG_RAX, 0);
     InsnAux a = of_registers();
     uint64_t seqs[8], trigger;
     unsigned count = 0;
@@ -57,7 +57,7 @@ static inline OepFixture of_fixture(unsigned kind) {
     if (kind <= OF_SAME_SUCCESSOR || kind == OF_BAD_BRANCH) {
         uint8_t compare[] = {0x83, 0xf8, kind == OF_NOT_EQUAL ? 7 : 8};
         seqs[count++] = of_emit(&f, pc, compare, sizeof(compare), a, pc + 3);
-        a = alu_after(a, ALU_CMP, 32, 8, compare[2], REG_RAX, 0, false);
+        a = alu_after(a, ALU_CMP, 32, 8, compare[2], DTA_REG_RAX, 0, false);
         pc += 3;
         uint8_t branch[] = {0x74, kind == OF_SAME_SUCCESSOR ? 0 : 0x10};
         bool taken = kind != OF_NOT_EQUAL;
@@ -68,9 +68,9 @@ static inline OepFixture of_fixture(unsigned kind) {
     }
     if (kind <= OF_LINEAR || kind == OF_CALL || kind == OF_BAD_BASELINE || kind == OF_BAD_BRANCH) {
         seqs[count++] = of_emit(&f, pc, add, sizeof(add), a, pc + 3);
-        a = alu_after(a, ALU_ADD, 32, 8, 1, REG_RAX, 0, true);
+        a = alu_after(a, ALU_ADD, 32, 8, 1, DTA_REG_RAX, 0, true);
         pc += 3;
-        if (kind == OF_BAD_BASELINE) a.reg_vals[REG_RAX] = 10;
+        if (kind == OF_BAD_BASELINE) a.reg_vals[DTA_REG_RAX] = 10;
     } else if (kind == OF_MEMORY || kind == OF_RET) {
         seqs[count++] = of_emit(&f, pc, nop, 1, a, pc + 1);
         ++pc;
@@ -87,12 +87,12 @@ static inline OepFixture of_fixture(unsigned kind) {
         out.target_address = 8; out.target_register = -1; out.target_memory = 0x3000;
         of_read(&a, 0x3000, 8);
     } else if (kind == OF_LATE_GUARD) {
-        a.reg_vals[REG_RDX] = 0x1200;
-        out.variables[0] = of_register_byte(REG_RDX, 0);
+        a.reg_vals[DTA_REG_RDX] = 0x1200;
+        out.variables[0] = of_register_byte(DTA_REG_RDX, 0);
         out.target_address = 0x1200;
         const uint8_t move[] = {0x89, 0xd0}, indirect[] = {0xff, 0xe2};
         seqs[count++] = of_emit(&f, pc, move, 2, a, pc + 2);
-        a.reg_vals[REG_RAX] = 0x1200; pc += 2;
+        a.reg_vals[DTA_REG_RAX] = 0x1200; pc += 2;
         seqs[count++] = of_emit(&f, pc, indirect, 2, a, 0x1200);
         pc = 0x1200;
         seqs[count++] = of_emit(&f, pc, nop, 1, a, pc + 1);
@@ -107,11 +107,11 @@ static inline OepFixture of_fixture(unsigned kind) {
     } else if (kind == OF_UNSUPPORTED) {
         const uint8_t divide[] = {0xf7, 0xf1};
         seqs[count++] = of_emit(&f, pc, divide, 2, a, pc + 2);
-        a.reg_vals[REG_RAX] = ~a.reg_vals[REG_RAX];
+        a.reg_vals[DTA_REG_RAX] = ~a.reg_vals[DTA_REG_RAX];
         pc += 2; out.target_address = 0xfffffff7;
     } else if (kind == OF_SYSCALL) {
         const uint8_t call[] = {0xcd, 0x80};
-        a.reg_vals[REG_RAX] = 5; a.reg_vals[REG_RBX] = 0x2000;
+        a.reg_vals[DTA_REG_RAX] = 5; a.reg_vals[DTA_REG_RBX] = 0x2000;
         uint64_t seq = ff_emit(&f, pc, call, 2, 9, 0, &a);
         const TraceEntry *e = trace_find_seq(f.trace, seq, NULL);
         InsnAux *aux = (InsnAux *)dse_aux_for(f.aux, f.trace, e);
@@ -119,7 +119,7 @@ static inline OepFixture of_fixture(unsigned kind) {
         CHECK(dse_aux_syscall_enter(f.aux, aux, e, 5, args));
         CHECK(dse_aux_syscall_return(aux, seq, 0, 5, 4));
         ff_finish(&f, seq, pc + 2);
-        seqs[count++] = seq; pc += 2; a.reg_vals[REG_RAX] = 4;
+        seqs[count++] = seq; pc += 2; a.reg_vals[DTA_REG_RAX] = 4;
         out.target_address = 4;
     }
     if (kind == OF_MEMORY || kind == OF_STORE) {

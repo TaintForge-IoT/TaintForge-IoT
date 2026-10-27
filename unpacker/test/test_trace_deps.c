@@ -161,7 +161,7 @@ static void test_memory_evidence(void) {
 static void test_x86_effects(void) {
   Fixture f = fixture();
   InsnAux aux = state();
-  aux.reg_taint[REG_RAX] = 0xf;
+  aux.reg_taint[DTA_REG_RAX] = 0xf;
   const uint8_t ah[] = {0xb4, 0x56}, selfzero[] = {0x31, 0xc0};
   const uint8_t inc[] = {0x40}, adc[] = {0x83, 0xd0, 0x00}, cld[] = {0xfc};
   const uint8_t sh0[] = {0xc1, 0xe0, 0}, sh32[] = {0xc1, 0xe0, 32};
@@ -170,9 +170,9 @@ static void test_x86_effects(void) {
   const uint8_t movs[] = {0xa4};
   const uint8_t lea[] = {0x8d, 0x44, 0x8b, 4};
   TraceDeps deps = dependencies(&f, emit(&f, 0x1000, ah, sizeof(ah), 1, 0, &aux));
-  assert(deps.must_write[REG_RAX] == 0xff00 && deps.may_write[REG_RAX] == 0xff00);
+  assert(deps.must_write[DTA_REG_RAX] == 0xff00 && deps.may_write[DTA_REG_RAX] == 0xff00);
   deps = dependencies(&f, emit(&f, 0x1002, selfzero, sizeof(selfzero), 1, 0, &aux));
-  assert(deps.value_uses[REG_RAX] == 0 && deps.must_write[REG_RAX] == UINT32_MAX);
+  assert(deps.value_uses[DTA_REG_RAX] == 0 && deps.must_write[DTA_REG_RAX] == UINT32_MAX);
   assert(deps.special_unknown_write == FLAG(AF));
   deps = dependencies(&f, emit(&f, 0x1004, inc, sizeof(inc), 1, 0, &aux));
   assert(!(deps.special_may_write & FLAG(CF)) && (deps.special_must_write & FLAG(ZF)));
@@ -183,24 +183,24 @@ static void test_x86_effects(void) {
   deps = dependencies(&f, emit(&f, 0x1009, movs, sizeof(movs), 1, 0, &aux));
   assert(deps.special_address_uses == FLAG(DF) && deps.special_value_uses == 0);
   deps = dependencies(&f, emit(&f, 0x1010, sh0, sizeof(sh0), 1, 0, &aux));
-  assert(deps.may_write[REG_RAX] == 0 && deps.special_may_write == 0);
+  assert(deps.may_write[DTA_REG_RAX] == 0 && deps.special_may_write == 0);
   deps = dependencies(&f, emit(&f, 0x1013, sh32, sizeof(sh32), 1, 0, &aux));
-  assert(deps.may_write[REG_RAX] == 0 && deps.special_may_write == 0);
+  assert(deps.may_write[DTA_REG_RAX] == 0 && deps.special_may_write == 0);
   deps = dependencies(&f, emit(&f, 0x1016, sh1, sizeof(sh1), 1, 0, &aux));
-  assert(deps.must_write[REG_RAX] == UINT32_MAX && deps.special_unknown_write == FLAG(AF));
+  assert(deps.must_write[DTA_REG_RAX] == UINT32_MAX && deps.special_unknown_write == FLAG(AF));
   deps = dependencies(&f, emit(&f, 0x1018, sh2, sizeof(sh2), 1, 0, &aux));
   assert(deps.special_unknown_write == (FLAG(AF) | FLAG(OF)));
   deps = dependencies(&f, emit(&f, 0x101b, sh8, sizeof(sh8), 1, 0, &aux));
   assert(deps.special_unknown_write == (FLAG(AF) | FLAG(OF) | FLAG(CF)));
   deps = dependencies(&f, emit(&f, 0x101e, shcl, sizeof(shcl), 1, 0, &aux));
-  assert(deps.may_write[REG_RAX] == 0 && deps.special_may_write == 0);
-  aux.reg_taint[REG_RCX] = 1;
+  assert(deps.may_write[DTA_REG_RAX] == 0 && deps.special_may_write == 0);
+  aux.reg_taint[DTA_REG_RCX] = 1;
   deps = dependencies(&f, emit(&f, 0x1020, shcl, sizeof(shcl), 1, 0, &aux));
-  assert(deps.may_write[REG_RAX] == UINT32_MAX && deps.must_write[REG_RAX] == 0);
+  assert(deps.may_write[DTA_REG_RAX] == UINT32_MAX && deps.must_write[DTA_REG_RAX] == 0);
   assert(deps.special_may_write & FLAG(ZF));
-  assert(deps.special_must_write == 0 && (deps.value_uses[REG_RCX] & 0xff));
+  assert(deps.special_must_write == 0 && (deps.value_uses[DTA_REG_RCX] & 0xff));
   deps = dependencies(&f, emit(&f, 0x1022, lea, sizeof(lea), 1, 0, &aux));
-  assert(deps.value_uses[REG_RBX] == UINT32_MAX && deps.value_uses[REG_RCX] == UINT32_MAX);
+  assert(deps.value_uses[DTA_REG_RBX] == UINT32_MAX && deps.value_uses[DTA_REG_RCX] == UINT32_MAX);
   assert(!deps.may_read_memory && !deps.may_write_memory);
   destroy(&f);
   puts("PASS: x86 AH, self-zeroing, INC/ADC, DF, masked and input-dependent shift counts");
@@ -227,23 +227,23 @@ static void test_slice_shift_preservation(bool variable, bool undefined) {
   const uint8_t shtwo[] = {0xc1, 0xe2, 2};
   const uint8_t jnz[] = {0x75, 1}, jo[] = {0x70, 1}, jmp[] = {0xff, 0xe0};
   uint64_t initial = emit(&f, 0x1000, mov, sizeof(mov), 1, 0, &aux);
-  aux.reg_taint[REG_RAX] = 0xf;
-  aux.reg_taint[REG_RBX] = 0xf;
+  aux.reg_taint[DTA_REG_RAX] = 0xf;
+  aux.reg_taint[DTA_REG_RBX] = 0xf;
   uint64_t compare = emit(&f, 0x1005, cmp, sizeof(cmp), 1, 0, &aux);
-  aux.reg_taint[REG_RCX] = variable ? 1 : 0;
+  aux.reg_taint[DTA_REG_RCX] = variable ? 1 : 0;
   uint64_t shift = emit(&f, 0x1008, undefined ? shtwo : variable ? shcl : shzero,
       variable ? sizeof(shcl) : sizeof(shzero), 1, 0, &aux);
   uint64_t branch = emit(&f, 0x100b, undefined ? jo : jnz, sizeof(jnz), 1, 0, &aux);
   uint64_t trigger = emit(&f, 0x100d, jmp, sizeof(jmp), 1, 0, &aux);
   const TraceEntry *slice[16] = {0};
-  DseSliceResult result = dse_build_reg_slice(f.trace, f.ring, trigger, REG_RAX, slice, 16);
+  DseSliceResult result = dse_build_reg_slice(f.trace, f.ring, trigger, DTA_REG_RAX, slice, 16);
   if (undefined) {
     assert(result.status == DSE_SLICE_DEPENDENCY_UNKNOWN && !result.complete);
     assert(result.dependency_unknown_reasons & TRACE_DEPS_UNDEFINED_SPECIAL);
   } else if (variable) {
     uint64_t expected[] = {initial, compare, shift, branch, trigger};
     check_slice(&result, slice, expected, 5);
-    assert(result.boundary_reg_bytes[REG_RCX] & 1);
+    assert(result.boundary_reg_bytes[DTA_REG_RCX] & 1);
   } else {
     uint64_t expected[] = {initial, compare, branch, trigger};
     check_slice(&result, slice, expected, 4);
@@ -257,12 +257,12 @@ static void test_slice_carry_and_partial_register(void) {
   const uint8_t add[] = {0x83, 0xc3, 1}, inc[] = {0x42};
   const uint8_t adc[] = {0x83, 0xd2, 0}, jmp[] = {0xff, 0xe2};
   uint64_t carry = emit(&f, 0x1000, add, sizeof(add), 1, 0, &aux);
-  aux.reg_taint[REG_RDX] = 0xf;
+  aux.reg_taint[DTA_REG_RDX] = 0xf;
   uint64_t increment = emit(&f, 0x1003, inc, sizeof(inc), 1, 0, &aux);
   uint64_t consume = emit(&f, 0x1004, adc, sizeof(adc), 1, 0, &aux);
   uint64_t trigger = emit(&f, 0x1007, jmp, sizeof(jmp), 1, 0, &aux);
   const TraceEntry *slice[16] = {0};
-  DseSliceResult result = dse_build_reg_slice(f.trace, f.ring, trigger, REG_RDX, slice, 16);
+  DseSliceResult result = dse_build_reg_slice(f.trace, f.ring, trigger, DTA_REG_RDX, slice, 16);
   uint64_t expected[] = {carry, increment, consume, trigger};
   check_slice(&result, slice, expected, 4);
   assert(!(result.boundary_special & FLAG(CF)));
@@ -273,16 +273,16 @@ static void test_slice_carry_and_partial_register(void) {
   const uint8_t mov[] = {0xb8, 0, 0, 0, 0}, ah[] = {0xb4, 0x12}, al[] = {0xb0, 0x34};
   const uint8_t jumpax[] = {0xff, 0xe0};
   uint64_t full = emit(&f, 0x2000, mov, sizeof(mov), 1, 0, &aux);
-  aux.reg_taint[REG_RAX] = 0xf;
+  aux.reg_taint[DTA_REG_RAX] = 0xf;
   uint64_t high = emit(&f, 0x2005, ah, sizeof(ah), 1, 0, &aux);
   uint64_t low = emit(&f, 0x2007, al, sizeof(al), 1, 0, &aux);
   /* An unrelated vCPU must never become a last writer. */
   (void)emit(&f, 0x2000, mov, sizeof(mov), 2, 1, &aux);
   trigger = emit(&f, 0x2009, jumpax, sizeof(jumpax), 1, 0, &aux);
-  result = dse_build_reg_slice(f.trace, f.ring, trigger, REG_RAX, slice, 16);
+  result = dse_build_reg_slice(f.trace, f.ring, trigger, DTA_REG_RAX, slice, 16);
   uint64_t partial[] = {full, high, low, trigger};
   check_slice(&result, slice, partial, 4);
-  assert(result.boundary_reg_bytes[REG_RAX] == 0);
+  assert(result.boundary_reg_bytes[DTA_REG_RAX] == 0);
   destroy(&f);
   puts("PASS: slicer keeps the carry producer through INC and preserves AL/AH byte boundaries");
 }
@@ -359,13 +359,13 @@ static void test_identity_and_owned_input(void) {
   occ.code_generation++;
   assert(!trace_deps_x86_build(entry, desc, meta, saved_aux, &occ, 32, &deps));
   assert(deps.incomplete_reasons & TRACE_DEPS_IDENTITY_MISMATCH);
-  assert(deps.may_write[REG_RAX] == UINT32_MAX && deps.must_write[REG_RAX] == 0);
+  assert(deps.may_write[DTA_REG_RAX] == UINT32_MAX && deps.must_write[DTA_REG_RAX] == 0);
   occ.code_generation--;
   TraceEntry legacy = *entry;
   legacy.insn_desc_id = 0;
   occ.desc_id = 0;
   assert(trace_deps_x86_build(&legacy, NULL, meta, saved_aux, &occ, 32, &deps));
-  assert(deps.must_write[REG_RAX] == UINT32_MAX);
+  assert(deps.must_write[DTA_REG_RAX] == UINT32_MAX);
   ReplayInputStatus status;
   ReplayInput *input = replay_input_capture(f.trace, f.ring, &seq, 1, trigger, 1024 * 1024, &status);
   assert(input && status == REPLAY_INPUT_READY);
@@ -373,7 +373,7 @@ static void test_identity_and_owned_input(void) {
   const ReplayStep *step = replay_input_step(input, 0);
   assert(trace_deps_x86_build(&step->entry, &step->descriptor,
       replay_input_meta(input, seq), replay_input_aux(input, seq), &step->occurrence, 32, &deps));
-  assert(deps.must_write[REG_RAX] == UINT32_MAX && deps.occurrence.code_generation == 1);
+  assert(deps.must_write[DTA_REG_RAX] == UINT32_MAX && deps.occurrence.code_generation == 1);
   replay_input_destroy(input);
   assert(deps.occurrence.pc == 0x1000); /* view owns all retained evidence */
   puts("PASS: generation identity, legacy adapter and dependencies after ReplayInput/source destruction");
@@ -386,9 +386,9 @@ static void test_rep_and_df(void) {
   const uint8_t stos[] = {0xf3, 0xaa}, jump[] = {0xff, 0x25, 0x06, 0x30, 0, 0};
   uint64_t df = emit(&f, 0x1000, cld, sizeof(cld), 1, 0, &aux);
   uint64_t count = emit(&f, 0x1001, movcount, sizeof(movcount), 1, 0, &aux);
-  aux.reg_vals[REG_RCX] = 10;
-  aux.reg_vals[REG_RDI] = 0x3000;
-  aux.reg_taint[REG_RCX] = 0xf;
+  aux.reg_vals[DTA_REG_RCX] = 10;
+  aux.reg_vals[DTA_REG_RDI] = 0x3000;
+  aux.reg_taint[DTA_REG_RCX] = 0xf;
   aux.execution_complete = true;
   aux.next_pc_valid = true;
   aux.next_pc = 0x1008;
@@ -405,7 +405,7 @@ static void test_rep_and_df(void) {
       .destination_first = 0x3000};
   uint64_t rep = emit(&f, 0x1006, stos, sizeof(stos), 1, 0, &aux);
   TraceDeps deps = dependencies(&f, rep);
-  assert(deps.must_write[REG_RDI] == 0 && deps.may_write[REG_RDI] == UINT32_MAX);
+  assert(deps.must_write[DTA_REG_RDI] == 0 && deps.may_write[DTA_REG_RDI] == UINT32_MAX);
   assert(deps.special_address_uses == FLAG(DF));
   aux = state();
   add_read(&aux, 0x3006, 4); /* includes two accesses outside the retained array */
@@ -415,17 +415,17 @@ static void test_rep_and_df(void) {
   uint64_t expected[] = {df, count, rep, trigger};
   check_slice(&result, slice, expected, 4);
   assert(result.string_summaries == 1 && result.boundary_special == 0);
-  assert(result.boundary_reg_bytes[REG_RCX] == 0);
+  assert(result.boundary_reg_bytes[DTA_REG_RCX] == 0);
   InsnAux *rep_aux = (InsnAux *)dse_aux_for(f.ring, f.trace, entry_at(&f, rep));
-  rep_aux->reg_taint[REG_RCX] = 0;
+  rep_aux->reg_taint[DTA_REG_RCX] = 0;
   deps = dependencies(&f, rep);
-  assert(deps.must_write[REG_RDI] == UINT32_MAX);
-  rep_aux->reg_vals[REG_RCX] = 0;
+  assert(deps.must_write[DTA_REG_RDI] == UINT32_MAX);
+  rep_aux->reg_vals[DTA_REG_RCX] = 0;
   rep_aux->mem_write_count = rep_aux->mem_write_total = 0;
   rep_aux->has_mem_write = rep_aux->mem_write_overflow = rep_aux->mem_write_range_valid = false;
   rep_aux->string_summary.expected_iterations = rep_aux->string_summary.write_events = 0;
   deps = dependencies(&f, rep);
-  assert(deps.may_write[REG_RDI] == 0 && deps.special_address_uses == 0);
+  assert(deps.may_write[DTA_REG_RDI] == 0 && deps.special_address_uses == 0);
   destroy(&f);
   puts("PASS: exact REP beyond eight accesses, count dependencies, zero iterations and DF producer");
 }
@@ -435,23 +435,23 @@ static void test_relevant_unknowns(void) {
   InsnAux aux = state();
   const uint8_t shift[] = {0xd3, 0xe0}, jump[] = {0xff, 0xe0};
   uint64_t seq = emit(&f, 0x1000, shift, sizeof(shift), 1, 0, &aux);
-  aux.reg_taint[REG_RAX] = 0xf;
+  aux.reg_taint[DTA_REG_RAX] = 0xf;
   uint64_t trigger = emit(&f, 0x1002, jump, sizeof(jump), 1, 0, &aux);
   InsnAux *shift_aux = (InsnAux *)dse_aux_for(f.ring, f.trace, entry_at(&f, seq));
-  shift_aux->reg_value_valid_mask &= ~(1U << REG_RCX);
+  shift_aux->reg_value_valid_mask &= ~(1U << DTA_REG_RCX);
   const TraceEntry *slice[16] = {0};
-  DseSliceResult result = dse_build_reg_slice(f.trace, f.ring, trigger, REG_RAX, slice, 16);
+  DseSliceResult result = dse_build_reg_slice(f.trace, f.ring, trigger, DTA_REG_RAX, slice, 16);
   assert(result.status == DSE_SLICE_DEPENDENCY_UNKNOWN);
   assert(result.dependency_unknown_reasons & TRACE_DEPS_STATE_MISSING);
   shift_aux->execution_complete = false;
-  result = dse_build_reg_slice(f.trace, f.ring, trigger, REG_RAX, slice, 16);
+  result = dse_build_reg_slice(f.trace, f.ring, trigger, DTA_REG_RAX, slice, 16);
   assert(result.status == DSE_SLICE_AUX_MISSING);
   shift_aux->execution_complete = true;
-  shift_aux->reg_value_valid_mask |= 1U << REG_RCX;
+  shift_aux->reg_value_valid_mask |= 1U << DTA_REG_RCX;
   /* An identity fault cannot be discarded as an unrelated register write. */
   TraceEntry *bad = (TraceEntry *)entry_at(&f, seq);
   bad->code_generation++;
-  result = dse_build_reg_slice(f.trace, f.ring, trigger, REG_RAX, slice, 16);
+  result = dse_build_reg_slice(f.trace, f.ring, trigger, DTA_REG_RAX, slice, 16);
   assert(result.status == DSE_SLICE_DEPENDENCY_UNKNOWN);
   assert(result.dependency_unknown_reasons & TRACE_DEPS_IDENTITY_MISMATCH);
   destroy(&f);

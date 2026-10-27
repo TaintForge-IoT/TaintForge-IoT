@@ -4,10 +4,13 @@ import ast
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from .syscall_result import parse_result, syscall_success
 
 
 SYSCALL_RE = re.compile(
@@ -132,6 +135,7 @@ class SyscallEvent:
     remote_port: Optional[int] = None
 
     high_risk: bool = False
+    success: Optional[bool] = None
 
 
 class StraceParserError(RuntimeError):
@@ -309,6 +313,7 @@ def parse_syscall_match(
         pid=int(pid_raw) if pid_raw else None,
         return_value=return_value,
         errno=errno,
+        success=syscall_success(return_value, errno),
         path=paths[0] if paths else None,
         paths=paths,
         remote_ip=remote_ip,
@@ -316,28 +321,6 @@ def parse_syscall_match(
         high_risk=syscall in HIGH_RISK_SYSCALLS,
         execution_context=execution_context,
     )
-
-
-def parse_result(result: str) -> tuple[Optional[int], Optional[str]]:
-    result = result.strip()
-
-    if result.startswith("?"):
-        return None, None
-
-    first = result.split(maxsplit=1)[0]
-
-    try:
-        return int(first), None
-    except ValueError:
-        pass
-
-    errno = None
-
-    parts = result.split()
-    if len(parts) >= 2 and parts[0] == "-1":
-        errno = parts[1]
-
-    return None, errno
 
 
 def extract_paths(syscall: str, args: str) -> list[str]:
@@ -419,65 +402,41 @@ def classify_syscall(syscall: str) -> str:
 
     return "other"
 
-def build_summary(events: list[SyscallEvent]) -> dict:
-    by_syscall = Counter(event.syscall for event in events)
-    by_category = Counter(event.category for event in events)
-    by_context = Counter(event.execution_context for event in events)
-
-    all_paths = sorted(
-        {
-            path
-            for event in events
-            for path in event.paths
-            if path
-        }
-    )
-
-    guest_paths = sorted(
-        {
-            path
-            for event in events
-            if event.execution_context == "guest"
-            for path in event.paths
-            if path
-        }
-    )
-
-    host_wrapper_paths = sorted(
-        {
-            path
-            for event in events
-            if event.execution_context == "host_wrapper"
-            for path in event.paths
-            if path
-        }
-    )
-
-    network_targets = sorted(
-        {
-            f"{event.remote_ip}:{event.remote_port}"
-            for event in events
-            if event.remote_ip is not None and event.remote_port is not None
-        }
-    )
-
-    high_risk = [
-        asdict(event)
-        for event in events
-        if event.high_risk
-    ]
+def build_summary(events: Iterable[SyscallEvent]) -> dict:
+    # Consume generators once. Repeated events do not need to remain in memory.
+    by_syscall, by_category, by_context = Counter(), Counter(), Counter()
+    all_paths, guest_paths, host_wrapper_paths, network_targets = set(), set(), set(), set()
+    events_total = high_risk_count = 0
+    high_risk = []
+    for event in events:
+        events_total += 1
+        by_syscall[event.syscall] += 1
+        by_category[event.category] += 1
+        by_context[event.execution_context] += 1
+        paths = {path for path in event.paths if path}
+        all_paths.update(paths)
+        if event.execution_context == "guest":
+            guest_paths.update(paths)
+        elif event.execution_context == "host_wrapper":
+            host_wrapper_paths.update(paths)
+        if event.remote_ip is not None and event.remote_port is not None:
+            network_targets.add(f"{event.remote_ip}:{event.remote_port}")
+        if event.high_risk:
+            high_risk_count += 1
+            if len(high_risk) < 50:
+                high_risk.append(asdict(event))
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "events_total": len(events),
+        "events_total": events_total,
         "by_syscall": dict(sorted(by_syscall.items())),
         "by_category": dict(sorted(by_category.items())),
         "by_context": dict(sorted(by_context.items())),
-        "paths": guest_paths,
-        "guest_paths": guest_paths,
-        "host_wrapper_paths": host_wrapper_paths,
-        "all_paths": all_paths,
-        "network_targets": network_targets,
-        "high_risk_count": len(high_risk),
-        "high_risk_events": high_risk[:50],
+        "paths": sorted(guest_paths),
+        "guest_paths": sorted(guest_paths),
+        "host_wrapper_paths": sorted(host_wrapper_paths),
+        "all_paths": sorted(all_paths),
+        "network_targets": sorted(network_targets),
+        "high_risk_count": high_risk_count,
+        "high_risk_events": high_risk,
     }

@@ -51,11 +51,13 @@ class C2RecordBroker:
         run_id: str,
         event_path: str | Path | None = None,
         listen_port_override: int | None = None,
+        protocol_hint: str | None = None,
     ) -> None:
         self.policy = policy
         self.bind_ip = bind_ip
         self.capture_root = Path(capture_root)
         self.run_id = run_id
+        self.protocol_hint = protocol_hint
         self.event_path = (
             Path(event_path)
             if event_path is not None
@@ -351,6 +353,7 @@ class C2RecordBroker:
 
             summary = {
                 "schema_version": 1,
+                **({"protocol_hint": self.protocol_hint} if self.protocol_hint is not None else {}),
                 "run_id": self.run_id,
                 "session_id": session_id,
                 "capture_kind": self.policy.capture_kind,

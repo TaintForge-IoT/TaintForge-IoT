@@ -108,6 +108,24 @@ class RepairPlanner:
         priority = _priority_from_blocking(requirement.blocking)
 
         if (
+            requirement.kind == RequirementKind.NETWORK
+            and dict(requirement.details).get("endpoint_resolution") == "unresolved"
+        ):
+            return self._decision(
+                requirement,
+                action=RepairActionKind.NONE,
+                disposition=RepairDisposition.MANUAL_ANALYSIS,
+                priority=priority,
+                risk=RepairRisk.HIGH,
+                automatic_allowed=False,
+                reason=(
+                    "The failed connect has no complete remote IP and port. "
+                    "Preserve the failure and resolve its destination before "
+                    "planning a network service; a sockaddr pointer is not an endpoint."
+                ),
+            )
+
+        if (
             requirement.status == RequirementStatus.PROVIDED
             and not _needs_semantic_network_review(requirement)
         ):

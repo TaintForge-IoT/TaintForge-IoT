@@ -27,9 +27,9 @@ int main(void) {
 	memcpy(meta.instr_bytes, bytes, sizeof(bytes));
 	meta.insn_id = 99;
 	meta.family = DTA_FAMILY_COMPARE;
-	meta.regs_read_mask = (1U << REG_RAX) | (1U << REG_RBX);
-	meta.reg_reads[0] = slice(REG_RAX, 0, 4);
-	meta.reg_reads[1] = slice(REG_RBX, 0, 4);
+	meta.regs_read_mask = (1U << DTA_REG_RAX) | (1U << DTA_REG_RBX);
+	meta.reg_reads[0] = slice(DTA_REG_RAX, 0, 4);
+	meta.reg_reads[1] = slice(DTA_REG_RBX, 0, 4);
 	meta.reg_read_count = 2;
 	meta.flags_write_mask = X86_FLAG_CF | X86_FLAG_ZF | X86_FLAG_OF;
 

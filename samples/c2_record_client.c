@@ -3,8 +3,10 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -47,9 +49,27 @@ static int send_all(
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     const unsigned char request[] = "hello";
-    unsigned char response[64];
+    /* One extra byte detects overlong responses as well as short reads. */
+    unsigned char response[sizeof(EXPECTED_RESPONSE)];
+    const char *target_ip = TARGET_IP;
+    long target_port = TARGET_PORT;
+
+    if (argc == 3) {
+        char *end = NULL;
+        errno = 0;
+        target_ip = argv[1];
+        target_port = strtol(argv[2], &end, 10);
+        if (errno != 0 || end == argv[2] || *end != '\0'
+            || target_port < 1 || target_port > 65535) {
+            fprintf(stderr, "invalid port\n");
+            return 2;
+        }
+    } else if (argc != 1) {
+        fprintf(stderr, "usage: %s [IPv4 PORT]\n", argv[0]);
+        return 2;
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -58,16 +78,24 @@ int main(void) {
         return 10;
     }
 
+    struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0
+        || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt");
+        close(fd);
+        return 10;
+    }
+
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
 
     address.sin_family = AF_INET;
-    address.sin_port = htons(TARGET_PORT);
+    address.sin_port = htons((unsigned short)target_port);
 
     if (
         inet_pton(
             AF_INET,
-            TARGET_IP,
+            target_ip,
             &address.sin_addr
         )
         != 1
@@ -103,8 +131,7 @@ int main(void) {
     }
 
     /*
-     * The local mock C2 reads until client EOF before replying.
-     * We close only the write half of the TCP connection.
+     * Mark the complete request while keeping the read half open for the reply.
      */
     if (shutdown(fd, SHUT_WR) < 0) {
         perror("shutdown");
@@ -112,48 +139,42 @@ int main(void) {
         return 14;
     }
 
-    ssize_t received = recv(
-        fd,
-        response,
-        sizeof(response),
-        0
-    );
-
-    if (received < 0) {
-        perror("recv");
-        close(fd);
-        return 15;
-    }
-
-    if (received > 0) {
-        ssize_t stdout_written = write(
-            STDOUT_FILENO,
-            response,
-            (size_t)received
-        );
-
-        if (stdout_written != received) {
-            perror("write");
+    size_t received = 0;
+    while (received < sizeof(response)) {
+        ssize_t chunk = recv(fd, response + received, sizeof(response) - received, 0);
+        if (chunk < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("recv");
             close(fd);
-            return 16;
+            return 15;
         }
-
-        (void)write(STDOUT_FILENO, "\n", 1);
+        if (chunk == 0) {
+            break;
+        }
+        received += (size_t)chunk;
     }
 
     close(fd);
 
     if (
-        received != 5
+        received != sizeof(EXPECTED_RESPONSE) - 1
         || memcmp(
             response,
             EXPECTED_RESPONSE,
-            5
+            sizeof(EXPECTED_RESPONSE) - 1
         )
         != 0
     ) {
         fprintf(stderr, "unexpected response\n");
         return 17;
+    }
+
+    if (fwrite(response, 1, received, stdout) != received
+        || fputc('\n', stdout) == EOF || fflush(stdout) == EOF) {
+        perror("write");
+        return 16;
     }
 
     return 0;

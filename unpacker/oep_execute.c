@@ -97,7 +97,7 @@ static void node_json(const Node *n) {
  if(n->count==2)printf(",%u",n->successors[1]);
  printf("],\"original_ir_sha256\":\"%s\",\"ir_instructions\":%u,\"ir_values\":%u,\"store_count\":%u,\"gpr_writes\":%u,\"esp_writes\":%u,\"original_condition_value_id\":%u,\"original_ir_dump\":",
   n->sha,ir_module_inst_count(n->module),ir_module_value_count(n->module),n->stores,
-  n->lift.gpr_writes,!!(n->lift.gpr_writes&(1U<<REG_RSP)),n->lift.condition);
+  n->lift.gpr_writes,!!(n->lift.gpr_writes&(1U<<DTA_REG_RSP)),n->lift.condition);
  string_json(n->dump,n->dump_size);
  printf(",\"control\":%u,\"call\":%s,\"fallthrough\":%u,\"direct_target\":%u,\"target_value_id\":%u,\"flags_written\":%u,\"flags_undefined\":%u",n->lift.control,n->lift.call?"true":"false",n->lift.fallthrough,n->lift.direct_target,n->lift.target,n->lift.flags_written,n->lift.flags_undefined);
  fputs(",\"repeat_expansion_iterations\":",stdout);

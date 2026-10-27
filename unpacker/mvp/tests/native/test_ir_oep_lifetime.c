@@ -20,7 +20,7 @@ static void observe(void *user,const char *name) {
         }
         if(w->fault==3) {
             InsnAux *a=(InsnAux *)replay_input_aux(w->input,step->entry.seq_id);
-            a->reg_vals[REG_RCX]^=1;
+            a->reg_vals[DTA_REG_RCX]^=1;
         }
     }
     if(!strcmp(name,"candidate_replay") || !strcmp(name,"alternative_replay"))
@@ -88,8 +88,8 @@ static bool select_once(void *user,const IrInputs *in,uint32_t limit,const IrOep
     f->variable_count=0;return true;
 }
 static void owned_aliases(FILE *report) {
-    OepFixture f=of_fixture(OF_LINEAR);f.variables[0]=of_register_byte(REG_RCX,0);
-    f.variables[1]=of_register_byte(REG_RDX,0);f.variables[1].same_as=1;f.variable_count=2;
+    OepFixture f=of_fixture(OF_LINEAR);f.variables[0]=of_register_byte(DTA_REG_RCX,0);
+    f.variables[1]=of_register_byte(DTA_REG_RDX,0);f.variables[1].same_as=1;f.variable_count=2;
     IrOepRequest q=of_request(&f);q.symbolic_count=0;q.symbolic_inputs=NULL;q.select_inputs=select_once;q.selection_user=&f;
     IrOepOptions o=of_options();o.rebuild_replay=true;
     IrOepResult r=ir_oep_verify(f.input,&q,&o);of_status(&r,IR_OEP_UNIQUE);

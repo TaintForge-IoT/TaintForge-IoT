@@ -25,9 +25,23 @@ static TfConcolic *g_concolic;
 #include "qemu_plugin_compat.h"
 #include "elf_image.h"
 #include "phase1_io.h"
+#include "phase1_retire.h"
+#include "phase1_resources.h"
 
 static TfRuntimeDiag g_runtime_diag;
 static TfPhase1Io g_phase1;
+static TfRetire g_retire = {.fd = -1};
+static qemu_plugin_id_t g_plugin_id;
+static bool g_released, g_exported;
+static uint64_t g_released_pages, g_released_bitmaps, g_released_register_buffers;
+static uint64_t g_explicitly_wiped_bytes;
+
+static bool phase1_admit(void) {
+    if (g_retire.state != TF_RETIRE_OFF &&
+        (getpid() != g_phase1.owner || __atomic_load_n(&g_phase1.profile_lost, __ATOMIC_ACQUIRE)))
+        tf_retire_abort(91, "unsupported_process_or_thread_profile");
+    return !g_released && tf_phase1_active(&g_phase1);
+}
 static void phase1_invalidate(uint64_t address, uint32_t generation, const char *reason);
 static void stage_clear_producers(void);
 static void stage_invalidate_mapping_range(uint64_t address, uint64_t size);
@@ -379,6 +393,21 @@ typedef struct {
     const char *status;
 } ProgramCapture;
 
+static void page_destroy(void *pointer) {
+    page_t *page = pointer;
+    if (!page) return;
+    if (page->wbitmap) {
+        tf_retire_wipe(page->wbitmap, page_size / 8U);
+        g_explicitly_wiped_bytes += page_size / 8U;
+        ++g_released_bitmaps;
+        g_free(page->wbitmap);
+    }
+    tf_retire_wipe(page, sizeof(*page));
+    g_explicitly_wiped_bytes += sizeof(*page);
+    ++g_released_pages;
+    g_free(page);
+}
+
 //multiple OEP vatiants
 typedef struct {
     uint64_t addr;
@@ -684,6 +713,7 @@ typedef struct {
 } dcfg_pending_transfer_t;
 
 typedef struct {
+    GByteArray *register_scratch, *flags_scratch;
     DtaVcpuState dta;
     dta_mem_transfer_t mem_transfer;
     uint64_t current_ip;
@@ -758,13 +788,31 @@ static bool g_vcpu_states_lock_initialized = false;
 static __thread unsigned int g_tls_vcpu_index = G_MAXUINT;
 static __thread PluginVcpuState *g_tls_vcpu_state = NULL;
 
+static void register_scratch_destroy(GByteArray *buffer) {
+    if (!buffer) return;
+    tf_retire_wipe(buffer->data, buffer->len);
+    g_explicitly_wiped_bytes += buffer->len;
+    ++g_released_register_buffers;
+    g_byte_array_free(buffer, TRUE);
+}
+
+static void plugin_vcpu_state_destroy(void *pointer) {
+    PluginVcpuState *state = pointer;
+    if (!state) return;
+    register_scratch_destroy(state->register_scratch);
+    register_scratch_destroy(state->flags_scratch);
+    tf_retire_wipe(state, sizeof(*state));
+    g_explicitly_wiped_bytes += sizeof(*state);
+    g_free(state);
+}
+
 static bool plugin_vcpu_states_init(void) {
     if (g_vcpu_states_lock_initialized) {
         return g_vcpu_states != NULL;
     }
     g_mutex_init(&g_vcpu_states_lock);
     g_vcpu_states_lock_initialized = true;
-    g_vcpu_states = g_ptr_array_new_with_free_func(g_free);
+    g_vcpu_states = g_ptr_array_new_with_free_func(plugin_vcpu_state_destroy);
     if (!g_vcpu_states) {
         g_mutex_clear(&g_vcpu_states_lock);
         g_vcpu_states_lock_initialized = false;
@@ -1082,6 +1130,13 @@ typedef struct {
     uint16_t port;
     char *payload_hex;
 } net_dep_t;
+
+static void net_dep_destroy(void *pointer) {
+    net_dep_t *item = pointer;
+    if (!item) return;
+    g_free(item->payload_hex);
+    g_free(item);
+}
 
 static GList *file_deps = NULL;
 static GList *net_deps = NULL;
@@ -2070,6 +2125,7 @@ static void dse_vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
     unsigned previous_vcpus = __atomic_fetch_add(&g_ir_vcpus, 1U, __ATOMIC_RELEASE);
     tf_concolic_vcpu(g_concolic, vcpu_index, previous_vcpus);
     if (g_phase1.enabled && (previous_vcpus != 0 || vcpu_index != 0)) {
+        if (g_retire.state != TF_RETIRE_OFF) tf_retire_abort(91, "multiple_guest_threads");
         tf_phase1_profile_lost(&g_phase1, "multiple_guest_threads");
         return;
     }
@@ -2088,9 +2144,13 @@ static void dse_vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
 static bool dse_read_reg(int rid, uint64_t *out) {
     if (!out || rid < 0 || rid >= REG_COUNT || !g_regs_ready || !g_reg_handle_valid[rid])
         return false;
-    static __thread GByteArray *buf = NULL;
-    if (!buf)
-        buf = g_byte_array_new();
+    PluginVcpuState *state = g_tls_vcpu_state;
+    if (!state) return false;
+    if (!state->register_scratch) state->register_scratch = g_byte_array_new();
+    GByteArray *buf = state->register_scratch;
+    /* read_register resets len first; erase the previous observation even if
+     * the next read fails and leaves an empty buffer. */
+    tf_retire_wipe(buf->data, buf->len);
     if (!tf_qemu_read_register_exact(g_reg_handle[rid], buf, 4)) {
         if (!g_reg_read_error_reported[rid]) {
             fprintf(stderr, "[REG] incomplete or failed read for %s: len=%u\n",
@@ -2138,10 +2198,12 @@ static void dse_read_tls_snapshot(InsnAux *aux) {
 static bool dse_read_eflags(uint32_t *out) {
     if (!out || !g_eflags_handle_valid || !g_x86_flags_verified)
         return false;
-    static __thread GByteArray *buf = NULL;
+    PluginVcpuState *state = g_tls_vcpu_state;
+    if (!state) return false;
     static bool error_reported = false;
-    if (!buf)
-        buf = g_byte_array_new();
+    if (!state->flags_scratch) state->flags_scratch = g_byte_array_new();
+    GByteArray *buf = state->flags_scratch;
+    tf_retire_wipe(buf->data, buf->len);
     if (!tf_qemu_read_register_exact(g_eflags_handle, buf, 4)) {
         if (!error_reported) {
             fprintf(stderr, "[REG] incomplete or failed read for eflags: len=%u\n", buf->len);
@@ -2217,7 +2279,7 @@ static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_
         dse_init_reg_handles();
     uint64_t taddr = 0;
     if (meta->insn_id == X86_INS_RET) {
-        if (!dse_read_reg(REG_RSP, &taddr))
+        if (!dse_read_reg(DTA_REG_RSP, &taddr))
             return false;
         taddr &= 0xFFFFFFFFULL;
     } else {
@@ -2547,7 +2609,7 @@ static bool dse_mem_access_value_u64(qemu_plugin_meminfo_t info, uint32_t size,
 
 static void dse_on_mem_impl(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
                             void *ud) {
-    if (!tf_phase1_active(&g_phase1))
+    if (!phase1_admit())
         return;
     PluginVcpuState *vcpu_state = plugin_vcpu_state_get(vcpu);
     if (!vcpu_state)
@@ -3409,9 +3471,8 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
         if (p) {
             if (p->exec_seen || p->exec_after_write)
                 phase1_invalidate(page_addr, next_code_generation(), "executed_mapping_unmapped");
+            /* The table owns both page and bitmap. Never unmap guest RAM. */
             g_hash_table_remove(pages, key);
-            g_free(p->wbitmap);
-            g_free(p);
         }
         if (page_addr == page_last) {
             break;
@@ -3774,7 +3835,7 @@ static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *write
 
 static void on_mem_write_impl(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr,
                               void *userdata) {
-    if (!tf_phase1_active(&g_phase1))
+    if (!phase1_admit())
         return;
     uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
     mark_written(vaddr, size, userdata, g_phase1.trace_seq, vcpu_idx);
@@ -4039,15 +4100,15 @@ static bool read_auxv_from_stack(void) {
     if (g_initial_sp_valid) {
         sp = g_initial_sp;
     } else {
-        if (!dse_read_reg(REG_RSP, &sp)) {
-            fprintf(stderr, "[AUXV] fail: cannot read initial REG_RSP\n");
+        if (!dse_read_reg(DTA_REG_RSP, &sp)) {
+            fprintf(stderr, "[AUXV] fail: cannot read initial DTA_REG_RSP\n");
             return false;
         }
         if (pb == 4) {
             sp &= 0xFFFFFFFFULL;
         }
         if (sp == 0) {
-            fprintf(stderr, "[AUXV] fail: initial REG_RSP is zero\n");
+            fprintf(stderr, "[AUXV] fail: initial DTA_REG_RSP is zero\n");
             return false;
         }
         g_initial_sp = sp;
@@ -4408,9 +4469,7 @@ static void do_dump(uint64_t oep) {
 }
 
 static void write_report(void) {
-    if (!image_captured)
-        do_dump(saved_oep);
-
+    /* Host-only serialization. Guest capture is an explicit earlier step. */
     TfAtomicFile output;
     if (!tf_atomic_open(&output, g_phase1.report_path)) {
         g_phase1.storage_failed = true;
@@ -4453,6 +4512,11 @@ static void write_report(void) {
                 "  \"analysis_instance_id\":\"%s\",\n"
                 "  \"capture_id\":\"%s:capture-1\",\n",
                 g_phase1.session, g_phase1.attempt, g_phase1.instance, g_phase1.instance);
+    if (tf_resources_enabled()) {
+        fputs("  \"resource_inventory\":", f_json);
+        tf_resources_json(f_json, true);
+        fputs(",\n", f_json);
+    }
     fprintf(f_json, "  \"oep\": \"0x%lx\",\n", saved_oep);
     fprintf(f_json, "  \"arch\": \"x86\",\n");
     fprintf(f_json, "  \"oep_confidence\": %.4f,\n", g_oep_confidence);
@@ -4950,15 +5014,13 @@ static void archive_pending_trace_occurrences(void) {
     archive_pending_trace_occurrences_impl();
 }
 
-static void plugin_exit(qemu_plugin_id_t id, void *udata) {
-    if (g_phase1.enabled && getpid() != g_phase1.owner)
-        return;
-    (void)id;
-    (void)udata;
+static void phase1_export(bool select_at_exit) {
+    if (g_exported) return;
+    g_exported = true;
     TfRuntimeScope shutdown_scope = tf_runtime_scope_begin(&g_runtime_diag, TF_PHASE_SHUTDOWN);
     archive_pending_trace_occurrences();
-    tf_concolic_destroy(g_concolic);
-    g_concolic = NULL;
+    if (!tf_concolic_finish(g_concolic))
+        g_phase1.storage_failed = true;
     runtime_scale_snapshot("final", g_icount);
     dta_shadow_report(g_shadow);
     if (g_ir_report) {
@@ -5003,9 +5065,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     }
     //oep choose
     oep_cand_t *chosen = NULL;
-    /* A quiet-window selection is provisional. Recompute at finalization so
-     * a later causal descendant or stronger independent leaf is considered. */
-    if (!g_phase1.profile_lost && oep_cands) {
+    if (oep_found)
+        chosen = g_selected_candidate;
+    /* Normal exit may revise a provisional leaf. Retirement exports the
+     * candidate already bound to its verdict and continuation. */
+    if (select_at_exit && !g_phase1.profile_lost && oep_cands) {
         chosen = choose_oep_cand();
         if (chosen) {
             if (g_selected_candidate && g_selected_candidate != chosen)
@@ -5021,6 +5085,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
         }
     } else if (g_phase1.profile_lost) {
         stage_retract_selection("capture_profile_incomplete");
+        chosen = NULL;
     }
     if (oep_cands) {
         build_oep_scoring(chosen);
@@ -5028,8 +5093,33 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 
     //write json-report
     saved_oep = oep_addr;
+    if (!image_captured)
+        do_dump(saved_oep);
     write_report();
     phase1_publish_manifest();
+    tf_runtime_scope_end(&shutdown_scope);
+    if (g_runtime_diag.options.profile) {
+        fputs("[RUNTIME-PROFILE] ", stderr);
+        if (!tf_runtime_profile_snapshot_json(stderr, &g_runtime_diag, "exit", g_icount))
+            fprintf(stderr, "[RUNTIME] profile write failed\n");
+    }
+}
+
+/* No QEMU calls, guest reads, socket waits, export or work scheduling here.
+ * Legal only before callback registration, after QEMU's removal completion,
+ * or in QEMU's normal atexit callback. Safe after partial init and twice. */
+static void phase1_release_owned(void) {
+    if (g_released) return;
+    g_released = true;
+    dse_lift_attach(NULL, NULL, NULL);
+    tf_concolic_destroy(g_concolic);
+    g_concolic = NULL;
+    g_cur_aux = NULL;
+    g_selected_candidate = NULL;
+    g_list_free_full(resolved_imports, g_free);
+    resolved_imports = NULL;
+    g_clear_pointer(&resolved_imports_by_slot, g_hash_table_destroy);
+    if (g_ir_report) { fclose(g_ir_report); g_ir_report = NULL; }
     //memory free
     for (GList *l = file_deps; l; l = l->next) {
         file_dep_t *f = (file_dep_t *)l->data;
@@ -5037,55 +5127,41 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
         g_free(f);
     }
     g_list_free(file_deps);
+    file_deps = NULL;
     for (GList *l = lib_deps; l; l = l->next) {
         lib_mapping_t *lm = (lib_mapping_t *)l->data;
         g_free(lm->path);
         g_free(lm);
     }
     g_list_free(lib_deps);
-    for (GList *l = net_deps; l; l = l->next) {
-        net_dep_t *n = (net_dep_t *)l->data;
-        g_free(n->payload_hex);
-        g_free(n);
-    }
-    g_list_free(net_deps);
-    g_hash_table_destroy(file_fd);
+    lib_deps = NULL;
+    g_list_free_full(net_deps, net_dep_destroy);
+    net_deps = NULL;
+    g_clear_pointer(&file_fd, g_hash_table_destroy);
 
     if (unmapped_pages) {
         g_hash_table_destroy(unmapped_pages);
         unmapped_pages = NULL;
     }
 
-    if (g_sockets) {
-        GHashTableIter iter;
-        gpointer key, value;
-        g_hash_table_iter_init(&iter, g_sockets);
-        while (g_hash_table_iter_next(&iter, &key, &value)) {
-            net_dep_t *n = value;
-            g_free(n->payload_hex);
-            g_free(n);
-        }
-    }
-    g_hash_table_destroy(g_sockets);
+    g_clear_pointer(&g_sockets, g_hash_table_destroy);
+    g_clear_pointer(&pages, g_hash_table_destroy);
+    for (unsigned file = 0; file < 32; ++file)
+        for (unsigned i = 0; i < 256; ++i)
+            g_clear_pointer(&g_stage_memfd_files[file].store_pages[i], page_destroy);
+    memset(g_stage_memfd_files, 0, sizeof(g_stage_memfd_files));
 
     //fd
-    g_free(pending_open_path);
+    g_clear_pointer(&pending_open_path, g_free);
 
     //capstone handle
-    cs_close(&cs_handle);
+    if (cs_handle) cs_close(&cs_handle);
+    cs_handle = 0;
     insn_exec_contexts_destroy();
     meta_free();
 
     //tracer
     if (g_dcfg) {
-        DcfgStats stats;
-        dcfg_graph_get_stats(g_dcfg, &stats);
-        fprintf(stderr,
-                "[DCFG-SUMMARY]"
-                " nodes=%u"
-                " edges=%u"
-                " occurrences=%" PRIu64 "\n",
-                stats.node_count, stats.edge_count, stats.branch_occurrence_count);
         dcfg_graph_destroy(g_dcfg);
         g_dcfg = NULL;
     }
@@ -5093,8 +5169,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
         branch_event_buffer_destroy(g_branch_events);
         g_branch_events = NULL;
     }
-    dse_lift_attach(NULL, NULL, NULL);
-    g_cur_aux = NULL;
     dse_aux_destroy(g_aux);
     g_aux = NULL;
     trace_buffer_destroy(g_trace);
@@ -5116,27 +5190,80 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     oep_cands = NULL;
     g_active_candidate = NULL;
     prev_jump_owner_id = 0;
-    //got
-    g_list_free_full(resolved_imports, g_free);
-    resolved_imports = NULL;
-    if (resolved_imports_by_slot) {
-        g_hash_table_destroy(resolved_imports_by_slot);
-        resolved_imports_by_slot = NULL;
-    }
     provenance_runtime_destroy();
     proc_executable_reset();
     g_clear_pointer(&g_main_image_path, g_free);
-    tf_runtime_scope_end(&shutdown_scope);
-    if (g_runtime_diag.options.profile) {
-        fputs("[RUNTIME-PROFILE] ", stderr);
-        if (!tf_runtime_profile_snapshot_json(stderr, &g_runtime_diag, "exit", g_icount))
-            fprintf(stderr, "[RUNTIME] profile write failed\n");
+    if (g_oep_scoring) {
+        g_string_free(g_oep_scoring, TRUE);
+        g_oep_scoring = NULL;
     }
     if (g_capture_gaps) {
         g_string_free(g_capture_gaps, TRUE);
         g_capture_gaps = NULL;
     }
     tf_phase1_destroy(&g_phase1);
+    memset(g_reg_handle, 0, sizeof(g_reg_handle));
+    memset(g_reg_handle_valid, 0, sizeof(g_reg_handle_valid));
+    g_eflags_handle = NULL;
+    g_eflags_handle_valid = g_regs_ready = false;
+}
+
+static unsigned phase1_owner_roots_remaining(void) {
+    unsigned remaining = !!pages + !!file_deps + !!lib_deps + !!net_deps + !!file_fd + !!g_sockets +
+        !!pending_open_path + !!cs_handle + !!g_insn_exec_contexts + !!g_dcfg +
+        !!g_branch_events + !!g_aux + !!g_trace + !!saved_reg + !!oep_cands +
+        !!resolved_imports + !!resolved_imports_by_slot + !!g_vcpu_states +
+        !!g_prov_fd_table + !!g_shadow + !!g_prov_registry + !!g_main_image_path +
+        !!g_oep_scoring + !!g_capture_gaps + !!g_ir_report + !!g_concolic + !!g_phase1.events +
+        !!g_phase1.session + !!unmapped_pages + !!g_active_candidate;
+    for (unsigned file = 0; file < 32; ++file)
+        for (unsigned i = 0; i < 256; ++i)
+            remaining += !!g_stage_memfd_files[file].store_pages[i];
+    return remaining;
+}
+
+static void phase1_removed(qemu_plugin_id_t id) {
+    if (id != g_plugin_id) tf_retire_abort(88, "plugin_identity");
+    tf_retire_removed(&g_retire);
+    phase1_release_owned();
+    tf_retire_released(&g_retire, g_released_pages, g_released_bitmaps,
+                      g_released_register_buffers, g_explicitly_wiped_bytes,
+                      phase1_owner_roots_remaining());
+    /* QEMU closes the module after this callback returns. */
+}
+
+static bool phase1_retire_at_boundary(uint64_t pc) {
+    if (g_retire.state != TF_RETIRE_ACTIVE) return false;
+    if (g_retire.on_verdict ? !tf_retire_due(&g_retire) : pc != g_retire.boundary) return false;
+    if (!oep_found || !cand_selection_eligible(g_selected_candidate) ||
+        g_selected_candidate->candidate_id != g_retire.candidate || !g_retire.candidate ||
+        g_retire.epoch != g_phase1.epoch)
+        tf_retire_abort(89, "no_current_oep_verdict");
+    if (__atomic_load_n(&g_ir_vcpus, __ATOMIC_ACQUIRE) != 1 || g_phase1.profile_lost)
+        tf_retire_abort(91, "unsupported_process_or_thread_profile");
+    tf_retire_bind_continuation(&g_retire, &g_phase1, pc);
+    __atomic_store_n(&g_phase1.quiesced, true, __ATOMIC_RELEASE);
+    g_retire.state = TF_RETIRE_PREPARING;
+    g_phase1.pc = pc;
+    phase1_export(false);
+    if (!image_captured || strcmp(g_capture_status, "success"))
+        tf_retire_abort(90, "capture_incomplete");
+    tf_retire_permit(&g_retire, &g_phase1);
+#if QEMU_PLUGIN_VERSION == 6
+    qemu_plugin_uninstall(g_plugin_id, phase1_removed);
+#else
+    tf_retire_abort(91, "unsupported_plugin_api");
+#endif
+    return true;
+}
+
+static void plugin_exit(qemu_plugin_id_t id, void *udata) {
+    (void)id; (void)udata;
+    if (g_released || (g_phase1.enabled && getpid() != g_phase1.owner)) return;
+    /* Reaching process exit without the requested retirement is not success. */
+    if (g_retire.state != TF_RETIRE_OFF) tf_retire_abort(89, "retirement_boundary_not_reached");
+    phase1_export(true);
+    phase1_release_owned();
 }
 
 static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
@@ -5183,7 +5310,7 @@ static bool capture_auxiliary_required(const InsnMeta *meta) {
 }
 
 static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
-    if (!tf_phase1_active(&g_phase1))
+    if (!phase1_admit())
         return;
     const InsnExecCtx *exec_ctx = (const InsnExecCtx *)udata;
     if (!exec_ctx)
@@ -5202,7 +5329,6 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         finalize_missing_memory_flag_transfer(vcpu_state);
         finalize_pending_branch(vcpu_state, vaddr);
         finalize_pending_transfer(vcpu_state, vaddr);
-        dcfg_track_instruction(vcpu_state, vaddr, exec_ctx->size);
     }
     uint64_t current_reg_vals[REG_COUNT] = {0};
     uint32_t current_reg_value_valid_mask = 0;
@@ -5303,6 +5429,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     vcpu_state->current_aux = NULL;
     vcpu_state->current_aux_seq_id = 0;
     g_cur_aux = NULL;
+    /* Finalize the previous instruction, but do not append a not-yet-executed
+     * continuation instruction to the archive being exported. */
+    if (phase1_retire_at_boundary(vaddr)) return;
+    {
+        TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_CONTROL_FLOW);
+        dcfg_track_instruction(vcpu_state, vaddr, exec_ctx->size);
+    }
     vcpu_state->current_ip = vaddr;
     transfer->active = true;
     transfer->pc = vaddr;
@@ -5313,13 +5446,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     transfer->flags_pending = meta && meta->flags_write_mask != 0 && meta->has_mem_read;
     transfer->flags_applied = false;
     if (meta && meta->insn_id == X86_INS_POPAL) {
-        uint32_t rsp_bit = UINT32_C(1) << REG_RSP;
+        uint32_t rsp_bit = UINT32_C(1) << DTA_REG_RSP;
         if (current_reg_value_valid_mask & rsp_bit) {
-            transfer->pre_esp = (uint32_t)current_reg_vals[REG_RSP];
+            transfer->pre_esp = (uint32_t)current_reg_vals[DTA_REG_RSP];
             transfer->pre_esp_valid = true;
         } else {
             uint64_t pre_esp = 0;
-            if (dse_read_reg(REG_RSP, &pre_esp)) {
+            if (dse_read_reg(DTA_REG_RSP, &pre_esp)) {
                 transfer->pre_esp = (uint32_t)pre_esp;
                 transfer->pre_esp_valid = true;
             }
@@ -5361,7 +5494,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     vcpu_state->brk_entry_valid = false;
     if (is_i386 && exec_ctx->size == 2 && exec_ctx->instr_bytes[0] == 0xcd &&
         exec_ctx->instr_bytes[1] == 0x80 && (current_reg_value_valid_mask & 1U) &&
-        current_reg_vals[REG_RAX] == 45)
+        current_reg_vals[DTA_REG_RAX] == 45)
         vcpu_state->brk_entry_valid = dse_read_brk_words(vcpu_state->brk_entry_words);
     uint64_t current_trace_seq_id = 0;
     if (g_trace) {
@@ -5641,6 +5774,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                     (unsigned long)chosen->addr);
             g_selected_candidate = chosen;
             phase1_candidate_event("oep_candidate_selected", chosen, true);
+            tf_retire_verdict(&g_retire, &g_phase1, chosen->candidate_id, chosen->addr);
             /* Entry mode publishes the image saved at the observed candidate.
              * The legacy finalization mode never rewinds guest execution. */
         }
@@ -5822,7 +5956,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
     (void)vcpu_idx;
     (void)a7;
     (void)a8;
-    if (!tf_phase1_active(&g_phase1))
+    if (!phase1_admit())
         return;
     if (g_stage_syscall_ordinal == UINT64_MAX) {
         tf_phase1_profile_lost(&g_phase1, "mapping_syscall_ordinal_exhausted");
@@ -6343,7 +6477,7 @@ static void vcpu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 }
 
 static void vcpu_tb_trans_impl(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
-    if (!tf_phase1_active(&g_phase1))
+    if (!phase1_admit())
         return;
     (void)id;
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
@@ -6392,7 +6526,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 
 static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num,
                                   int64_t ret) {
-    if (!tf_phase1_active(&g_phase1))
+    if (!phase1_admit())
         return;
     (void)id;
     (void)vcpu_idx;
@@ -6554,63 +6688,11 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
     vcpu_syscall_ret_impl(id, vcpu_idx, num, ret);
 }
 
-static void plugin_install_cleanup(bool capstone_initialized, bool metadata_initialized) {
-    dse_lift_attach(NULL, NULL, NULL);
-    g_cur_aux = NULL;
-    if (g_aux) {
-        dse_aux_destroy(g_aux);
-        g_aux = NULL;
-    }
-    if (g_trace) {
-        trace_buffer_destroy(g_trace);
-        g_trace = NULL;
-    }
-    if (g_branch_events) {
-        branch_event_buffer_destroy(g_branch_events);
-        g_branch_events = NULL;
-    }
-    if (g_dcfg) {
-        dcfg_graph_destroy(g_dcfg);
-        g_dcfg = NULL;
-    }
-    if (resolved_imports_by_slot) {
-        g_hash_table_destroy(resolved_imports_by_slot);
-        resolved_imports_by_slot = NULL;
-    }
-    if (unmapped_pages) {
-        g_hash_table_destroy(unmapped_pages);
-        unmapped_pages = NULL;
-    }
-    if (g_sockets) {
-        g_hash_table_destroy(g_sockets);
-        g_sockets = NULL;
-    }
-    if (file_fd) {
-        g_hash_table_destroy(file_fd);
-        file_fd = NULL;
-    }
-    if (pages) {
-        g_hash_table_destroy(pages);
-        pages = NULL;
-    }
-    insn_exec_contexts_destroy();
-    if (metadata_initialized) {
-        meta_free();
-    }
-    if (capstone_initialized) {
-        cs_close(&cs_handle);
-    }
-    provenance_runtime_destroy();
-    proc_executable_reset();
-    g_clear_pointer(&g_main_image_path, g_free);
-}
-
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
                                            char **argv) {
-    bool capstone_initialized = false;
-    bool metadata_initialized = false;
-    if (!dse_plugin_options(argc, argv))
-        return -1;
+    if (!tf_resources_configure(argc, argv)) return -1;
+    g_plugin_id = id;
+    if (!dse_plugin_options(argc, argv)) return -1;
     tf_runtime_diag_init(&g_runtime_diag);
     if (!tf_runtime_diag_options(&g_runtime_diag, argc, argv, stderr))
         return -1;
@@ -6625,9 +6707,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     }
     if (!info || !info->target_name) {
         fprintf(stderr, "[PLUGIN] missing target information\n");
-        return -1;
+        goto fail;
     }
 
+    if (!tf_retire_configure(&g_retire, &g_phase1, argc, argv, QEMU_PLUGIN_VERSION,
+                             info->target_name, info->system_emulation)) {
+        fprintf(stderr, "[PHASE1] invalid retirement options/profile\n");
+        goto fail;
+    }
     g_analysis_scope_id = (uint64_t)id;
     if (g_analysis_scope_id == 0) {
         g_analysis_scope_id = UINT64_C(1);
@@ -6656,7 +6743,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         current_arch = ARCH_MIPS;
     } else {
         fprintf(stderr, "[PLUGIN] unsupported architecture: %s\n", target);
-        return -1;
+        goto fail;
     }
 
     fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
@@ -6721,22 +6808,20 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         fprintf(stderr, "[PLUGIN] Capstone init failed\n");
         goto fail;
     }
-    capstone_initialized = true;
     if (cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON) != CS_ERR_OK) {
         fprintf(stderr, "[PLUGIN] failed to enable Capstone detail mode\n");
         goto fail;
     }
 
     meta_init();
-    metadata_initialized = true;
     if (!insn_exec_contexts_init()) {
         fprintf(stderr, "[PLUGIN] instruction context storage init failed\n");
         goto fail;
     }
 
-    pages = g_hash_table_new(g_direct_hash, g_direct_equal);
+    pages = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, page_destroy);
     file_fd = g_hash_table_new(g_direct_hash, g_direct_equal);
-    g_sockets = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_sockets = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, net_dep_destroy);
     unmapped_pages = g_hash_table_new(g_direct_hash, g_direct_equal);
     resolved_imports_by_slot = g_hash_table_new(g_direct_hash, g_direct_equal);
 
@@ -6786,8 +6871,8 @@ fail:
     }
     tf_phase1_event(&g_phase1, "error", "error", "plugin_install_failed", NULL);
     tf_phase1_finish(&g_phase1, "not_attempted");
-    tf_phase1_destroy(&g_phase1);
-    plugin_install_cleanup(capstone_initialized, metadata_initialized);
+    phase1_release_owned();
+    tf_retire_close(&g_retire);
 
     return -1;
 }

@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "date": "2026-09-18",
+  "real_qemu_executed": false,
+  "real_phase1_coload_executed": false,
+  "local_source_revision": "6b99be177940a8ae20200ae6572e2a78a0c8cabe",
+  "github_revision_checked": "3e74e480eea3e945786aa931690609afb81f5f24",
+  "qemu_reference_tag": "v11.0.1",
+  "qemu_reference_revision": "6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55",
+  "checks": [
+    {
+      "name": "local_package_baseline",
+      "status": "passed",
+      "detail": "All 11 target_state_fix files match the local integration; finalization differences are confined to the later test_prebuilt_runner update."
+    },
+    {
+      "name": "qemu_exact_header_blob",
+      "status": "passed",
+      "git_blob": "4eb1d2cd85c615916dcf60c70aceb4f450f185d3"
+    },
+    {
+      "name": "c_shared_object_compilation",
+      "status": "passed",
+      "flags": "-std=c11 -O2 -Wall -Wextra -Werror -Wformat=2 -Wshadow -pthread -fPIC -fvisibility=hidden -shared"
+    },
+    {
+      "name": "gcc_static_analyzer",
+      "status": "passed",
+      "flags": "-fanalyzer -O0 -Wall -Wextra -Werror -c"
+    },
+    {
+      "name": "host_mock_tests",
+      "status": "passed",
+      "test_methods": 14,
+      "transport": "socketpair",
+      "cpu_api": "mock"
+    },
+    {
+      "name": "asan_ubsan_host_mock_tests",
+      "status": "passed",
+      "test_methods": 14,
+      "leak_detection": false,
+      "transport": "socketpair",
+      "cpu_api": "mock"
+    },
+    {
+      "name": "python_syntax_and_framing",
+      "status": "passed"
+    },
+    {
+      "name": "i386_elf_build_and_static_inspection",
+      "status": "passed",
+      "detail": "ELF32 little-endian ET_EXEC EM_386; no PT_INTERP; non-executable GNU_STACK; both symbols and call/ret present."
+    },
+    {
+      "name": "installer_on_disposable_tree",
+      "status": "passed",
+      "detail": "Adds only experiment; refuses existing destination; accepts reviewed optional flags_receipt variant; rejects unknown source changes."
+    },
+    {
+      "name": "reference_repo_unchanged",
+      "status": "passed",
+      "detail": "Original README.md modification is still the only change; no Phase 1 files modified."
+    }
+  ],
+  "environment": {
+    "os": "Ubuntu 24.04 container",
+    "machine": "x86_64",
+    "compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+    "qemu_i386_available": false,
+    "i386_execution": "Exec format error",
+    "unix_listener": "socket(AF_UNIX, SOCK_STREAM) denied with EPERM",
+    "glib_build_context": "Installed libglib-2.0.so.0 (2.80.0); official GNOME GLib 2.80 public garray/gtypes headers and generated visibility/version macros. Minimal glib.h includes these declarations. Host glibconfig from runtime adapted to 2.80.0; normal pkg-config dev package unavailable. This is not an Arch package build."
+  },
+  "not_run": [
+    "Stock Arch pkg-config build path and exact installed QEMU runtime",
+    "Actual i386 guest execution and stack/PID/FD/call-return oracle",
+    "QEMU vCPU-context register/memory observations at both points",
+    "Real Unix socket bind/listen/connect and peer-credential handshake",
+    "Full Python supervisor/controller/QEMU matrix including co-load in both orders",
+    "Phase1Run.verify for the selected user plugin and runtime manifest",
+    "VM timeout/controller-loss behavior including SIGKILL and cleanup"
+  ],
+  "conclusion": "Implementation and model-level verification complete. Target VM acceptance pending; no claim of global quiescence or capsule readiness."
+}

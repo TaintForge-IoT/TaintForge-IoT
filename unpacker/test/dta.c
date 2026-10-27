@@ -676,85 +676,85 @@ int x86_reg_to_rid(unsigned cs_reg) {
     case X86_REG_AX:
     case X86_REG_AL:
     case X86_REG_AH:
-        return REG_RAX;
+        return DTA_REG_RAX;
     case X86_REG_RCX:
     case X86_REG_ECX:
     case X86_REG_CX:
     case X86_REG_CL:
     case X86_REG_CH:
-        return REG_RCX;
+        return DTA_REG_RCX;
     case X86_REG_RDX:
     case X86_REG_EDX:
     case X86_REG_DX:
     case X86_REG_DL:
     case X86_REG_DH:
-        return REG_RDX;
+        return DTA_REG_RDX;
     case X86_REG_RBX:
     case X86_REG_EBX:
     case X86_REG_BX:
     case X86_REG_BL:
     case X86_REG_BH:
-        return REG_RBX;
+        return DTA_REG_RBX;
     case X86_REG_RSP:
     case X86_REG_ESP:
     case X86_REG_SP:
     case X86_REG_SPL:
-        return REG_RSP;
+        return DTA_REG_RSP;
     case X86_REG_RBP:
     case X86_REG_EBP:
     case X86_REG_BP:
     case X86_REG_BPL:
-        return REG_RBP;
+        return DTA_REG_RBP;
     case X86_REG_RSI:
     case X86_REG_ESI:
     case X86_REG_SI:
     case X86_REG_SIL:
-        return REG_RSI;
+        return DTA_REG_RSI;
     case X86_REG_RDI:
     case X86_REG_EDI:
     case X86_REG_DI:
     case X86_REG_DIL:
-        return REG_RDI;
+        return DTA_REG_RDI;
     case X86_REG_R8:
     case X86_REG_R8D:
     case X86_REG_R8W:
     case X86_REG_R8B:
-        return REG_R8;
+        return DTA_REG_R8;
     case X86_REG_R9:
     case X86_REG_R9D:
     case X86_REG_R9W:
     case X86_REG_R9B:
-        return REG_R9;
+        return DTA_REG_R9;
     case X86_REG_R10:
     case X86_REG_R10D:
     case X86_REG_R10W:
     case X86_REG_R10B:
-        return REG_R10;
+        return DTA_REG_R10;
     case X86_REG_R11:
     case X86_REG_R11D:
     case X86_REG_R11W:
     case X86_REG_R11B:
-        return REG_R11;
+        return DTA_REG_R11;
     case X86_REG_R12:
     case X86_REG_R12D:
     case X86_REG_R12W:
     case X86_REG_R12B:
-        return REG_R12;
+        return DTA_REG_R12;
     case X86_REG_R13:
     case X86_REG_R13D:
     case X86_REG_R13W:
     case X86_REG_R13B:
-        return REG_R13;
+        return DTA_REG_R13;
     case X86_REG_R14:
     case X86_REG_R14D:
     case X86_REG_R14W:
     case X86_REG_R14B:
-        return REG_R14;
+        return DTA_REG_R14;
     case X86_REG_R15:
     case X86_REG_R15D:
     case X86_REG_R15W:
     case X86_REG_R15B:
-        return REG_R15;
+        return DTA_REG_R15;
     default:
         return -1;
     }
@@ -1780,7 +1780,7 @@ static void snapshot_accumulator_labels(const RegShadow *pre_regs, uint8_t width
         return;
     }
     for (uint8_t byte = 0; byte < width; byte++) {
-        out_labels[byte] = pre_regs->bytes[REG_RAX][byte];
+        out_labels[byte] = pre_regs->bytes[DTA_REG_RAX][byte];
     }
 }
 
@@ -1996,7 +1996,7 @@ DtaTransferResult dta_apply_mem_read_labels(RegShadow *rs, const RegShadow *pre_
         case X86_INS_LODSD:
         case X86_INS_LODSQ: {
             if (meta->string_element_size == 0 || meta->string_element_size != mem_width ||
-                dst.reg_id != REG_RAX || dst.byte_offset != 0 || dst.width != mem_width) {
+                dst.reg_id != DTA_REG_RAX || dst.byte_offset != 0 || dst.width != mem_width) {
                 return DTA_TRANSFER_NOT_APPLICABLE;
             }
             propagate_mem_labels2reg(rs, dst, effective_mem, mem_width, X86_INS_MOV, true);
@@ -2930,8 +2930,8 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
             m->flags_read_mask = 0;
             m->flags_write_mask = X86_FLAG_TRACKED;
             m->has_mem_read = true;
-            m->mem_addr_reg_mask |= UINT32_C(1) << REG_RDI;
-            m->mem_read_addr_reg_mask |= UINT32_C(1) << REG_RDI;
+            m->mem_addr_reg_mask |= UINT32_C(1) << DTA_REG_RDI;
+            m->mem_read_addr_reg_mask |= UINT32_C(1) << DTA_REG_RDI;
             RegSlice accumulator = reg_slice_from_x86(X86_REG_EAX, 4);
             RegSlice index = reg_slice_from_x86(X86_REG_EDI, 4);
             append_reg_slice(m->reg_reads, &m->reg_read_count, accumulator,
@@ -2940,15 +2940,15 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
                              &m->reg_slice_detail_truncated);
             append_reg_slice(m->reg_writes, &m->reg_write_count, index,
                              &m->reg_slice_detail_truncated);
-            m->regs_read_mask |= (UINT32_C(1) << REG_RAX) | (UINT32_C(1) << REG_RDI);
-            m->regs_written_mask |= UINT32_C(1) << REG_RDI;
+            m->regs_read_mask |= (UINT32_C(1) << DTA_REG_RAX) | (UINT32_C(1) << DTA_REG_RDI);
+            m->regs_written_mask |= UINT32_C(1) << DTA_REG_RDI;
         }
         // implicit mem access
         switch (insn->id) {
         case X86_INS_PUSH:
             m->has_mem_write = true;
-            m->mem_addr_reg_mask |= 1U << REG_RSP;
-            m->mem_write_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RSP;
+            m->mem_write_addr_reg_mask |= 1U << DTA_REG_RSP;
             if (x86->op_count > 0 && x86->operands[0].type == X86_OP_MEM) {
                 uint32_t source_address = x86_mem_address_reg_mask(&x86->operands[0]);
                 m->has_mem_read = true;
@@ -2960,16 +2960,16 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
         case X86_INS_PUSHFD:
         case X86_INS_PUSHFQ:
             m->has_mem_write = true;
-            m->mem_addr_reg_mask |= UINT32_C(1) << REG_RSP;
-            m->mem_write_addr_reg_mask |= UINT32_C(1) << REG_RSP;
-            m->regs_read_mask |= UINT32_C(1) << REG_RSP;
-            m->regs_written_mask |= UINT32_C(1) << REG_RSP;
+            m->mem_addr_reg_mask |= UINT32_C(1) << DTA_REG_RSP;
+            m->mem_write_addr_reg_mask |= UINT32_C(1) << DTA_REG_RSP;
+            m->regs_read_mask |= UINT32_C(1) << DTA_REG_RSP;
+            m->regs_written_mask |= UINT32_C(1) << DTA_REG_RSP;
             m->flags_read_mask |= X86_FLAG_TRACKED;
             break;
         case X86_INS_CALL:
             m->has_mem_write = true;
-            m->mem_addr_reg_mask |= 1U << REG_RSP;
-            m->mem_write_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RSP;
+            m->mem_write_addr_reg_mask |= 1U << DTA_REG_RSP;
             if (x86->op_count > 0 && x86->operands[0].type == X86_OP_MEM) {
                 uint32_t source_address = x86_mem_address_reg_mask(&x86->operands[0]);
                 m->has_mem_read = true;
@@ -2979,8 +2979,8 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
             break;
         case X86_INS_POP:
             m->has_mem_read = true;
-            m->mem_addr_reg_mask |= 1U << REG_RSP;
-            m->mem_read_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RSP;
+            m->mem_read_addr_reg_mask |= 1U << DTA_REG_RSP;
             if (x86->op_count > 0 && x86->operands[0].type == X86_OP_MEM) {
                 uint32_t destination_address = x86_mem_address_reg_mask(&x86->operands[0]);
                 m->has_mem_write = true;
@@ -2990,30 +2990,30 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
             break;
         case X86_INS_RET:
             m->has_mem_read = true;
-            m->mem_addr_reg_mask |= 1U << REG_RSP;
-            m->mem_read_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RSP;
+            m->mem_read_addr_reg_mask |= 1U << DTA_REG_RSP;
             break;
         case X86_INS_PUSHAL:
             m->has_mem_write = true;
-            m->mem_addr_reg_mask |= 1U << REG_RSP;
-            m->mem_write_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RSP;
+            m->mem_write_addr_reg_mask |= 1U << DTA_REG_RSP;
             break;
         case X86_INS_POPAL:
             m->has_mem_read = true;
-            m->mem_addr_reg_mask |= 1U << REG_RSP;
-            m->mem_read_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RSP;
+            m->mem_read_addr_reg_mask |= 1U << DTA_REG_RSP;
             break;
         case X86_INS_ENTER:
             m->has_mem_read = true;
             m->has_mem_write = true;
-            m->mem_addr_reg_mask |= (1U << REG_RSP) | (1U << REG_RBP);
-            m->mem_read_addr_reg_mask |= (1U << REG_RSP) | (1U << REG_RBP);
-            m->mem_write_addr_reg_mask |= 1U << REG_RSP;
+            m->mem_addr_reg_mask |= (1U << DTA_REG_RSP) | (1U << DTA_REG_RBP);
+            m->mem_read_addr_reg_mask |= (1U << DTA_REG_RSP) | (1U << DTA_REG_RBP);
+            m->mem_write_addr_reg_mask |= 1U << DTA_REG_RSP;
             break;
         case X86_INS_LEAVE:
             m->has_mem_read = true;
-            m->mem_addr_reg_mask |= 1U << REG_RBP;
-            m->mem_read_addr_reg_mask |= 1U << REG_RBP;
+            m->mem_addr_reg_mask |= 1U << DTA_REG_RBP;
+            m->mem_read_addr_reg_mask |= 1U << DTA_REG_RBP;
             break;
         case X86_INS_STOSB:
         case X86_INS_STOSW:
@@ -3021,8 +3021,8 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
         case X86_INS_STOSQ:
             if (m->string_element_size != 0) {
                 m->has_mem_write = true;
-                m->mem_addr_reg_mask |= 1U << REG_RDI;
-                m->mem_write_addr_reg_mask |= 1U << REG_RDI;
+                m->mem_addr_reg_mask |= 1U << DTA_REG_RDI;
+                m->mem_write_addr_reg_mask |= 1U << DTA_REG_RDI;
             }
             break;
         case X86_INS_LODSB:
@@ -3031,8 +3031,8 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
         case X86_INS_LODSQ:
             if (m->string_element_size != 0) {
                 m->has_mem_read = true;
-                m->mem_addr_reg_mask |= UINT32_C(1) << REG_RSI;
-                m->mem_read_addr_reg_mask |= UINT32_C(1) << REG_RSI;
+                m->mem_addr_reg_mask |= UINT32_C(1) << DTA_REG_RSI;
+                m->mem_read_addr_reg_mask |= UINT32_C(1) << DTA_REG_RSI;
                 x86_reg accumulator = X86_REG_INVALID;
                 switch (m->string_element_size) {
                 case 1:
@@ -3054,14 +3054,14 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
                     reg_slice_from_x86(accumulator, m->string_element_size);
                 append_reg_slice(m->reg_writes, &m->reg_write_count, accumulator_write,
                                  &m->reg_slice_detail_truncated);
-                m->regs_written_mask |= UINT32_C(1) << REG_RAX;
+                m->regs_written_mask |= UINT32_C(1) << DTA_REG_RAX;
                 RegSlice source_index = reg_slice_from_x86(X86_REG_ESI, 4);
                 append_reg_slice(m->reg_reads, &m->reg_read_count, source_index,
                                  &m->reg_slice_detail_truncated);
                 append_reg_slice(m->reg_writes, &m->reg_write_count, source_index,
                                  &m->reg_slice_detail_truncated);
-                m->regs_read_mask |= UINT32_C(1) << REG_RSI;
-                m->regs_written_mask |= UINT32_C(1) << REG_RSI;
+                m->regs_read_mask |= UINT32_C(1) << DTA_REG_RSI;
+                m->regs_written_mask |= UINT32_C(1) << DTA_REG_RSI;
             }
             break;
         default:
@@ -3073,9 +3073,9 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
              insn->id == X86_INS_MOVSQ)) {
             m->has_mem_read = true;
             m->has_mem_write = true;
-            m->mem_addr_reg_mask |= (1U << REG_RSI) | (1U << REG_RDI);
-            m->mem_read_addr_reg_mask |= 1U << REG_RSI;
-            m->mem_write_addr_reg_mask |= 1U << REG_RDI;
+            m->mem_addr_reg_mask |= (1U << DTA_REG_RSI) | (1U << DTA_REG_RDI);
+            m->mem_read_addr_reg_mask |= 1U << DTA_REG_RSI;
+            m->mem_write_addr_reg_mask |= 1U << DTA_REG_RDI;
         }
         //indirect jumps/calls/rets
         if (insn->id == X86_INS_RET) {

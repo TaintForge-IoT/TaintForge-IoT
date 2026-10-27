@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .network_policy import NetworkPolicy, NetworkServicePolicy
+from .dns_emulator import DNSStaticService
 
 
 class TCPFakeService:
@@ -263,33 +264,21 @@ async def run_network_emulator(
     policy: NetworkPolicy,
     log_dir: str | Path,
 ) -> None:
-    servers: list[asyncio.AbstractServer] = []
-
-    tcp_services = [
-        service
-        for service in policy.services
-        if service.service_type == "tcp"
-    ]
-
-    for service in tcp_services:
-        fake_service = TCPFakeService(
-            service=service,
-            log_dir=log_dir,
-            is_catch_all=False,
-        )
-
-        server = await fake_service.start()
-        servers.append(server)
-
-    if not servers:
-        print("[!] No known TCP services enabled")
-        return
-
-    print("[+] Known-service network emulator is running. Press Ctrl+C to stop.")
-
+    servers = []
     try:
-        await asyncio.gather(
-            *(server.serve_forever() for server in servers)
-        )
+        for service in policy.services:
+            if service.protocol_hint == "dns":
+                servers.append(await DNSStaticService(service, log_dir).start())
+            elif service.service_type == "tcp":
+                servers.append(await TCPFakeService(service, log_dir).start())
+        if not servers:
+            print("[!] No known services enabled")
+            return
+        print("[+] Known-service network emulator is running. Press Ctrl+C to stop.")
+        await asyncio.gather(*(server.serve_forever() for server in servers))
     except asyncio.CancelledError:
         pass
+    finally:
+        for server in servers:
+            server.close()
+        await asyncio.gather(*(server.wait_closed() for server in servers))

@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "local_revision": "6b99be177940a8ae20200ae6572e2a78a0c8cabe",
+  "github_revision": "3e74e480eea3e945786aa931690609afb81f5f24",
+  "source_files": {
+    "taintforge_env/phase1_runtime.py": "b98aa60144b0ffa5b1b116a4e21f96be96f8af2d016a5dc4277faf3c7e6f9093",
+    "taintforge_env/elf_target.py": "87c8257c869e7cd98c4f0f2aa54fd94af4d9cdbaf9e3e5c49906eac3e90bbd5f",
+    "taintforge_env/unified_runtime.py": "bc1bab5f5a020f4bff5b448565509408a237d854706197a64a6ee068217d2efd",
+    "taintforge_env/syscall_result.py": "faa0184a840389d4faa35c6a5881435fa1f3ebef789340794d00440d86f53536",
+    "taintforge_env/target_state_oracle.py": "e1201bb5d49c0cd129be9b2e889e5f319b79b0a54de9e94aae9c0cd2d5972f36"
+  },
+  "qemu_version": "11.0.1",
+  "plugin_api": 6,
+  "qemu_revision": "6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55",
+  "qemu_header_sha256": "9592f519d7344b1e38b0123b92c28c4e688faedf41263984910353736bb0b7be",
+  "github_comparison": {
+    "taintforge_env/phase1_runtime.py": "adds_optional_flags_receipt; reviewed_compatible",
+    "taintforge_env/unified_runtime.py": "different_or_absent",
+    "taintforge_env/syscall_result.py": "different_or_absent",
+    "taintforge_env/target_state_oracle.py": "different_or_absent"
+  },
+  "compatible_source_variants": {
+    "taintforge_env/phase1_runtime.py": [
+      "d310c66f0cde4f4d5ba55605da9eb885c59752d5d94415a6f8c5192d4d57e2ff"
+    ],
+    "taintforge_env/unified_runtime.py": [
+      "535be84c548990998755d1e510db0919f003a0e92e0927d8fb04e7aef5387afe",
+      "180b4b61f8c8dfc08df868f17f1f85a8cfaf738adc565fc16e5a8728fa525dfb"
+    ]
+  },
+  "source_note": "Local unified integration plus target_state_fix; GitHub also contains a compatible optional flags_receipt addition in Phase1Run. Neither source is overwritten. Unified lifecycle integration adds the reviewed fixture-owner bundle; Phase 1 remains unchanged."
+}

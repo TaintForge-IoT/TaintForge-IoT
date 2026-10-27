@@ -1,0 +1,39 @@
+{
+  "mode": "record",
+  "allow_internet": false,
+  "recording": {
+    "capture_kind": "local_test",
+    "run_id": "dns-udp-local",
+    "timeout_seconds": 5,
+    "quiet_seconds": 0.05,
+    "max_exchanges": 256,
+    "max_pending": 16
+  },
+  "catch_all": {"enabled": false},
+  "services": [
+    {
+      "service_type": "udp", "role": "dns", "protocol_hint": "dns",
+      "remote_ip": "198.51.100.53", "remote_port": 53, "domain": null,
+      "bind_ip": "127.0.0.1", "bind_port": 40530,
+      "upstream_ip": "127.0.0.1", "upstream_port": 5353
+    },
+    {
+      "service_type": "tcp", "role": "dns", "protocol_hint": "dns",
+      "remote_ip": "198.51.100.53", "remote_port": 53, "domain": null,
+      "bind_ip": "127.0.0.1", "bind_port": 40530,
+      "upstream_ip": "127.0.0.1", "upstream_port": 5353
+    },
+    {
+      "service_type": "tcp", "role": "c2", "protocol_hint": "c2_binary",
+      "remote_ip": "198.51.100.10", "remote_port": 48101, "domain": "c2.example",
+      "bind_ip": "127.0.0.1", "bind_port": 40531,
+      "upstream_ip": "127.0.0.1", "upstream_port": 48101
+    },
+    {
+      "service_type": "udp", "role": "c2", "protocol_hint": "udp",
+      "remote_ip": "198.51.100.10", "remote_port": 48102, "domain": "c2.example",
+      "bind_ip": "127.0.0.1", "bind_port": 40532,
+      "upstream_ip": "127.0.0.1", "upstream_port": 48102
+    }
+  ]
+}

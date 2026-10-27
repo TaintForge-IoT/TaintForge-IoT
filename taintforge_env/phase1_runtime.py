@@ -198,7 +198,8 @@ class Phase1Run:
             raise Phase1RuntimeError("Phase 1 event stream did not finish")
         return result
 
-    def verify(self, *, require_protected_channel: bool = False) -> dict[str, Any]:
+    def verify(self, *, require_protected_channel: bool = False,
+               recorded_directory: Path | None = None) -> dict[str, Any]:
         # No opt-in flag can manufacture channel isolation from this transport.
         if require_protected_channel:
             raise Phase1RuntimeError("protected evidence channel is unsupported by the regular-file QEMU-user adapter")
@@ -218,7 +219,8 @@ class Phase1Run:
                 continue
             path = self.paths[name]
             _regular(path, 1024 * 1024 * 1024)
-            if item.get("path") != str(path) or type(item.get("size")) is not int or item["size"] != path.stat().st_size or item.get("sha256") != digest(path):
+            recorded = path if recorded_directory is None else recorded_directory / path.name
+            if not recorded.is_absolute() or item.get("path") != str(recorded) or type(item.get("size")) is not int or item["size"] != path.stat().st_size or item.get("sha256") != digest(path):
                 raise Phase1RuntimeError(f"Phase 1 artifact integrity mismatch: {name}")
         events = self.events()
         if manifest.get("event_count") != len(events):

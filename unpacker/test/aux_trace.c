@@ -442,14 +442,14 @@ static const char *int80_register_issue(const TraceEntry *entry, const InsnAux *
         return "register_snapshot_missing";
     if (!s->post_eflags_valid || s->post_eflags != aux->eflags_before)
         return "preserved_flags_unverified";
-    if (aux->reg_vals[REG_RAX] != number || aux->reg_vals[REG_RBX] != s->args[0] ||
-        (argc >= 2 && aux->reg_vals[REG_RCX] != s->args[1]) ||
-        (argc >= 3 && aux->reg_vals[REG_RDX] != s->args[2]) ||
-        (argc >= 4 && aux->reg_vals[REG_RSI] != s->args[3]) ||
-        (argc >= 5 && aux->reg_vals[REG_RDI] != s->args[4]) ||
-        (argc >= 6 && aux->reg_vals[REG_RBP] != s->args[5]))
+    if (aux->reg_vals[DTA_REG_RAX] != number || aux->reg_vals[DTA_REG_RBX] != s->args[0] ||
+        (argc >= 2 && aux->reg_vals[DTA_REG_RCX] != s->args[1]) ||
+        (argc >= 3 && aux->reg_vals[DTA_REG_RDX] != s->args[2]) ||
+        (argc >= 4 && aux->reg_vals[DTA_REG_RSI] != s->args[3]) ||
+        (argc >= 5 && aux->reg_vals[DTA_REG_RDI] != s->args[4]) ||
+        (argc >= 6 && aux->reg_vals[DTA_REG_RBP] != s->args[5]))
         return "argument_mismatch";
-    if (s->post_regs[REG_RAX] != s->result)
+    if (s->post_regs[DTA_REG_RAX] != s->result)
         return "return_mismatch";
     if (number != 356 && number != 90 && number != 192 && number != 45 &&
         number != 4 && number != 5 && number != 85 && s->result &&
@@ -913,10 +913,10 @@ static bool observed_int80_return(const TraceEntry *entry, const InsnAux *before
         s->descriptor_id != entry->insn_desc_id || s->bytes_hash != entry->bytes_hash ||
         s->code_generation != entry->code_generation || s->vcpu_index != entry->vcpu_index ||
         ((before->eflags_before | after->eflags_before) & (UINT32_C(1) << 17)) != 0 ||
-        !(before->reg_value_valid_mask & (UINT32_C(1) << REG_RAX)) ||
-        !(after->reg_value_valid_mask & (UINT32_C(1) << REG_RAX)) ||
-        (uint32_t)before->reg_vals[REG_RAX] != s->number ||
-        (uint32_t)after->reg_vals[REG_RAX] != s->result)
+        !(before->reg_value_valid_mask & (UINT32_C(1) << DTA_REG_RAX)) ||
+        !(after->reg_value_valid_mask & (UINT32_C(1) << DTA_REG_RAX)) ||
+        (uint32_t)before->reg_vals[DTA_REG_RAX] != s->number ||
+        (uint32_t)after->reg_vals[DTA_REG_RAX] != s->result)
         return false;
     return true;
 }
@@ -1033,7 +1033,7 @@ void dse_aux_prepare_string(InsnAux *aux, const InsnMeta *meta) {
     summary->element_size = meta->string_element_size;
     summary->has_rep_prefix = meta->has_rep_prefix;
     summary->pattern_mismatch = false;
-    summary->expected_iterations = meta->has_rep_prefix ? (uint32_t)aux->reg_vals[REG_RCX] : 1U;
+    summary->expected_iterations = meta->has_rep_prefix ? (uint32_t)aux->reg_vals[DTA_REG_RCX] : 1U;
     summary->direction = 0;
     switch (meta->insn_id) {
     case X86_INS_MOVSB:
@@ -1051,14 +1051,14 @@ void dse_aux_prepare_string(InsnAux *aux, const InsnMeta *meta) {
     default:
         return;
     }
-    uint32_t required_registers = 1U << REG_RDI;
+    uint32_t required_registers = 1U << DTA_REG_RDI;
     if (summary->kind == DSE_STRING_MOVS) {
-        required_registers |= 1U << REG_RSI;
+        required_registers |= 1U << DTA_REG_RSI;
     } else {
-        required_registers |= 1U << REG_RAX;
+        required_registers |= 1U << DTA_REG_RAX;
     }
     if (summary->has_rep_prefix) {
-        required_registers |= 1U << REG_RCX;
+        required_registers |= 1U << DTA_REG_RCX;
     }
     if ((aux->reg_value_valid_mask & required_registers) != required_registers) {
         dse_aux_mark_string_mismatch(aux, "register-snapshot-incomplete", 0, required_registers,
@@ -1087,9 +1087,9 @@ bool dse_aux_capture_string_read(DseAuxRing *ring, InsnAux *aux, uint64_t addres
     uint32_t event_index = summary->read_events;
     if (event_index == 0) {
         summary->source_first = address;
-        if ((uint32_t)address != (uint32_t)aux->reg_vals[REG_RSI]) {
+        if ((uint32_t)address != (uint32_t)aux->reg_vals[DTA_REG_RSI]) {
             dse_aux_mark_string_mismatch(aux, "source-base", event_index,
-                                         (uint32_t)aux->reg_vals[REG_RSI], (uint32_t)address);
+                                         (uint32_t)aux->reg_vals[DTA_REG_RSI], (uint32_t)address);
         }
     } else {
         (void)dse_aux_validate_string_address(aux, "source-sequence", summary->source_first,
@@ -1126,9 +1126,9 @@ void dse_aux_capture_string_write(InsnAux *aux, uint64_t address, uint32_t size)
     uint32_t event_index = summary->write_events;
     if (event_index == 0) {
         summary->destination_first = address;
-        if ((uint32_t)address != (uint32_t)aux->reg_vals[REG_RDI]) {
+        if ((uint32_t)address != (uint32_t)aux->reg_vals[DTA_REG_RDI]) {
             dse_aux_mark_string_mismatch(aux, "destination-base", event_index,
-                                         (uint32_t)aux->reg_vals[REG_RDI], (uint32_t)address);
+                                         (uint32_t)aux->reg_vals[DTA_REG_RDI], (uint32_t)address);
         }
     } else {
         (void)dse_aux_validate_string_address(aux, "destination-sequence",
@@ -1195,12 +1195,12 @@ static bool dse_aux_resolve_string_post_state(InsnAux *aux, const uint64_t post_
                                      byte_count_64);
         return false;
     }
-    uint32_t required_registers = UINT32_C(1) << REG_RDI;
+    uint32_t required_registers = UINT32_C(1) << DTA_REG_RDI;
     if (summary->kind == DSE_STRING_MOVS) {
-        required_registers |= UINT32_C(1) << REG_RSI;
+        required_registers |= UINT32_C(1) << DTA_REG_RSI;
     }
     if (summary->has_rep_prefix) {
-        required_registers |= UINT32_C(1) << REG_RCX;
+        required_registers |= UINT32_C(1) << DTA_REG_RCX;
     }
     if ((aux->reg_value_valid_mask & required_registers) != required_registers) {
         dse_aux_mark_string_mismatch(aux, "pre-register-snapshot-incomplete", 0, required_registers,
@@ -1214,8 +1214,8 @@ static bool dse_aux_resolve_string_post_state(InsnAux *aux, const uint64_t post_
     }
 
     uint32_t byte_count = (uint32_t)byte_count_64;
-    uint32_t edi_before = (uint32_t)aux->reg_vals[REG_RDI];
-    uint32_t edi_after = (uint32_t)post_reg_vals[REG_RDI];
+    uint32_t edi_before = (uint32_t)aux->reg_vals[DTA_REG_RDI];
+    uint32_t edi_after = (uint32_t)post_reg_vals[DTA_REG_RDI];
     int8_t resolved_direction =
         dse_aux_direction_from_post_state(edi_before, edi_after, byte_count);
     if (resolved_direction == 0) {
@@ -1224,8 +1224,8 @@ static bool dse_aux_resolve_string_post_state(InsnAux *aux, const uint64_t post_
         return false;
     }
     if (summary->kind == DSE_STRING_MOVS) {
-        uint32_t esi_before = (uint32_t)aux->reg_vals[REG_RSI];
-        uint32_t esi_after = (uint32_t)post_reg_vals[REG_RSI];
+        uint32_t esi_before = (uint32_t)aux->reg_vals[DTA_REG_RSI];
+        uint32_t esi_after = (uint32_t)post_reg_vals[DTA_REG_RSI];
         int8_t source_direction =
             dse_aux_direction_from_post_state(esi_before, esi_after, byte_count);
         if (source_direction == 0) {
@@ -1247,9 +1247,9 @@ static bool dse_aux_resolve_string_post_state(InsnAux *aux, const uint64_t post_
         return false;
     }
     summary->direction = resolved_direction;
-    if (summary->has_rep_prefix && (uint32_t)post_reg_vals[REG_RCX] != 0) {
+    if (summary->has_rep_prefix && (uint32_t)post_reg_vals[DTA_REG_RCX] != 0) {
         dse_aux_mark_string_mismatch(aux, "rep-count-post-state", 0, 0,
-                                     (uint32_t)post_reg_vals[REG_RCX]);
+                                     (uint32_t)post_reg_vals[DTA_REG_RCX]);
         return false;
     }
     return true;

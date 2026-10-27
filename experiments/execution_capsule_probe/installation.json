@@ -1,0 +1,50 @@
+{
+  "repo": "/home/lisoon/taintforge",
+  "revision": "8d48587843dd30ba5ac97e2bb25f6d5c1801a2cb",
+  "reference_local_revision": "6b99be177940a8ae20200ae6572e2a78a0c8cabe",
+  "reference_github_revision": "3e74e480eea3e945786aa931690609afb81f5f24",
+  "files": {
+    "taintforge_env/phase1_runtime.py": {
+      "expected_sha256": "b98aa60144b0ffa5b1b116a4e21f96be96f8af2d016a5dc4277faf3c7e6f9093",
+      "actual_sha256": "d310c66f0cde4f4d5ba55605da9eb885c59752d5d94415a6f8c5192d4d57e2ff",
+      "accepted_sha256": [
+        "b98aa60144b0ffa5b1b116a4e21f96be96f8af2d016a5dc4277faf3c7e6f9093",
+        "d310c66f0cde4f4d5ba55605da9eb885c59752d5d94415a6f8c5192d4d57e2ff"
+      ],
+      "matches": true
+    },
+    "taintforge_env/elf_target.py": {
+      "expected_sha256": "87c8257c869e7cd98c4f0f2aa54fd94af4d9cdbaf9e3e5c49906eac3e90bbd5f",
+      "actual_sha256": "87c8257c869e7cd98c4f0f2aa54fd94af4d9cdbaf9e3e5c49906eac3e90bbd5f",
+      "accepted_sha256": [
+        "87c8257c869e7cd98c4f0f2aa54fd94af4d9cdbaf9e3e5c49906eac3e90bbd5f"
+      ],
+      "matches": true
+    },
+    "taintforge_env/unified_runtime.py": {
+      "expected_sha256": "bc1bab5f5a020f4bff5b448565509408a237d854706197a64a6ee068217d2efd",
+      "actual_sha256": "bc1bab5f5a020f4bff5b448565509408a237d854706197a64a6ee068217d2efd",
+      "accepted_sha256": [
+        "bc1bab5f5a020f4bff5b448565509408a237d854706197a64a6ee068217d2efd"
+      ],
+      "matches": true
+    },
+    "taintforge_env/syscall_result.py": {
+      "expected_sha256": "faa0184a840389d4faa35c6a5881435fa1f3ebef789340794d00440d86f53536",
+      "actual_sha256": "faa0184a840389d4faa35c6a5881435fa1f3ebef789340794d00440d86f53536",
+      "accepted_sha256": [
+        "faa0184a840389d4faa35c6a5881435fa1f3ebef789340794d00440d86f53536"
+      ],
+      "matches": true
+    },
+    "taintforge_env/target_state_oracle.py": {
+      "expected_sha256": "e1201bb5d49c0cd129be9b2e889e5f319b79b0a54de9e94aae9c0cd2d5972f36",
+      "actual_sha256": "e1201bb5d49c0cd129be9b2e889e5f319b79b0a54de9e94aae9c0cd2d5972f36",
+      "accepted_sha256": [
+        "e1201bb5d49c0cd129be9b2e889e5f319b79b0a54de9e94aae9c0cd2d5972f36"
+      ],
+      "matches": true
+    }
+  },
+  "compatible": true
+}

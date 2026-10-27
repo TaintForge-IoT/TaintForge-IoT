@@ -90,6 +90,49 @@ class TargetStateOracleTests(unittest.TestCase):
         self.assertTrue(result.reached)
         self.assertEqual(result.rules[0].observed_count, 3)
 
+    def test_legacy_success_inference_is_conservative_and_read_only(self) -> None:
+        cases = [
+            ({"return_value": 13, "errno": None}, True),
+            ({"return_value": 0, "errno": None}, True),
+            ({"result": "0x40805000", "return_value": None}, True),
+            ({"result": "-1 ENOSYS (Function not implemented)", "return_value": -1}, False),
+            ({"result": "-1 errno=111 (Connection refused)"}, False),
+            ({"return_value": -1, "errno": "EIO"}, False),
+            ({"return_value": -1, "errno": None}, None),
+            ({"return_value": None, "errno": None}, None),
+            ({"result": "?"}, None), ({}, None),
+            ({"return_value": True}, None), ({"return_value": "13"}, None),
+            ({"return_value": 13.0}, None),
+            ({"return_value": 13, "success": None}, None),
+            ({"return_value": 13, "success": False}, False),
+            ({"success": 1}, 1), ({"success": 0}, 0),
+            ({"event": "process_exit", "return_value": 0}, None),
+        ]
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                event = {"event": "syscall", "syscall": "write", "execution_context": "guest", **fields}
+                self.write_jsonl("syscall_events.jsonl", [event])
+                source = self.root / "logs/syscall_events.jsonl"
+                before = source.read_bytes()
+                for success in (True, False):
+                    spec = self.spec([{"id": "write", "type": "event_count", "source": "syscall",
+                                       "where": {"syscall": "write", "success": success}}])
+                    result = TargetStateOracle().evaluate(self.root, spec)
+                    self.assertEqual(result.reached, expected is success)
+                self.assertEqual(source.read_bytes(), before)
+
+    def test_repeated_sequence_normalizes_legacy_results(self) -> None:
+        self.write_jsonl("syscall_events.jsonl", [
+            {"execution_context": "guest", "syscall": "write", "result": "13"},
+            {"execution_context": "host_wrapper", "syscall": "write", "result": "13"},
+            {"execution_context": "guest", "syscall": "close", "return_value": 0},
+        ])
+        spec = self.spec([{"id": "sequence", "type": "repeated_sequence", "source": "syscall",
+                           "sequence": [{"syscall": "write", "success": True},
+                                        {"syscall": "close", "success": True}],
+                           "min_repeats": 1, "max_gap": 0}])
+        self.assertTrue(TargetStateOracle().evaluate(self.root, spec).reached)
+
     def test_sequence_does_not_match_when_gap_exceeds_limit(self) -> None:
         self.write_jsonl(
             "syscall_events.jsonl",

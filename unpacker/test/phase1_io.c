@@ -310,12 +310,13 @@ bool tf_phase1_start(TfPhase1Io *io, const char *target, bool system, unsigned a
         "\"ir_enabled\":%s,\"runtime_load\":\"observed\",\"register_observation\":\"pending\","
         "\"max_guest_processes\":1,\"max_guest_threads\":1,\"event_schema\":1,\"report_schema\":1,"
         "\"checkpoint\":\"unsupported\",\"external_memory_write\":\"unsupported\","
-        "\"provenance_export\":\"unsupported\",\"analysis_detach\":\"unsupported\","
+        "\"provenance_export\":\"unsupported\",\"analysis_detach\":\"%s\","
         "\"control_channel_protection\":\"unverified\",\"capture_scope\":\"tracked_program_pages\","
         "\"event_transport\":\"regular_file\",\"callback_storage_io\":\"synchronous\","
         "\"ir_match_scope\":\"selected_trace_window_only\",\"oep_policy\":\"heuristic_candidate\"}",
         TF_PHASE1_BUILD_ID, qtarget, system ? "system" : "linux-user", api,
-        flags ? "taintforge_x86_flags_v1" : "unverified", ir ? "true" : "false");
+        flags ? "taintforge_x86_flags_v1" : "unverified", ir ? "true" : "false",
+        io->retirement_enabled ? "cooperative-controlled-v1" : "disabled");
     bool written = tf_phase1_event(io, "analysis_started", reason ? "unsupported" : "observing",
                                    reason, payload);
     g_free(qtarget);
@@ -324,8 +325,9 @@ bool tf_phase1_start(TfPhase1Io *io, const char *target, bool system, unsigned a
 }
 
 bool tf_phase1_active(const TfPhase1Io *io) {
-    return !io->enabled ||
-           (getpid() == io->owner && !__atomic_load_n(&io->profile_lost, __ATOMIC_ACQUIRE));
+    return !__atomic_load_n(&io->quiesced, __ATOMIC_ACQUIRE) &&
+           (!io->enabled ||
+            (getpid() == io->owner && !__atomic_load_n(&io->profile_lost, __ATOMIC_ACQUIRE)));
 }
 
 void tf_phase1_profile_lost(TfPhase1Io *io, const char *reason) {

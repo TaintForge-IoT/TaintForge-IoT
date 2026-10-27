@@ -107,7 +107,7 @@ class RequirementExtractor:
 
         self._extract_syscall_requirements(syscall_events)
         self._extract_network_requirements(bundle.network_events)
-        self._extract_loader_requirements(bundle.stderr_text)
+        self._extract_loader_requirements(bundle.iter_stderr_lines())
         self._extract_rootfs_requirements(bundle.rootfs_diff)
 
         requirements = tuple(
@@ -206,6 +206,39 @@ class RequirementExtractor:
                         errno=errno,
                         evidence=self._syscall_evidence(event, index),
                         details={"transport": "tcp"},
+                    )
+                else:
+                    # QEMU may print only a sockaddr pointer. Keep the failure
+                    # without inventing a destination or assuming TCP: connect
+                    # is also used with datagram and Unix-domain sockets.
+                    details = {
+                        "endpoint_resolution": "unresolved",
+                        "transport": "unknown",
+                        "missing_endpoint_fields": ",".join(
+                            key for key, value in (("remote_ip", remote_ip), ("remote_port", remote_port))
+                            if value is None
+                        ),
+                    }
+                    for key, value in (("remote_ip", remote_ip), ("remote_port", remote_port)):
+                        if value is not None:
+                            details[key] = str(value)
+                    for key in ("pid", "source_file", "line_number"):
+                        value = self._optional_string(event.get(key))
+                        if value is not None:
+                            details[key] = value
+                    self._add(
+                        kind=RequirementKind.NETWORK,
+                        # This identifies an observation, not a network address.
+                        # Do not merge unknown destinations across calls/PIDs.
+                        resource=f"unresolved-connect-event-{index}",
+                        operation="connect",
+                        status=RequirementStatus.UNMET,
+                        blocking=self._blocking_after(events, index),
+                        confidence=1.0,
+                        repairable=False,
+                        errno=errno,
+                        evidence=self._syscall_evidence(event, index),
+                        details=details,
                     )
 
     def _extract_path_event(
@@ -452,8 +485,9 @@ class RequirementExtractor:
                     },
                 )
 
-    def _extract_loader_requirements(self, stderr_text: str) -> None:
-        for line_index, line in enumerate(stderr_text.splitlines()):
+    def _extract_loader_requirements(self, stderr_lines: Iterable[str]) -> None:
+        for line_index, line in enumerate(stderr_lines):
+            line = line.rstrip("\r\n")
             for pattern in LIBRARY_PATTERNS:
                 match = pattern.search(line)
                 if match is None:

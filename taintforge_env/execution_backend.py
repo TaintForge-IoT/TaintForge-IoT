@@ -24,6 +24,7 @@ class ExecutionBackendError(RuntimeError):
 class ExecutionBackendKind(StrEnum):
     NATIVE = "native"
     QEMU_USER = "qemu_user"
+    QEMU_PLUGIN = "qemu_plugin"
 
 
 class TraceBackend(StrEnum):
@@ -57,10 +58,12 @@ class ExecutionPlan:
     qemu_host_sha256: str | None = None
     qemu_guest_path: str | None = None
     legacy_qemu_guest_path: str | None = None
+    analyzer_bundle_path: str | None = None
+    analyzer_bundle_sha256: str | None = None
 
     @property
     def qemu_required(self) -> bool:
-        return self.backend == ExecutionBackendKind.QEMU_USER
+        return self.backend in {ExecutionBackendKind.QEMU_USER, ExecutionBackendKind.QEMU_PLUGIN}
 
     @property
     def trace_filename(self) -> str:
@@ -145,6 +148,33 @@ class ExecutionBackendResolver:
                 "guest dynamic interpreter is missing from the execution "
                 f"rootfs: {target.interpreter}"
             )
+
+        if "phase1" in runtime:
+            from .elf_runtime import in_sysroot
+            from .unified_runtime import verify_bundle
+            try:
+                config = runtime["phase1"]
+                if not isinstance(config, dict) or not isinstance(config.get("bundle_path"), str) or not isinstance(config.get("bundle_sha256"), str):
+                    raise ExecutionBackendError("phase1 requires a bound analyzer runtime bundle")
+                bundle = Path(config["bundle_path"])
+                if not bundle.is_absolute() or bundle.resolve() != bundle:
+                    raise ExecutionBackendError("analyzer bundle path must be absolute and canonical")
+                manifest = verify_bundle(bundle, config["bundle_sha256"])
+                if target.arch != "i386" or manifest["host_arch"] != self.host_arch:
+                    raise ExecutionBackendError("Phase 1 v1 requires an i386 guest and a matching host analyzer bundle")
+                if _sha256_file(in_sysroot(root, guest_binary)) != target.sha256:
+                    raise ExecutionBackendError("guest launch ELF differs from the bound original binary")
+                if (root / _RESERVED_INTERNAL_DIR.lstrip("/")).exists() or (root / _RESERVED_INTERNAL_DIR.lstrip("/")).is_symlink():
+                    raise ExecutionBackendError("execution rootfs contains reserved runner path /__taintforge")
+                qemu = bundle / manifest["qemu"]
+                return ExecutionPlan(backend=ExecutionBackendKind.QEMU_PLUGIN,
+                    trace_backend=TraceBackend.QEMU_STRACE, host_arch=self.host_arch,
+                    target=target, guest_binary=guest_binary, guest_interpreter=target.interpreter,
+                    qemu_binary_name="qemu-i386", qemu_host_path=str(qemu),
+                    qemu_host_sha256=_sha256_file(qemu), qemu_guest_path="/__taintforge/bin/qemu-i386",
+                    analyzer_bundle_path=str(bundle), analyzer_bundle_sha256=manifest["bundle_sha256"])
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise ExecutionBackendError(f"invalid Phase 1 execution backend: {exc}") from exc
 
         native_compatible = _native_compatible(
             self.host_arch,

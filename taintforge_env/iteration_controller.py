@@ -23,6 +23,7 @@ from .attempt import (
     AttemptValidationError,
     ExecutionStage,
     RunPurpose,
+    StageTransition,
     make_failure_fingerprint,
 )
 from .environment_manifest import (
@@ -630,6 +631,7 @@ class IterationController:
         goal_reason: str | None = None,
         guest_exit_code: int | None = None,
         timed_out: bool = False,
+        stage_transitions: tuple[StageTransition, ...] = (),
     ) -> IterationRecord:
         with self._locked():
             manifest = self.load()
@@ -651,6 +653,11 @@ class IterationController:
             except AttemptValidationError as exc:
                 raise IterationControllerError(str(exc)) from exc
             self._validate_contract_binding(manifest, record, contract)
+            stage = contract.initial_stage
+            for sequence, transition in enumerate(stage_transitions):
+                if not isinstance(transition, StageTransition) or transition.sequence != sequence or transition.from_stage != stage:
+                    raise IterationControllerError("attempt stage transitions do not form a contiguous bound history")
+                stage = transition.to_stage
             _validate_execution_claim_for_completion(
                 iteration_dir,
                 session_id=manifest.session_id,
@@ -721,6 +728,7 @@ class IterationController:
                 repair_plan_path=target_artifacts / "repair_plan.json",
                 guest_exit_code=guest_exit_code,
                 timed_out=timed_out,
+                stage_transitions=stage_transitions,
             )
             try:
                 attempt_result_path = AttemptStore(
@@ -1075,6 +1083,7 @@ def _build_attempt_result(
     repair_plan_path: Path,
     guest_exit_code: int | None,
     timed_out: bool,
+    stage_transitions: tuple[StageTransition, ...] = (),
 ) -> AttemptResult:
     if guest_exit_code is not None and (
         not isinstance(guest_exit_code, int) or isinstance(guest_exit_code, bool)
@@ -1105,7 +1114,7 @@ def _build_attempt_result(
     }:
         failure_fingerprint = make_failure_fingerprint(
             outcome=outcome,
-            stage=contract.initial_stage,
+            stage=stage_transitions[-1].to_stage if stage_transitions else contract.initial_stage,
             exit_code=guest_exit_code,
             error_code=error_code,
             blocking_resource=_first_automatic_repair_resource(
@@ -1118,14 +1127,14 @@ def _build_attempt_result(
         contract_sha256=contract.contract_sha256,
         outcome=outcome,
         initial_stage=contract.initial_stage,
-        final_stage=contract.initial_stage,
+        final_stage=stage_transitions[-1].to_stage if stage_transitions else contract.initial_stage,
         progress=AttemptProgress(
             goal_reached=observation.goal_reached,
             oracle_reason=observation.goal_reason,
             guest_events_total=observation.metrics.guest_events_total,
             observation_sha256=_sha256_file(observation_path),
         ),
-        transitions=(),
+        transitions=stage_transitions,
         failure_fingerprint=failure_fingerprint,
         started_at_utc=contract.created_at_utc,
         finished_at_utc=datetime.now(timezone.utc).isoformat(),
