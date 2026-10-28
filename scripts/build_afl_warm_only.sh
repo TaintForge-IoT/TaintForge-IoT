@@ -11,15 +11,23 @@ tf_build_out=$(mktemp -d "$PWD/workdir/afl-warm-build.XXXXXXXX")
 printf 'Build directory: %s\n' "$tf_build_out"
 trap 'printf "Build stopped. Logs: %s\n" "$tf_build_out" >&2' ERR
 
+tf_build_prefix=${TF_WARM_QEMU_PREFIX:-$HOME/.local/opt/taintforge/qemu-11.0.1-warm}
 bash scripts/build_afl_warm_qemu.sh \
     "${TF_WARM_QEMU_SOURCE:-$HOME/.cache/taintforge/qemu-11.0.1-warm-source}" \
-    "${TF_WARM_QEMU_PREFIX:-$HOME/.local/opt/taintforge/qemu-11.0.1-warm}" \
+    "$tf_build_prefix" \
     2>&1 | tee "$tf_build_out/qemu-build.log"
 
-export TF_QEMU_INCLUDE="$PWD/experiments/execution_capsule_probe/vendor"
-bash unpacker/test/build_group7_4c1_plugin.sh \
-    unpacker/test "$tf_build_out/libtaintforge_ir.so" \
-    2>&1 | tee "$tf_build_out/phase1-build.log"
+tf_build_prefix=$(realpath -- "$tf_build_prefix")
+source "$tf_build_prefix/share/taintforge/environment.sh"
+cp -- "$TF_PHASE1_PLUGIN" "$tf_build_out/libtaintforge_ir.so"
+cp -- "$TF_PHASE1_PLUGIN.runtime.json" "$tf_build_out/libtaintforge_ir.so.runtime.json"
+python3 -B - "$tf_build_out/libtaintforge_ir.so" <<'PY' 2>&1 | tee "$tf_build_out/phase1-build.log"
+from pathlib import Path
+import sys
+from taintforge_env.phase1_runtime import Phase1Runtime
+runtime = Phase1Runtime.load(Path(sys.argv[1]))
+print('Reused calibrated Phase 1 plugin:', runtime.plugin)
+PY
 
 python3 - "$tf_build_out" <<'PY' 2>&1 | tee "$tf_build_out/native-build.log"
 import json

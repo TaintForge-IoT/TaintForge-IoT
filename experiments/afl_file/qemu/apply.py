@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or repair the private warm-fork ABI in a pinned QEMU 11.0.1 tree."""
+"""Install the warm-fork ABI and x86 plugin EFLAGS fix in pinned QEMU 11.0.1."""
 import argparse
 import hashlib
 import os
@@ -13,6 +13,55 @@ BASELINES = {
     'linux-user/syscall_defs.h': '850be5489422d063ea1d213f9a31b66130b4f72445b1bc893b01d750fccbb359',
     'linux-user/strace.c': '8c470c56124e23606edd089606d69d778d7d1db10db2e91e9c82e602f50bd592',
     'include/plugins/qemu-plugin.h': '9592f519d7344b1e38b0123b92c28c4e688faedf41263984910353736bb0b7be',
+    'target/i386/cpu.h': 'e4161376ce7f839b51aac81abb6b01830593d0729dfd7a7e27a4789259c72c63',
+    'target/i386/gdbstub.c': '19e432e4fdaf50212a8c66c0cc3770960380b80d364bc165d1c6d55a4da9f4b2',
+    'target/i386/tcg/tcg-cpu.c': '7ae34b79e3d7d0f6448cfc213830b31a0d5a33adf975c41e9bcac913658d568e',
+    'target/i386/tcg/translate.c': '491e6023ddaf370a0428b44558ec6a50977d756fda0837fac9bc092970a25c5a',
+}
+# Backport of upstream e7ae490e0cf8c712fad6e39984a57a14e9cc400f.
+# Keep this host execution marker outside migratable CPUX86State.
+EFLAGS_REPLACEMENTS = {
+    'target/i386/cpu.h': ((b'    CPUX86State env;\n',
+        b'    CPUX86State env;\n    bool eflags_in_tcg;\n'),),
+    'target/i386/gdbstub.c': ((b'        case IDX_FLAGS_REG:\n'
+        b'            return gdb_get_reg32(mem_buf, env->eflags);\n',
+        b'        case IDX_FLAGS_REG:\n'
+        b'            if (cpu->eflags_in_tcg) {\n'
+        b'                return gdb_get_reg32(mem_buf, cpu_compute_eflags(env));\n'
+        b'            }\n'
+        b'            return gdb_get_reg32(mem_buf, env->eflags);\n'),),
+    'target/i386/tcg/tcg-cpu.c': (
+        (b'    env->eflags &= ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);\n',
+         b'    env->eflags &= ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);\n'
+         b'    cpu->eflags_in_tcg = true;\n'),
+        (b'    env->eflags = cpu_compute_eflags(env);\n',
+         b'    env->eflags = cpu_compute_eflags(env);\n    cpu->eflags_in_tcg = false;\n')),
+    'target/i386/tcg/translate.c': ((b'    dc->prev_insn_start = dc->base.insn_start;\n',
+        b'    if (dcbase->plugin_enabled) {\n'
+        b'        gen_update_cc_op(dc);\n'
+        b'    }\n'
+        b'    dc->prev_insn_start = dc->base.insn_start;\n'),),
+}
+# The previously delivered standalone flags patch is admitted exactly, then
+# upgraded to the upstream placement and callback ordering above.
+LEGACY_EFLAGS_REPLACEMENTS = {
+    'target/i386/cpu.h': ((b'                        stored elsewhere */\n',
+        b'                        stored elsewhere */\n'
+        b'    bool eflags_in_tcg; /* CC and DF currently use the TCG representation. */\n'),),
+    'target/i386/gdbstub.c': ((b'            return gdb_get_reg32(mem_buf, env->eflags);\n',
+        b'            return gdb_get_reg32(mem_buf, env->eflags_in_tcg ?\n'
+        b'                                 cpu_compute_eflags(env) : env->eflags);\n'),),
+    'target/i386/tcg/tcg-cpu.c': (
+        (b'    env->eflags &= ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);\n',
+         b'    env->eflags &= ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);\n'
+         b'    env->eflags_in_tcg = true;\n'),
+        (b'    env->eflags = cpu_compute_eflags(env);\n',
+         b'    env->eflags = cpu_compute_eflags(env);\n    env->eflags_in_tcg = false;\n')),
+    'target/i386/tcg/translate.c': ((b'    tcg_gen_insn_start(pc_arg, dc->cc_op, 0);\n',
+        b'    if (dc->base.plugin_enabled) {\n'
+        b'        gen_update_cc_op(dc);\n'
+        b'    }\n'
+        b'    tcg_gen_insn_start(pc_arg, dc->cc_op, 0);\n'),),
 }
 INCLUDE = b'#include "tf-warm.h"\n\n'
 HOOK = b'    tf_warm_syscall(num, arg1, arg2);\n'
@@ -52,6 +101,22 @@ def read_regular(root, name):
     return path.read_bytes() if path.exists() else None
 
 
+def flags_source(name, original):
+    baseline = original
+    for replacements in (EFLAGS_REPLACEMENTS[name], LEGACY_EFLAGS_REPLACEMENTS[name]):
+        for before, after in reversed(replacements):
+            baseline = baseline.replace(after, before)
+    variants = []
+    for replacements in (EFLAGS_REPLACEMENTS[name], LEGACY_EFLAGS_REPLACEMENTS[name]):
+        variant = baseline
+        for before, after in replacements:
+            if variant.count(before) != 1:
+                raise ValueError('EFLAGS insertion point changed: ' + name)
+            variant = variant.replace(before, after, 1)
+        variants.append(variant)
+    return baseline, variants[0], (baseline, *variants)
+
+
 def changes(root):
     root = Path(root).resolve(strict=True)
     version = read_regular(root, 'VERSION')
@@ -62,7 +127,9 @@ def changes(root):
         original = read_regular(root, name)
         if original is None:
             raise ValueError('Missing QEMU source: ' + name)
-        if name == 'include/plugins/qemu-plugin.h':
+        if name in EFLAGS_REPLACEMENTS:
+            baseline, desired, accepted = flags_source(name, original)
+        elif name == 'include/plugins/qemu-plugin.h':
             baseline = original.replace(DECLARATIONS, b'')
             if baseline.count(API_END) != 1:
                 raise ValueError('Plugin API insertion point changed')

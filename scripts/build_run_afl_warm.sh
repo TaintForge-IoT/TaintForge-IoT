@@ -9,7 +9,14 @@ tf_warm_qemu=$(realpath -- "$1")
 tf_warm_output=$(realpath -m -- "$2")
 tf_warm_afl_bin=$(realpath -- "$3")
 mkdir -- "$tf_warm_output"
-export TF_QEMU_INCLUDE="$PWD/experiments/execution_capsule_probe/vendor"
+if [[ -z ${TF_QEMU_INCLUDE:-} ]]; then
+    tf_warm_installed_sdk="$(dirname -- "$tf_warm_qemu")/../include/taintforge"
+    if [[ -f "$tf_warm_installed_sdk/qemu-plugin.h" ]]; then
+        export TF_QEMU_INCLUDE=$(realpath -- "$tf_warm_installed_sdk")
+    else
+        export TF_QEMU_INCLUDE="$PWD/experiments/execution_capsule_probe/vendor"
+    fi
+fi
 export TF_OBSERVER_QEMU="$tf_warm_qemu"
 export TF_WARM_QEMU="$tf_warm_qemu"
 export TF_AFL_BIN="$tf_warm_afl_bin"
