@@ -2128,15 +2128,11 @@ static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t v
 			}
 		}
 	} else if (meta && meta->insn_id == X86_INS_LEAVE) {	
-		RegSlice ebp_slice = reg_slice_from_x86(X86_REG_EBP, 4);
-		RegSlice esp_slice = reg_slice_from_x86(X86_REG_ESP, 4);
-		ProvLabelId old_ebp_labels[4];
-		bool leave_valid = size == 4 && effective_labels_valid && reg_slice_is_valid(ebp_slice) && reg_slice_is_valid(esp_slice) && 
-			reg_slice_load_labels(&transfer->pre_regs, ebp_slice, old_ebp_labels);
-		if (leave_valid) {
-			(void)reg_slice_store_labels(regs, esp_slice, old_ebp_labels, 4, vcpu_state->current_ip);
-			(void)reg_slice_store_labels(regs, ebp_slice, effective_labels, 4, vcpu_state->current_ip);
-		} else {
+		bool leave_valid = size == 4 && context_valid && effective_labels_valid &&
+			dta_apply_leave32_labels(regs, &transfer->pre_regs, effective_labels, vcpu_state->current_ip);
+		if (!leave_valid) {
+			RegSlice ebp_slice = reg_slice_from_x86(X86_REG_EBP, 4);
+			RegSlice esp_slice = reg_slice_from_x86(X86_REG_ESP, 4);
 			ProvLabelId incomplete= dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
 			if (reg_slice_is_valid(esp_slice)) {
 				(void)reg_slice_set_label(regs, esp_slice, incomplete, vcpu_state->current_ip);

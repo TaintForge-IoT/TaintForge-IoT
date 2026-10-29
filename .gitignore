@@ -2,6 +2,15 @@ __pycache__/
 *.py[cod]
 /build/
 /workdir/
+/unpacker/oep-smt.*/
+/unpacker/oep-audit.*/
+/unpacker/oep-rebuild.*/
+/unpacker/oep-run.*/
+/unpacker/unpack-new.*/
+/unpacker/unpack-build.*/
+/unpacker/unpack-matrix.*/
+/unpacker/unpack-proof.*/
+/unpacker/unpack-proof-matrix.*/
 *.so
 .pytest_cache/
 .taintforge-backups/

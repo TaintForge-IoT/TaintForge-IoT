@@ -222,6 +222,8 @@ def run_campaign(root, *, afl_bin=None, seconds=300, executions=None):
         env = {k: os.environ[k] for k in ('PATH', 'LD_LIBRARY_PATH') if k in os.environ}
         env.update(AFL_NO_UI='1', AFL_NO_AFFINITY='1', AFL_SKIP_CPUFREQ='1',
                    AFL_FAST_CAL='1', AFL_MAP_SIZE=str(f.MAP_SIZE))
+        if os.environ.get('AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES') == '1':
+            env['AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES'] = '1'
         signals = []
         process = None
         def stopped(number, frame):

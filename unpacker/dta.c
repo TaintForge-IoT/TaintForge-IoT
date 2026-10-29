@@ -1305,6 +1305,27 @@ static bool prefix_dependency_labels(const RegShadow *pre_regs, const ProvLabelI
 	return true;
 }
 
+bool dta_apply_leave32_labels(RegShadow *regs, const RegShadow *pre_regs,
+		const ProvLabelId *popped_labels, uint64_t ip) {
+	if (!reg_shadow_compatible(regs, pre_regs) || !label_array_is_valid(pre_regs, popped_labels, 4)) {
+		return false;
+	}
+	RegShadow before = *pre_regs;
+	RegShadow updated = *regs;
+	RegSlice ebp = reg_slice_from_x86(X86_REG_EBP, 4);
+	RegSlice esp = reg_slice_from_x86(X86_REG_ESP, 4);
+	ProvLabelId frame[4], stack[4];
+	/* LEAVE ends with ESP = old EBP + 4; carries preserve lower-byte dependencies. */
+	if (!reg_slice_load_labels(&before, ebp, frame) || !label_array_is_valid(&before, frame, 4) ||
+			!prefix_dependency_labels(&before, frame, 4, stack) ||
+			!reg_slice_store_labels(&updated, esp, stack, 4, ip) ||
+			!reg_slice_store_labels(&updated, ebp, popped_labels, 4, ip)) {
+		return false;
+	}
+	*regs = updated;
+	return true;
+}
+
 static ProvLabelId join_known_inputs(const RegShadow *pre_regs, const InsnMeta *meta, const ProvLabelId *extra, uint8_t extra_count) {
 	ProvLabelId joined = meta_read_state_join(pre_regs, meta);
 	if (joined == PROV_LABEL_ID_INVALID) joined = PROV_LABEL_CLEAN;

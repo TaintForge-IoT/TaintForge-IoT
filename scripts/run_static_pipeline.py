@@ -39,6 +39,7 @@ import sys
 import tempfile
 import textwrap
 import uuid
+import zipfile
 
 from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1RuntimeError
 from dataclasses import dataclass
@@ -824,6 +825,133 @@ def load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def oep_certificate_reference(
+    path: Path, *, sample_sha256: str, candidate: Any
+) -> dict[str, Any]:
+    """Import an offline certificate as a reference, never as this run's proof."""
+    path = path.expanduser()
+    if path.is_symlink() or not path.is_file():
+        raise PipelineError("OEP certificate must be a regular file")
+    with path.open("rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise PipelineError("OEP certificate exceeds 1 MiB")
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key: {key}")
+            value[key] = item
+        return value
+
+    def invalid_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    try:
+        certificate = json.loads(raw.decode("utf-8"), object_pairs_hook=object_pairs,
+                                 parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise PipelineError(f"Invalid OEP certificate JSON: {exc}") from exc
+    if (not isinstance(certificate, dict)
+            or type(certificate.get("schema_version")) is not int
+            or certificate["schema_version"] != 1
+            or certificate.get("status") not in (
+                "VERIFIED_RESTORED_ENTRY_UNDER_EXPLICIT_PREMISES",
+                "CONFIRMED_REFERENCE_ENTRY_FOR_OBSERVED_RUN_UNDER_TRUSTED_MODELS")
+            or certificate.get("restored_image_entry_verified_under_premises") is not True
+            or certificate.get("oep_proof") != "NOT_ESTABLISHED"):
+        raise PipelineError("Unsupported OEP reference certificate schema or scope")
+    if (certificate["status"] == "CONFIRMED_REFERENCE_ENTRY_FOR_OBSERVED_RUN_UNDER_TRUSTED_MODELS"
+            and certificate.get("oep_confirmed_for_observed_run_under_trusted_models") is not True):
+        raise PipelineError("Unsupported OEP reference certificate observed-run confirmation")
+    required_false = (
+        "original_prepack_OEP_independently_established", "independent_OS_entry_origins_proven",
+        "kernel_implementation_verified", "guest_permissions_independently_observed",
+        "unconditional_oep_proven", "historical_certificates_upgraded",
+        "target_instruction_executed", "checkpoint_used_as_seed",
+    )
+    optional_false = ("oep_proven", "whole_program_oep_proven", "fuzzing_ready", "process_checkpoint",
+                      "applies_to_current_run", "current_run_binding_verified")
+    if (any(certificate.get(key) is not False for key in required_false)
+            or any(key in certificate and certificate[key] is not False for key in optional_false)):
+        raise PipelineError("OEP reference certificate promotes unsupported proof scope")
+    source = certificate.get("source_elf_sha256")
+    target = certificate.get("payload_entry")
+    if (not isinstance(source, str) or len(source) != 64
+            or any(char not in "0123456789abcdef" for char in source)
+            or type(target) is not int or not 0 <= target <= 0xffffffff
+            or not isinstance(certificate.get("conditions"), list) or not certificate["conditions"]
+            or not isinstance(certificate.get("open_obligations"), list) or not certificate["open_obligations"]):
+        raise PipelineError("Invalid OEP reference identity or premise fields")
+    try:
+        current_target = int(candidate, 0) if isinstance(candidate, str) else candidate
+    except ValueError:
+        current_target = None
+    return {
+        "status": "REFERENCE_ONLY", "certificate_path": str(path.resolve()),
+        "certificate_sha256": hashlib.sha256(raw).hexdigest(),
+        "certificate_status": certificate["status"], "source_elf_sha256": source,
+        "payload_entry": target, "sample_sha256_matches": source == sample_sha256,
+        "candidate_address_matches": type(current_target) is int and current_target == target,
+        "current_run_binding_verified": False, "applies_to_current_run": False,
+        "oep_proven": False, "process_checkpoint": False, "fuzzing_ready": False,
+        "oep_proof": "NOT_ESTABLISHED",
+        "scope": "Offline reference only; this import verifies no current Phase 1 execution or snapshot binding.",
+    }
+
+
+def oep_proof_reference(
+    path: Path, *, sample_sha256: str, candidate: Any
+) -> dict[str, Any]:
+    """Audit recorded proof receipts without binding a fresh pipeline execution."""
+    try:
+        from unpacker.oep_audit import audit_evidence
+
+        audited = audit_evidence(path.expanduser())
+    except (ImportError, ValueError, OSError, KeyError, TypeError, RecursionError,
+            zipfile.BadZipFile) as exc:
+        raise PipelineError(f"Invalid OEP proof evidence: {exc}") from exc
+    if (not isinstance(audited, dict)
+            or type(audited.get("schema_version")) is not int
+            or audited["schema_version"] != 1
+            or audited.get("status") != "SMT_REFERENCE_RECEIPTS_AUDITED"):
+        raise PipelineError("Unsupported OEP proof audit status or schema")
+    source, target = audited.get("source_elf_sha256"), audited.get("entry")
+    if (not isinstance(source, str) or len(source) != 64
+            or any(char not in "0123456789abcdef" for char in source)
+            or type(target) is not int or not 0 <= target <= 0xffffffff
+            or audited.get("certificate_status") != "SMT_PROVED_REFERENCE_OEP_FOR_SELECTED_EXECUTION"
+            or audited.get("oep_proof") != "SMT_SELECTED_EXECUTION_TO_REFERENCE_OEP_UNDER_TRUSTED_MODELS"):
+        raise PipelineError("Invalid OEP proof audit identity or recorded scope")
+    false_scope = (
+        "unconditional_oep_proven", "current_run_binding_verified", "applies_to_current_run",
+        "solver_results_recomputed", "proof_results_recomputed", "fuzzing_ready",
+        "oep_proven", "process_checkpoint",
+    )
+    if any(key in audited and audited[key] is not False for key in false_scope):
+        raise PipelineError("OEP proof audit promotes unsupported current-run or proof scope")
+    try:
+        current_target = int(candidate, 0) if isinstance(candidate, str) else candidate
+    except ValueError:
+        current_target = None
+    return {
+        **audited,
+        "proof_reference_path": str(path.expanduser().resolve()),
+        "payload_entry": target,
+        "sample_sha256_matches": source == sample_sha256,
+        "candidate_address_matches": type(current_target) is int and current_target == target,
+        "current_run_binding_verified": False, "applies_to_current_run": False,
+        "oep_proven": False, "process_checkpoint": False, "fuzzing_ready": False,
+        "solver_results_recomputed": False, "proof_results_recomputed": False,
+        "recorded_solver_results_trusted": True,
+        "reference_scope": (
+            "Offline recorded SMT proof receipts; this audit verifies no current "
+            "Phase 1 execution or snapshot binding."
+        ),
+    }
+
+
 def tcp_dependency_ports(phase2_payload: dict[str, Any]) -> list[int]:
     ports: set[int] = set()
 
@@ -1151,6 +1279,7 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         f"- Raw metadata: `{phase1.get('unpacked_json')}`",
         f"- Raw memory dump: `{phase1.get('unpacked_bin')}`",
         f"- OEP recorded by Phase 1: `{phase1.get('oep')}`",
+        f"- Imported OEP certificate: `{phase1.get('oep_verification', {}).get('status', 'not_requested')}`",
         f"- Dumped regions: `{phase1.get('regions')}`",
         f"- File dependencies: `{phase1.get('file_dependencies')}`",
         f"- Network events: `{phase1.get('network_events')}`",
@@ -1207,6 +1336,19 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         "## Current Limitations",
         "",
     ]
+
+    imported_proof = phase1.get("oep_verification", {})
+    if imported_proof.get("status") == "SMT_REFERENCE_RECEIPTS_AUDITED":
+        position = lines.index("## Compatibility Bridge") - 1
+        lines[position:position] = [
+            f"- Recorded reference OEP: `{hex(imported_proof['payload_entry'])}`",
+            f"- Recorded proof status: `{imported_proof['certificate_status']}`",
+            f"- Recorded proof: `{imported_proof['oep_proof']}`",
+            f"- Imported proof scope: {imported_proof['reference_scope']}",
+            f"- Current Phase 1 binding verified: `{imported_proof['current_run_binding_verified']}`",
+            f"- Current Phase 1 OEP proved: `{imported_proof['oep_proven']}`",
+            f"- Imported solver results recomputed: `{imported_proof['solver_results_recomputed']}`",
+        ]
 
     lines.extend(f"- {item}" for item in report["limitations"])
 
@@ -1272,6 +1414,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default=None, help="Pipeline output directory")
     parser.add_argument("--phase1-timeout", type=int, default=20)
     parser.add_argument("--phase1-only", action="store_true", help="Validate Phase 1 and its artifacts, then finish before Phase 2")
+    oep_reference = parser.add_mutually_exclusive_group()
+    oep_reference.add_argument("--oep-certificate", type=Path,
+                               help="Offline conditional OEP certificate for reference only; never proves this Phase 1 run")
+    oep_reference.add_argument("--oep-proof", type=Path,
+                               help="Audit recorded SMT proof evidence (result directory or ZIP); never proves this Phase 1 run")
     parser.add_argument("--phase2-timeout", type=int, default=60)
     parser.add_argument(
         "--network",
@@ -1421,6 +1568,17 @@ def main() -> int:
             else 0,
         }
 
+        if args.oep_certificate is not None:
+            report["phase1"]["oep_verification"] = oep_certificate_reference(
+                args.oep_certificate, sample_sha256=report["input"]["sha256"],
+                candidate=raw_phase1.get("oep"),
+            )
+        elif args.oep_proof is not None:
+            report["phase1"]["oep_verification"] = oep_proof_reference(
+                args.oep_proof, sample_sha256=report["input"]["sha256"],
+                candidate=raw_phase1.get("oep"),
+            )
+
         if args.phase1_only:
             report["status"] = "completed"
             report["phase2"]["status"] = "not_requested"
@@ -1430,6 +1588,8 @@ def main() -> int:
         phase2_payload, adapter_audit = build_phase2_input(
             raw_phase1=raw_phase1, elf=elf
         )
+        if "oep_verification" in report["phase1"]:
+            adapter_audit["oep_verification"] = report["phase1"]["oep_verification"]
         phase2_input_path = output_root / "phase2_input.json"
         adapter_audit_path = output_root / "bridge_audit.json"
         atomic_write_json(phase2_input_path, phase2_payload)
@@ -1446,6 +1606,8 @@ def main() -> int:
                 "network_dependencies"
             ],
         }
+        if "oep_verification" in report["phase1"]:
+            report["bridge"]["oep_verification"] = report["phase1"]["oep_verification"]
 
         report["phase2"]["status"] = "running"
         phase2_out = output_root / "phase2"

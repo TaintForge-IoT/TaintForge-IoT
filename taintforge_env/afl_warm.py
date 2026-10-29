@@ -65,14 +65,27 @@ def prepare_campaign(out, *, binary, qemu, plugin, guest_path, seeds, max_input=
 
 class FilesystemBaseline:
     """Restore the paused parent's root inode in place; no child is alive here."""
-    def __init__(self, root, backup):
+    def __init__(self, root, backup, *, preserve=()):
         self.root, self.backup = Path(root).resolve(), Path(backup).resolve()
         f.p.require(self.root != Path('/') and not self.backup.is_relative_to(self.root),
                     'Invalid checkpoint filesystem paths')
+        preserve = tuple(Path(path) for path in preserve)
+        f.p.require(all(path.parts and not path.is_absolute() and '..' not in path.parts
+                        for path in preserve), 'Invalid preserved runtime path')
+        self.preserved = {Path(name) for name in EXCLUDED} | set(preserve)
+        self.ancestors = {parent for path in preserve for parent in path.parents if parent.parts}
+        self.protected = {}
+        for relative in sorted({Path('.')} | set(preserve) | self.ancestors, key=lambda path: len(path.parts)):
+            path = self.root / relative
+            f.p.require(not path.is_symlink() and path.is_dir(), 'Runtime mount path is not a real directory')
+            info = path.stat()
+            self.protected[relative] = (info.st_dev, info.st_ino)
         self.backup.mkdir(parents=True, exist_ok=False)
         for directory, names, files in os.walk(self.root, followlinks=False):
-            if Path(directory) == self.root: names[:] = [n for n in names if n not in EXCLUDED]
+            relative = Path(directory).relative_to(self.root)
+            names[:] = [name for name in names if relative / name not in self.preserved]
             for name in files:
+                if relative / name in self.preserved: continue
                 path = Path(directory)/name
                 f.p.require(path.is_symlink() or path.is_file() and path.stat().st_nlink == 1,
                             'Checkpoint cannot preserve a special file or hardlink')
@@ -80,35 +93,49 @@ class FilesystemBaseline:
         from .environment_snapshot import scan_environment, tree_digest
         self.digest = tree_digest(scan_environment(self.backup))
 
-    @staticmethod
-    def _copy(source, destination):
+    def _copy(self, source, destination, relative=Path('.')):
         for item in source.iterdir():
-            if item.name in EXCLUDED: continue
+            child = relative / item.name
+            if child in self.preserved: continue
             target = destination/item.name
             if item.is_symlink(): target.symlink_to(os.readlink(item))
-            elif item.is_dir(): shutil.copytree(item, target, symlinks=True)
+            elif item.is_dir():
+                target.mkdir(exist_ok=True)
+                self._copy(item, target, child)
+                shutil.copystat(item, target, follow_symlinks=False)
             else:
                 f.p.require(item.is_file() and item.stat().st_nlink == 1,
                             'Checkpoint requires private regular files')
                 shutil.copy2(item, target)
 
+    def _clear(self, directory, relative=Path('.')):
+        for item in directory.iterdir():
+            child = relative / item.name
+            if child in self.preserved: continue
+            if child in self.ancestors: self._clear(item, child)
+            elif item.is_dir() and not item.is_symlink(): shutil.rmtree(item)
+            else: item.unlink()
+
     def restore(self):
         from .environment_snapshot import scan_environment, tree_digest
         f.p.require(tree_digest(scan_environment(self.backup)) == self.digest,
                     'Checkpoint filesystem changed')
-        for item in self.root.iterdir():
-            if item.name in EXCLUDED: continue
-            if item.is_dir() and not item.is_symlink(): shutil.rmtree(item)
-            else: item.unlink()
+        for relative, expected in self.protected.items():
+            path = self.root / relative
+            f.p.require(not path.is_symlink() and path.is_dir(), 'Runtime mount path changed')
+            info = path.stat()
+            f.p.require((info.st_dev, info.st_ino) == expected, 'Runtime mount directory identity changed')
+        self._clear(self.root)
         self._copy(self.backup, self.root)
         # Files were prepared for the unprivileged M4 execution identity.
         if os.geteuid() == 0:
             owner = self.root.stat()
             for directory, names, files in os.walk(self.root, followlinks=False):
-                if Path(directory) == self.root:
-                    names[:] = [n for n in names if n not in EXCLUDED]
+                relative = Path(directory).relative_to(self.root)
+                names[:] = [name for name in names if relative / name not in self.preserved]
                 os.chown(directory, owner.st_uid, owner.st_gid, follow_symlinks=False)
                 for name in names+files:
+                    if relative / name in self.preserved: continue
                     os.chown(Path(directory)/name, owner.st_uid, owner.st_gid, follow_symlinks=False)
 
 
@@ -175,7 +202,10 @@ class Broker:
                 # The native checkpoint follows verified retirement and RESUME 2.
                 from .phase1_retirement import verify_retirement
                 verify_retirement(self.binding, pid)
-                baseline = FilesystemBaseline(self.binding['rootfs'], self.root/'checkpoint-rootfs')
+                phase = Path(f.read_json(Path(self.binding['run_dir'])/'config/phase1_binding.json')['output_directory'])
+                f.p.require(phase == Path(self.binding['run_dir'])/'logs/phase1', 'Unbound warm Phase 1 mount')
+                baseline = FilesystemBaseline(self.binding['rootfs'], self.root/'checkpoint-rootfs',
+                                              preserve=(phase.relative_to('/'),))
                 self.ready.set()
                 self.publish(self.root/'warm-ready.json', {'schema': 1, 'status': 'ready',
                     'pid_namespace_pid': pid, 'rss_mib': rss, 'phase1_runs': 1,
@@ -276,7 +306,7 @@ class WarmAttemptServer(AttemptServer):
         self.output = (self.root/'warm-worker.log').open('wb')
         self.worker = subprocess.Popen([sys.executable, '-m', 'scripts.run_afl_file', 'warm-session',
             '--out', str(self.root)], cwd=f.PROJECT, stdout=self.output, stderr=self.output,
-            start_new_session=True)
+            process_group=0)
         config = f.read_json(self.root/'campaign.json')['warm']
         deadline = time.monotonic()+config['bootstrap_seconds']
         try:
