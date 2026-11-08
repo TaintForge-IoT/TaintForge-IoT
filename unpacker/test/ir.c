@@ -46,9 +46,9 @@ static const char *const op_names[IR_OP_COUNT] = {
     "CONST",       "INPUT", "UNKNOWN", "COPY",  "ADD",    "SUB",  "MUL",  "AND",
     "OR",          "XOR",   "NOT",     "NEG",   "SHL",    "LSHR", "ASHR", "EXTRACT",
     "CONCAT",      "ZEXT",  "SEXT",    "EQ",    "ULT",    "SLT",  "ITE",  "READ_STATE",
-    "WRITE_STATE", "LOAD",  "STORE",   "GUARD", "BARRIER", "ZERO_MEMORY"};
+    "WRITE_STATE", "LOAD",  "STORE",   "GUARD", "BARRIER", "ZERO_MEMORY", "UDIV", "UREM"};
 static const unsigned char op_arity[IR_OP_COUNT] = {0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2,
-                                                    1, 2, 1, 1, 2, 2, 2, 3, 0, 1, 2, 3, 1, 0, 0};
+                                                    1, 2, 1, 1, 2, 2, 2, 3, 0, 1, 2, 3, 1, 0, 0, 2, 2};
 
 const char *ir_opcode_name(IrOpcode op) {
     return (unsigned)op < IR_OP_COUNT ? op_names[op] : "INVALID";
@@ -323,6 +323,8 @@ static bool spec_valid(const IrModule *m, IrBlockId block, IrInstId before, cons
     case IR_OP_ADD:
     case IR_OP_SUB:
     case IR_OP_MUL:
+    case IR_OP_UDIV:
+    case IR_OP_UREM:
     case IR_OP_AND:
     case IR_OP_OR:
     case IR_OP_XOR:
@@ -655,6 +657,12 @@ bool ir_compute_bv(const IrInstSpec *s, const IrType t[3], const uint64_t a[3], 
         break;
     case IR_OP_MUL:
         r = a[0] * a[1];
+        break;
+    case IR_OP_UDIV:
+        r = a[1] ? a[0] / a[1] : mask;
+        break;
+    case IR_OP_UREM:
+        r = a[1] ? a[0] % a[1] : a[0];
         break;
     case IR_OP_AND:
         r = a[0] & a[1];

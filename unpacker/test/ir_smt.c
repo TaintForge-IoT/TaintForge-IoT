@@ -556,6 +556,8 @@ static Sym arithmetic(IrSmt *s, const IrInstSpec *ins, Sym v[3]) {
     case IR_OP_ADD:
     case IR_OP_SUB:
     case IR_OP_MUL:
+    case IR_OP_UDIV:
+    case IR_OP_UREM:
     case IR_OP_NEG:
     case IR_OP_ULT:
     case IR_OP_SLT:
@@ -599,6 +601,12 @@ static Sym arithmetic(IrSmt *s, const IrInstSpec *ins, Sym v[3]) {
         r.mask = ite(
             s, either(s, known_number(s, a, 0), known_number(s, b, 0)), ones,
             ite(s, known_number(s, a, 1), b.mask, ite(s, known_number(s, b, 1), a.mask, r.mask)));
+        break;
+    case IR_OP_UDIV:
+        r.value = bin(s, Z3_mk_bvudiv, a.value, b.value);
+        break;
+    case IR_OP_UREM:
+        r.value = bin(s, Z3_mk_bvurem, a.value, b.value);
         break;
     case IR_OP_AND:
         r.value = bv_and(s, w, a.value, b.value);

@@ -1,0 +1,16 @@
+--- a/include/plugins/qemu-plugin.h
++++ b/include/plugins/qemu-plugin.h
+@@ -1351,6 +1351,13 @@
+ QEMU_PLUGIN_API
+ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry);
+ 
++
++/* Private TaintForge warm-fork ABI 1, linux-user only. */
++QEMU_PLUGIN_API
++int qemu_plugin_tf_warm_configure(const char *input, const char *endpoint,
++ uint64_t max_rss_mib, int observer_fd, void (*prepare)(void), void (*on_child)(void));
++QEMU_PLUGIN_API
++void qemu_plugin_tf_warm_arm(void);
+ #ifdef __cplusplus
+ } /* extern "C" */
+ #endif

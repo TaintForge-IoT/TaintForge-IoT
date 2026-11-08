@@ -1,0 +1,14 @@
+{
+  "kind": "exact accepted SDK header reconstructed from pinned upstream source and project ABI declarations",
+  "license": "GPL-2.0-or-later",
+  "network_access_during_probe": false,
+  "plugin_api": 6,
+  "project_declarations_source_sha256": "149c7e991ab37a7a65d725946a2e34d944c88e51c850f38b345ce8a713eaf981",
+  "project_declarations_source_url": "https://raw.githubusercontent.com/Lisoon22/TaintForge-IoT/main/experiments/afl_file/qemu/apply.py",
+  "qemu_commit": "6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55",
+  "qemu_version": "11.0.1",
+  "sdk_header_sha256": "27dade0671ef9e64d895d3511239bf360404ad7c1bf70b513dc8ada4342985d3",
+  "sdk_header_size_bytes": 48118,
+  "upstream_sha256": "9592f519d7344b1e38b0123b92c28c4e688faedf41263984910353736bb0b7be",
+  "upstream_url": "https://raw.githubusercontent.com/qemu/qemu/6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55/include/plugins/qemu-plugin.h"
+}

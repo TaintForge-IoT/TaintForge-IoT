@@ -153,6 +153,23 @@ static IrConcolicReadResult invert_replay(const ReplayInput *input, IrReplay *re
     }
 
 done:
+    out.replay_build_attempted = true;
+    out.replay_build_status = build.status;
+    out.replay_build_issues = build.issues;
+    out.replay_selected_steps = build.selected_steps;
+    out.replay_lifted_steps = build.lifted_steps;
+    out.replay_stopped_origin = build.stopped_origin;
+    const ReplayStep *stopped = build.stopped_origin.has_trace_identity
+        ? replay_input_find(input, build.stopped_origin.seq_id) : NULL;
+    if (stopped && stopped->descriptor_valid &&
+        stopped->entry.pc == build.stopped_origin.pc &&
+        stopped->entry.insn_desc_id == build.stopped_origin.descriptor_id &&
+        stopped->entry.code_generation == build.stopped_origin.code_generation &&
+        stopped->entry.vcpu_index == build.stopped_origin.vcpu_id &&
+        stopped->descriptor.size <= MAX_INSN_BYTES) {
+        out.replay_stopped_size = stopped->descriptor.size;
+        memcpy(out.replay_stopped_bytes, stopped->descriptor.bytes, out.replay_stopped_size);
+    }
     ir_invert_result_destroy(&inverted);
     ir_branches_destroy(branches);
     ir_replay_destroy(replay);
@@ -279,6 +296,9 @@ struct TfConcolic {
     IrConcolicRead read;
     ConcolicSyscall syscalls[CONCOLIC_MAX_SYSCALLS];
     uint32_t syscall_count;
+    uint64_t last_syscall_seq;
+    int64_t last_syscall_number;
+    bool has_syscall_context;
 };
 
 static void fail(TfConcolic *run, const char *reason) {
@@ -501,6 +521,9 @@ void tf_concolic_syscall(TfConcolic *run, const TraceBuffer *trace, uint64_t seq
                          int64_t num, uint64_t fd, uint64_t address, uint64_t count) {
     if (!run || run->finished || run->failure)
         return;
+    run->has_syscall_context = true;
+    run->last_syscall_seq = seq;
+    run->last_syscall_number = num;
     const TraceEntry *entry = trace_find_seq(trace, seq, NULL);
     if (run->stdin_span || run->stdin_sequence || run->pending || run->armed || run->source.completed_read || num != 3 || fd != 0 ||
         count != 1 || address > UINT32_MAX || vcpu != 0 || !seq || !entry ||
@@ -539,6 +562,9 @@ void tf_concolic_syscall_ex(TfConcolic *run, const TraceBuffer *trace, uint64_t 
                             int64_t num, const uint64_t args[6], const char *path) {
     if (!run || run->finished || run->failure)
         return;
+    run->has_syscall_context = true;
+    run->last_syscall_seq = seq;
+    run->last_syscall_number = num;
     if (!args) {
         fail(run, "syscall_arguments_missing");
         return;
@@ -944,6 +970,29 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
     fprintf(f, "{\"schema\":%u,\"status\":\"%s\",\"reason\":\"%s\",",
             run->stdin_sequence ? 4U : run->stdin_span ? 3U : run->guest_file ? 2U : 1U,
             result.status, result.reason);
+    if (result.replay_build_attempted) {
+        IrOrigin stopped = result.replay_stopped_origin;
+        fprintf(f, "\"replay_build\":{\"status\":%u,\"issues\":%u,"
+                "\"selected_steps\":%u,\"lifted_steps\":%u,\"stopped_origin\":",
+                (unsigned)result.replay_build_status, result.replay_build_issues,
+                result.replay_selected_steps, result.replay_lifted_steps);
+        if (stopped.has_trace_identity) {
+            fprintf(f, "{\"seq\":%" PRIu64 ",\"pc\":%" PRIu64 ",\"vcpu\":%u,"
+                    "\"generation\":%" PRIu64 ",\"descriptor\":%" PRIu64 ",\"bytes\":",
+                    stopped.seq_id, stopped.pc, stopped.vcpu_id, stopped.code_generation,
+                    (uint64_t)stopped.descriptor_id);
+            if (result.replay_stopped_size) {
+                fputc('"', f);
+                for (unsigned i = 0; i < result.replay_stopped_size; ++i)
+                    fprintf(f, "%02x", result.replay_stopped_bytes[i]);
+                fputc('"', f);
+            } else
+                fputs("null", f);
+            fputc('}', f);
+        } else
+            fputs("null", f);
+        fputs("},", f);
+    }
     if (run->stdin_sequence) {
         fprintf(f,
                 "\"relation\":\"stdin_read_sequence_identity\",\"host_identity_verified\":true,"
@@ -1078,11 +1127,23 @@ bool tf_concolic_finish(TfConcolic *run) {
     if (!run || !run->report)
         return true;
     bool ok = true;
-    if (!run->finished &&
-        fprintf(run->report, "{\"schema\":%u,\"status\":\"UNKNOWN\",\"reason\":\"%s\"}\n",
+    if (!run->finished) {
+        if (fprintf(run->report, "{\"schema\":%u,\"status\":\"UNKNOWN\",\"reason\":\"%s\","
+                "\"collector\":{\"branch_pc\":%u,\"requested_occurrence\":%u,"
+                "\"observed_occurrences\":%u,\"armed\":%s,\"last_syscall\":",
                 run->stdin_sequence ? 4U : run->stdin_span ? 3U : run->guest_file ? 2U : 1U,
-                run->failure ? run->failure : "selected_branch_not_reached") < 0)
-        ok = false;
+                run->failure ? run->failure : "selected_branch_not_reached",
+                run->pc, run->occurrence, run->seen, run->armed ? "true" : "false") < 0)
+            ok = false;
+        if (run->has_syscall_context) {
+            if (fprintf(run->report, "{\"seq\":%" PRIu64 ",\"number\":%" PRId64 "}",
+                        run->last_syscall_seq, run->last_syscall_number) < 0)
+                ok = false;
+        } else if (fputs("null", run->report) < 0)
+            ok = false;
+        if (fputs("}}\n", run->report) < 0)
+            ok = false;
+    }
     if (fclose(run->report))
         ok = false;
     run->report = NULL;

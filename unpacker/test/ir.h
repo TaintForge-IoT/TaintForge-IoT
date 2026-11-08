@@ -112,6 +112,10 @@ typedef enum {
     IR_OP_BARRIER,
     /* A fully defined, immutable zero byte array over the whole MEM domain. */
     IR_OP_ZERO_MEMORY,
+    /* Total unsigned bit-vector operations (SMT-LIB semantics): UDIV(x,0)
+     * is all ones; UREM(x,0) is x. Guest division faults require a GUARD. */
+    IR_OP_UDIV,
+    IR_OP_UREM,
     IR_OP_COUNT
 } IrOpcode;
 

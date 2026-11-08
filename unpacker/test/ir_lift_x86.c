@@ -453,7 +453,62 @@ static IrX86LiftStatus preflight(const IrX86Frontend *f, const cs_insn *insn) {
         return f->options.flat32_ram ? IR_X86_LIFT_OK : IR_X86_LIFT_MEMORY_MODEL;
     if (insn->id == X86_INS_NOP || insn->id == X86_INS_CLD || insn->id == X86_INS_STD)
         return IR_X86_LIFT_OK;
+    if (insn->id == X86_INS_CDQ)
+        return x->op_count == 0 && insn->size == 1 && insn->bytes[0] == 0x99
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_IDIV)
+        return x->op_count == 1 && register_ok(&x->operands[0]) &&
+            x->operands[0].size == 4 && x->prefix[2] != 0x66
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_DIV)
+        return x->op_count == 1 && register_ok(&x->operands[0]) &&
+            x->operands[0].size == 4 && x->prefix[2] != 0x66
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_BSF || insn->id == X86_INS_BSR)
+        return insn->size == 3 && insn->bytes[0] == 0x0f &&
+            insn->bytes[1] == (insn->id == X86_INS_BSF ? 0xbc : 0xbd) &&
+            x->op_count == 2 && register_ok(&x->operands[0]) &&
+            register_ok(&x->operands[1]) && x->operands[0].size == 4 &&
+            x->operands[1].size == 4 ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_ROL || insn->id == X86_INS_ROR)
+        return insn->size == 2 && insn->bytes[0] == 0xd3 &&
+            (insn->bytes[1] & 0xf8) == (insn->id == X86_INS_ROL ? 0xc0 : 0xc8) &&
+            x->op_count == 2 && register_ok(&x->operands[0]) &&
+            x->operands[0].size == 4 && x->operands[1].type == X86_OP_REG &&
+            x->operands[1].reg == X86_REG_CL ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_SHLD) {
+        bool cl = insn->size == 3 && insn->bytes[0] == 0x0f && insn->bytes[1] == 0xa5;
+        bool imm = insn->size == 4 && insn->bytes[0] == 0x0f && insn->bytes[1] == 0xa4;
+        return (cl || imm) && (insn->bytes[2] & 0xc0) == 0xc0 && x->op_count == 3 &&
+            register_ok(&x->operands[0]) && register_ok(&x->operands[1]) &&
+            x->operands[0].size == 4 && x->operands[1].size == 4 &&
+            (cl ? x->operands[2].type == X86_OP_REG && x->operands[2].reg == X86_REG_CL
+                : x->operands[2].type == X86_OP_IMM)
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    }
+    if (insn->id == X86_INS_SHRD)
+        return insn->size == 3 && insn->bytes[0] == 0x0f && insn->bytes[1] == 0xad &&
+            (insn->bytes[2] & 0xc0) == 0xc0 && x->op_count == 3 &&
+            register_ok(&x->operands[0]) && register_ok(&x->operands[1]) &&
+            x->operands[0].size == 4 && x->operands[1].size == 4 &&
+            x->operands[2].type == X86_OP_REG && x->operands[2].reg == X86_REG_CL
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_BT)
+        return x->op_count == 2 && register_ok(&x->operands[0]) &&
+            register_ok(&x->operands[1]) && x->operands[0].size == 4 &&
+            x->operands[1].size == 4 && x->prefix[2] != 0x66
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id == X86_INS_MUL)
+        return insn->size >= 2 && insn->bytes[0] == 0xf7 &&
+            (insn->bytes[1] & 0x38) == 0x20 && x->addr_size == 4 &&
+            x->op_count == 1 && x->operands[0].size == 4
+            ? operand_status(f, x, &x->operands[0], false) : IR_X86_LIFT_UNSUPPORTED;
     if (insn->id == X86_INS_IMUL) {
+        if (x->op_count == 1)
+            return insn->size >= 2 && insn->bytes[0] == 0xf7 &&
+                (insn->bytes[1] & 0x38) == 0x28 && x->addr_size == 4 &&
+                x->operands[0].size == 4
+                ? operand_status(f, x, &x->operands[0], false) : IR_X86_LIFT_UNSUPPORTED;
         if (x->op_count != 2 && x->op_count != 3)
             return IR_X86_LIFT_UNSUPPORTED;
         const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
@@ -946,18 +1001,52 @@ static IrValueId branch_condition(Lift *l, unsigned cc) {
     return cc & 1U ? unary(l, IR_OP_NOT, 1, value, 0) : value;
 }
 
+static void rotates32(Lift *l, unsigned id, const cs_x86 *x, IrX86LiftResult *r) {
+    IrValueId a = read_operand(l, x, &x->operands[0], r);
+    IrValueId count = unary(l, IR_OP_ZEXT, 32,
+        binary(l, IR_OP_AND, 8, read_register(l, X86_REG_CL), constant(l, 8, 31)), 0);
+    IrValueId zero = binary(l, IR_OP_EQ, 1, count, constant(l, 32, 0));
+    IrValueId one = binary(l, IR_OP_EQ, 1, count, constant(l, 32, 1));
+    IrValueId opposite = binary(l, IR_OP_SUB, 32, constant(l, 32, 32), count);
+    bool left = id == X86_INS_ROL;
+    IrValueId result = binary(l, IR_OP_OR, 32,
+        binary(l, left ? IR_OP_SHL : IR_OP_LSHR, 32, a, count),
+        binary(l, left ? IR_OP_LSHR : IR_OP_SHL, 32, a, opposite));
+    IrValueId cf = bit(l, result, left ? 0 : 31);
+    IrValueId of = binary(l, IR_OP_XOR, 1, bit(l, result, 31),
+        left ? cf : bit(l, result, 30));
+    IrValueId undefined = emit(l, (IrInstSpec){.op = IR_OP_UNKNOWN,
+        .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED});
+    IrValueId old_cf = read_state(l, l->f->state.flags[X86_SPECIAL_STATE_CF], ir_type_bv(1));
+    IrValueId old_of = read_state(l, l->f->state.flags[X86_SPECIAL_STATE_OF], ir_type_bv(1));
+    write_state(l, l->f->state.flags[X86_SPECIAL_STATE_CF], choose(l, 1, zero, old_cf, cf));
+    write_state(l, l->f->state.flags[X86_SPECIAL_STATE_OF],
+        choose(l, 1, zero, old_of, choose(l, 1, one, of, undefined)));
+    r->flags_written = (1U << X86_SPECIAL_STATE_CF) | (1U << X86_SPECIAL_STATE_OF);
+    r->flags_preserved_when = zero;
+    r->flags_defined[X86_SPECIAL_STATE_OF] = one;
+    write_operand(l, x, &x->operands[0], result, r);
+}
+
 static void shifts(Lift *l, unsigned id, const cs_x86 *x, IrX86LiftResult *r) {
-    const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
+    bool shrd = id == X86_INS_SHRD, shld = id == X86_INS_SHLD;
+    const cs_x86_op *dst = &x->operands[0], *src = &x->operands[shrd || shld ? 2 : 1];
     unsigned width = dst->size * 8U;
     IrValueId a = read_operand(l, x, dst, r);
+    IrValueId high = shrd || shld ? read_operand(l, x, &x->operands[1], r) : 0;
     IrValueId raw =
         src->type == X86_OP_REG ? read_register(l, X86_REG_CL) : constant(l, 8, (uint64_t)src->imm);
     IrValueId count8 = binary(l, IR_OP_AND, 8, raw, constant(l, 8, 31));
     IrValueId count = width == 8 ? count8 : unary(l, IR_OP_ZEXT, width, count8, 0);
     IrValueId zero = binary(l, IR_OP_EQ, 1, count, constant(l, width, 0));
     IrValueId one = binary(l, IR_OP_EQ, 1, count, constant(l, width, 1));
-    bool left = id == X86_INS_SHL || id == X86_INS_SAL, sar = id == X86_INS_SAR;
+    bool left = id == X86_INS_SHL || id == X86_INS_SAL || shld, sar = id == X86_INS_SAR;
     IrValueId result = binary(l, left ? IR_OP_SHL : sar ? IR_OP_ASHR : IR_OP_LSHR, width, a, count);
+    if (shrd || shld) {
+        IrValueId opposite = binary(l, IR_OP_SUB, width, constant(l, width, width), count);
+        result = choose(l, width, zero, a, binary(l, IR_OP_OR, width, result,
+            binary(l, shld ? IR_OP_LSHR : IR_OP_SHL, width, high, opposite)));
+    }
     IrValueId flags[6];
     flags[X86_SPECIAL_STATE_ZF] = binary(l, IR_OP_EQ, 1, result, constant(l, width, 0));
     flags[X86_SPECIAL_STATE_SF] = bit(l, result, width - 1);
@@ -975,7 +1064,8 @@ static void shifts(Lift *l, unsigned id, const cs_x86 *x, IrX86LiftResult *r) {
     IrValueId cf_defined =
         sar ? constant(l, 1, 1) : binary(l, IR_OP_ULT, 1, count, constant(l, width, width));
     flags[X86_SPECIAL_STATE_CF] = choose(l, 1, cf_defined, carry, undefined);
-    IrValueId overflow = left  ? binary(l, IR_OP_XOR, 1, bit(l, result, width - 1), carry)
+    IrValueId overflow = shrd  ? binary(l, IR_OP_XOR, 1, bit(l, a, width - 1), bit(l, result, width - 1))
+                         : left  ? binary(l, IR_OP_XOR, 1, bit(l, result, width - 1), carry)
                          : sar ? constant(l, 1, 0)
                                : bit(l, a, width - 1);
     flags[X86_SPECIAL_STATE_OF] = choose(l, 1, one, overflow, undefined);
@@ -1065,13 +1155,138 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
         r.control = IR_X86_CONDITIONAL;
         r.direct_target = (uint32_t)x->operands[0].imm;
         r.condition = unary(&l, IR_OP_NOT, 1, binary(&l, IR_OP_EQ, 1, count, constant(&l, bits, 0)), 0);
+    } else if (insn->id == X86_INS_CDQ) {
+        IrValueId value = unary(&l, IR_OP_SEXT, 64, read_register(&l, X86_REG_EAX), 0);
+        write_register(&l, X86_REG_EDX, unary(&l, IR_OP_EXTRACT, 32, value, 32));
+        r.gpr_writes = 1U << DTA_REG_RDX; /* Flags and EAX are preserved. */
+    } else if (insn->id == X86_INS_IDIV) {
+        /* All operands refer to the old state, including IDIV EAX/EDX.
+         * Use unsigned magnitudes so even INT64_MIN has a representable
+         * absolute value. Pure BV division is total; the architectural guard
+         * excludes #DE before any state write. No observed value is used. */
+        IrValueId dividend = binary(&l, IR_OP_CONCAT, 64,
+            read_register(&l, X86_REG_EDX), read_register(&l, X86_REG_EAX));
+        IrValueId divisor = read_register(&l, x->operands[0].reg);
+        IrValueId wide_divisor = unary(&l, IR_OP_SEXT, 64, divisor, 0);
+        IrValueId negative_n = unary(&l, IR_OP_EXTRACT, 1, dividend, 63);
+        IrValueId negative_d = unary(&l, IR_OP_EXTRACT, 1, divisor, 31);
+        IrValueId magnitude_n = choose(&l, 64, negative_n,
+            unary(&l, IR_OP_NEG, 64, dividend, 0), dividend);
+        IrValueId magnitude_d = choose(&l, 64, negative_d,
+            unary(&l, IR_OP_NEG, 64, wide_divisor, 0), wide_divisor);
+        IrValueId unsigned_q = binary(&l, IR_OP_UDIV, 64, magnitude_n, magnitude_d);
+        IrValueId unsigned_r = binary(&l, IR_OP_UREM, 64, magnitude_n, magnitude_d);
+        IrValueId quotient = choose(&l, 64, binary(&l, IR_OP_XOR, 1, negative_n, negative_d),
+            unary(&l, IR_OP_NEG, 64, unsigned_q, 0), unsigned_q);
+        IrValueId remainder = choose(&l, 64, negative_n,
+            unary(&l, IR_OP_NEG, 64, unsigned_r, 0), unsigned_r);
+        IrValueId q32 = unary(&l, IR_OP_EXTRACT, 32, quotient, 0);
+        IrValueId nonzero = unary(&l, IR_OP_NOT, 1,
+            binary(&l, IR_OP_EQ, 1, divisor, constant(&l, 32, 0)), 0);
+        IrValueId fits = binary(&l, IR_OP_EQ, 1, quotient,
+            unary(&l, IR_OP_SEXT, 64, q32, 0));
+        ir_emit_effect(f->module, block, (IrInstSpec){.op = IR_OP_GUARD,
+            .type = ir_type_void(), .args = {binary(&l, IR_OP_AND, 1, nonzero, fits)},
+            .immediate = IR_REASON_GUARD, .origin = origin});
+        write_register(&l, X86_REG_EAX, q32);
+        write_register(&l, X86_REG_EDX, unary(&l, IR_OP_EXTRACT, 32, remainder, 0));
+        r.gpr_writes = (1U << DTA_REG_RAX) | (1U << DTA_REG_RDX);
+        r.flags_written = r.flags_undefined = 0x3f;
+        for (unsigned i = 0; i < 6; ++i)
+            write_state(&l, f->state.flags[i], emit(&l, (IrInstSpec){
+                .op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
+    } else if (insn->id == X86_INS_DIV) {
+        /* Capture every old operand before EAX/EDX are replaced, including
+         * DIV EAX and DIV EDX. EDX < divisor is exactly the non-faulting
+         * domain: divisor != 0 and the 64/32 quotient fits in 32 bits. */
+        IrValueId low = read_register(&l, X86_REG_EAX);
+        IrValueId high = read_register(&l, X86_REG_EDX);
+        IrValueId divisor = read_register(&l, x->operands[0].reg);
+        ir_emit_effect(f->module, block, (IrInstSpec){.op = IR_OP_GUARD,
+            .type = ir_type_void(),
+            .args = {binary(&l, IR_OP_ULT, 1, high, divisor)},
+            .immediate = IR_REASON_GUARD, .origin = origin});
+        IrValueId dividend = binary(&l, IR_OP_CONCAT, 64, high, low);
+        IrValueId wide_divisor = unary(&l, IR_OP_ZEXT, 64, divisor, 0);
+        IrValueId quotient = binary(&l, IR_OP_UDIV, 64, dividend, wide_divisor);
+        IrValueId remainder = binary(&l, IR_OP_UREM, 64, dividend, wide_divisor);
+        write_register(&l, X86_REG_EAX, unary(&l, IR_OP_EXTRACT, 32, quotient, 0));
+        write_register(&l, X86_REG_EDX, unary(&l, IR_OP_EXTRACT, 32, remainder, 0));
+        r.gpr_writes = (1U << DTA_REG_RAX) | (1U << DTA_REG_RDX);
+        r.flags_written = r.flags_undefined = 0x3f;
+        for (unsigned i = 0; i < 6; ++i)
+            write_state(&l, f->state.flags[i], emit(&l, (IrInstSpec){
+                .op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
+    } else if (insn->id == X86_INS_BSF || insn->id == X86_INS_BSR) {
+        /* Capture the old source even when it aliases the destination.
+         * Five fixed stages locate the set bit without a new generic opcode.
+         * The portable legacy profile deliberately leaves the zero-source
+         * destination and non-ZF arithmetic flags unknown. */
+        IrValueId value = read_register(&l, x->operands[1].reg);
+        IrValueId zero = binary(&l, IR_OP_EQ, 1, value, constant(&l, 32, 0));
+        IrValueId index = constant(&l, 32, 0);
+        for (unsigned step = 16; step; step >>= 1) {
+            IrValueId upper = binary(&l, IR_OP_LSHR, 32, value, constant(&l, 32, step));
+            IrValueId take = insn->id == X86_INS_BSF
+                ? binary(&l, IR_OP_EQ, 1, unary(&l, IR_OP_EXTRACT, step, value, 0), constant(&l, step, 0))
+                : unary(&l, IR_OP_NOT, 1, binary(&l, IR_OP_EQ, 1, upper, constant(&l, 32, 0)), 0);
+            value = choose(&l, 32, take, upper, value);
+            index = binary(&l, IR_OP_OR, 32, index, choose(&l, 32, take, constant(&l, 32, step), constant(&l, 32, 0)));
+        }
+        IrValueId unknown = emit(&l, (IrInstSpec){.op = IR_OP_UNKNOWN,
+            .type = ir_type_bv(32), .immediate = IR_REASON_UNDEFINED});
+        write_operand(&l, x, &x->operands[0], choose(&l, 32, zero, unknown, index), &r);
+        r.flags_written = 0x3f;
+        r.flags_undefined = 0x37;
+        for (unsigned i = 0; i < 6; ++i)
+            write_state(&l, f->state.flags[i], i == X86_SPECIAL_STATE_ZF ? zero :
+                emit(&l, (IrInstSpec){.op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
+    } else if (insn->id == X86_INS_BT) {
+        IrValueId value = read_register(&l, x->operands[0].reg);
+        IrValueId index = binary(&l, IR_OP_AND, 32,
+            read_register(&l, x->operands[1].reg), constant(&l, 32, 31));
+        IrValueId carry = unary(&l, IR_OP_EXTRACT, 1,
+            binary(&l, IR_OP_LSHR, 32, value, index), 0);
+        r.flags_written = 0x37;
+        r.flags_undefined = 0x36; /* PF/AF/SF/OF undefined; ZF and DF preserved. */
+        for (unsigned i = 0; i < 6; ++i)
+            if (r.flags_written & (1U << i))
+                write_state(&l, f->state.flags[i], i == X86_SPECIAL_STATE_CF ? carry :
+                    emit(&l, (IrInstSpec){.op = IR_OP_UNKNOWN, .type = ir_type_bv(1),
+                                        .immediate = IR_REASON_UNDEFINED}));
+    } else if (insn->id == X86_INS_MUL) {
+        /* Capture EAX and the register/memory source before either implicit
+         * destination is written. A memory address may itself use EAX/EDX.
+         * Zero-extension keeps the complete unsigned 32x32 -> 64 product. */
+        IrValueId a = read_register(&l, X86_REG_EAX);
+        IrValueId b = read_operand(&l, x, &x->operands[0], &r);
+        IrValueId product = binary(&l, IR_OP_MUL, 64,
+            unary(&l, IR_OP_ZEXT, 64, a, 0), unary(&l, IR_OP_ZEXT, 64, b, 0));
+        IrValueId low = unary(&l, IR_OP_EXTRACT, 32, product, 0);
+        IrValueId high = unary(&l, IR_OP_EXTRACT, 32, product, 32);
+        IrBuildPhase previous = ir_module_build_phase(f->module, IR_BUILD_ARITHMETIC_FLAGS);
+        IrValueId overflow = unary(&l, IR_OP_NOT, 1,
+            binary(&l, IR_OP_EQ, 1, high, constant(&l, 32, 0)), 0);
+        r.flags_written = 0x3f;
+        r.flags_undefined = 0x1e; /* PF/AF/ZF/SF undefined; CF=OF=(high != 0). */
+        for (unsigned i = 0; i < 6; ++i)
+            write_state(&l, f->state.flags[i], (i == X86_SPECIAL_STATE_CF ||
+                i == X86_SPECIAL_STATE_OF) ? overflow : emit(&l, (IrInstSpec){
+                .op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
+        ir_module_build_phase(f->module, previous);
+        write_register(&l, X86_REG_EAX, low);
+        write_register(&l, X86_REG_EDX, high);
+        r.gpr_writes = (1U << DTA_REG_RAX) | (1U << DTA_REG_RDX);
     } else if (insn->id == X86_INS_IMUL) {
         const cs_x86_op *dst = &x->operands[0], *src = &x->operands[1];
+        bool implicit = x->op_count == 1;
         unsigned width = dst->size * 8U, wide = width * 2U;
         /* Read all sources before replacing an aliased destination. Capstone
          * exposes the signed imm8/imm16/imm32 at the destination width. */
-        IrValueId a = read_operand(&l, x, x->op_count == 2 ? dst : src, &r);
-        IrValueId b = x->op_count == 2 && src->type == X86_OP_REG && src->reg == dst->reg
+        IrValueId a = implicit ? read_register(&l, X86_REG_EAX)
+            : read_operand(&l, x, x->op_count == 2 ? dst : src, &r);
+        IrValueId b = implicit ? read_operand(&l, x, dst, &r)
+            : x->op_count == 2 && src->type == X86_OP_REG && src->reg == dst->reg
             ? a : read_operand(&l, x, &x->operands[x->op_count - 1U], &r);
         IrValueId product = binary(&l, IR_OP_MUL, wide,
             unary(&l, IR_OP_SEXT, wide, a, 0), unary(&l, IR_OP_SEXT, wide, b, 0));
@@ -1086,7 +1301,14 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
                 i == X86_SPECIAL_STATE_OF) ? overflow : emit(&l, (IrInstSpec){
                 .op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
         ir_module_build_phase(f->module, previous);
-        write_operand(&l, x, dst, value, &r);
+        if (implicit) {
+            /* The source/address was captured before replacing EAX or EDX. */
+            write_register(&l, X86_REG_EAX, value);
+            write_register(&l, X86_REG_EDX, unary(&l, IR_OP_EXTRACT, 32, product, 32));
+            r.gpr_writes = (1U << DTA_REG_RAX) | (1U << DTA_REG_RDX);
+        } else {
+            write_operand(&l, x, dst, value, &r);
+        }
     } else if (insn->id == X86_INS_NOT || insn->id == X86_INS_BSWAP) {
         const cs_x86_op *dst = &x->operands[0];
         IrValueId old = read_operand(&l, x, dst, &r), value;
@@ -1199,7 +1421,9 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
             r.gpr_writes |= 1U << DTA_REG_RBP;
         } else
             write_operand(&l, x, &x->operands[0], value, &r);
-    } else if (shift(insn->id)) {
+    } else if (insn->id == X86_INS_ROL || insn->id == X86_INS_ROR) {
+        rotates32(&l, insn->id, x, &r);
+    } else if (shift(insn->id) || insn->id == X86_INS_SHRD || insn->id == X86_INS_SHLD) {
         shifts(&l, insn->id, x, &r);
     } else if (unary_arithmetic(insn->id)) {
         const cs_x86_op *dst = &x->operands[0];

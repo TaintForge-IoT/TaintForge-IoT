@@ -1,0 +1,99 @@
+{
+  "cases": [
+    {
+      "changed_offsets": [
+        0,
+        1
+      ],
+      "compare_value": 666,
+      "data": "data/div32-O1",
+      "elf_hex_sha256": "e8bf7a836bbaed01831c87eb82b64250953263434b04f7e0983540e720ecc7eb",
+      "elf_sha256": "9f748fb1df9fe88b89194b75135f4d7e705827404396066910cd7e27b7df0b72",
+      "evidence_archive_sha256": "f1e188490a63870a3e91f3519019b7bae8ff25860a05dfcd1bece1c63a872a89",
+      "expected_seed_value": 666,
+      "expected_sha256": "13bf185ae1f0a3e17785e15d0fc80f3321d0f55f28d0d1756052f24eebd2a61e",
+      "expected_witness_value": 334,
+      "id": "div32-O1",
+      "occurrence": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "pc": 134516817,
+      "seed_sha256": "8ddf68bcd4b3bf24cd10f55f6ff6fd5b8d1629d1cae6172ac60f893cd4dd9bc3",
+      "seed_stdout_sha256": "e2ca2771fc7c542bcdeeb6065a6e872ff2f2d263a19005b55f63311c0a8f1fa9",
+      "source_candidate_report_sha256": "31cbaa5cda10b4024ca8df7a5fb70dfbd761ca7519c05704cd081de12aa32828",
+      "source_solve_report_sha256": "d3edf447ad13cd07633751d60a43912222345017d911a2fd104cc5d8d7aa82cd",
+      "witness_sha256": "5fb807ce100c90d2837ccfc94d8f8ba5d35cd3d6fafcd2f41f245b596e360057",
+      "witness_stdout_sha256": "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5"
+    },
+    {
+      "changed_offsets": [
+        0,
+        1,
+        4
+      ],
+      "compare_value": 666,
+      "data": "data/div32-O2",
+      "elf_hex_sha256": "540b88e4bfb0724b8fb79eafd1299f37df8fead58880fc4375e4ca543a1da071",
+      "elf_sha256": "ad5089ce142a0ad8fd9dab0e80f6e4e3c97072407900e44c3681cea0349cb302",
+      "evidence_archive_sha256": "f1e188490a63870a3e91f3519019b7bae8ff25860a05dfcd1bece1c63a872a89",
+      "expected_seed_value": 666,
+      "expected_sha256": "f59d28edf394b4b6c9beca1c23092f89a223cb87637936939c64e2e05368475a",
+      "expected_witness_value": 206,
+      "id": "div32-O2",
+      "occurrence": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "pc": 134516817,
+      "seed_sha256": "8ddf68bcd4b3bf24cd10f55f6ff6fd5b8d1629d1cae6172ac60f893cd4dd9bc3",
+      "seed_stdout_sha256": "e2ca2771fc7c542bcdeeb6065a6e872ff2f2d263a19005b55f63311c0a8f1fa9",
+      "source_candidate_report_sha256": "539676cd1dec7070e3cff7581065d61a38d35fbb3043cfb502d0a1157eac8cd3",
+      "source_solve_report_sha256": "cdc28e7b0198e325c7382727417d35845083d7c40df53cd4a8f6ba39f5df7255",
+      "witness_sha256": "473575a3a45978464da9d7b5a7faa6c9b72f9dc124a2f1b7a31d6bbe074c902d",
+      "witness_stdout_sha256": "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5"
+    },
+    {
+      "changed_offsets": [
+        0,
+        1,
+        4
+      ],
+      "compare_value": 666,
+      "data": "data/div32-O3",
+      "elf_hex_sha256": "7e4350ad1f87b18b0f5876757a1de46546f2112b177cc32365747ec82cb10140",
+      "elf_sha256": "fb2a6c8ab3c6e4a791555eef5f682a721cce02c976740b5d20e16d2f056267ad",
+      "evidence_archive_sha256": "f1e188490a63870a3e91f3519019b7bae8ff25860a05dfcd1bece1c63a872a89",
+      "expected_seed_value": 666,
+      "expected_sha256": "f59d28edf394b4b6c9beca1c23092f89a223cb87637936939c64e2e05368475a",
+      "expected_witness_value": 206,
+      "id": "div32-O3",
+      "occurrence": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "pc": 134516817,
+      "seed_sha256": "8ddf68bcd4b3bf24cd10f55f6ff6fd5b8d1629d1cae6172ac60f893cd4dd9bc3",
+      "seed_stdout_sha256": "e2ca2771fc7c542bcdeeb6065a6e872ff2f2d263a19005b55f63311c0a8f1fa9",
+      "source_candidate_report_sha256": "539676cd1dec7070e3cff7581065d61a38d35fbb3043cfb502d0a1157eac8cd3",
+      "source_solve_report_sha256": "cdc28e7b0198e325c7382727417d35845083d7c40df53cd4a8f6ba39f5df7255",
+      "witness_sha256": "473575a3a45978464da9d7b5a7faa6c9b72f9dc124a2f1b7a31d6bbe074c902d",
+      "witness_stdout_sha256": "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5"
+    }
+  ],
+  "input_path": "/etc/dta-input",
+  "profile": "div32-fixed-elf-regressions-v1",
+  "schema": 1
+}

@@ -5,7 +5,9 @@
 #include "ir_environment.h"
 #include "trace.h"
 
-/* IA-32 data movement, arithmetic, shifts, stack, flags, SETcc/CMOVcc and near transfers.
+/* IA-32 data movement, arithmetic, shifts, register BT32/DIV32/IDIV32/BSF32/BSR32/ROL32/ROR32/SHRD32/SHLD32,
+ * bare MUL/one-operand IMUL r/m32 under the existing RAM contract, CDQ, stack, flags,
+ * SETcc/CMOVcc and near transfers.
  * These keys belong to the x86 frontend, not the generic IR.
  * GPR order is the existing RegId order 0..7;
  * flag order is CF/PF/AF/ZF/SF/OF/DF (X86SpecialStateId). */
@@ -127,6 +129,33 @@ typedef struct IrX86Frontend IrX86Frontend;
  * Its register/memory source is read unconditionally, even when the condition is false.
  * Exact F3 0F 1E FB ENDBR32 is a no-op under flat32_ram's CET-disabled contract;
  * other ENDBR encodings remain unsupported. Replay checkpoints retain its origin.
+ * DIV r32 reads EDX:EAX and the old divisor; EDX < divisor guards the
+ * non-faulting domain before any state write. CF/PF/AF/ZF/SF/OF become
+ * undefined, DF is preserved. Fault delivery and memory/8/16-bit DIV
+ * remain outside this frontend's unsigned DIV support.
+ * Bare 99 CDQ sign-extends EAX into EDX and preserves all flags.
+ * IDIV r32 uses the full signed EDX:EAX dividend, truncates toward zero,
+ * and gives the remainder the dividend's sign. A nonzero divisor and
+ * sign-extension equality for the quotient guard every state write.
+ * This also rejects INT64_MIN/-1 and INT32_MIN/-1 where applicable.
+ * IDIV memory/8/16-bit forms and exception delivery remain unsupported.
+ * Bare BSF/BSR r32,r32 locate the least/most significant set bit for a
+ * nonzero source and define ZF as source == 0. The portable legacy profile
+ * conservatively leaves a zero-source destination and CF/PF/AF/SF/OF
+ * unknown; CPU-specific preserved destinations/flags are not assumed.
+ * DF is preserved. Memory/16-bit/prefixed bit scans remain unsupported.
+ * Bare D3 /0 and /1 register ROL/ROR r32,CL use the old CL masked by 31.
+ * Count zero preserves all flags. Nonzero CF is exact; OF is defined only
+ * for count one, and remains unknown for larger counts. PF/AF/ZF/SF/DF
+ * are preserved. Other rotate encodings remain unsupported.
+ * Bare 0F AD /r SHRD r32,r32,CL reads both old operands and old CL & 31.
+ * Count zero preserves destination and all flags. Nonzero CF/SF/ZF/PF are
+ * exact; AF is undefined and OF is defined only for count one. DF is preserved.
+ * Bare 0F A5 /r and 0F A4 /r ib SHLD r32,r32,CL/imm8 reads both old
+ * operands before writing the destination; its count is masked with 31.
+ * Count zero preserves the destination and all flags. Nonzero CF/SF/ZF/PF
+ * are exact, AF is undefined, and OF is defined only for count one. DF is preserved.
+ * Memory/16-bit/prefixed double shifts and immediate SHRD remain unsupported.
  * Lifting never consults an observed branch outcome. */
 IrX86Frontend *ir_x86_frontend_create(IrModule *module, const IrX86Options *options);
 void ir_x86_frontend_destroy(IrX86Frontend *frontend);

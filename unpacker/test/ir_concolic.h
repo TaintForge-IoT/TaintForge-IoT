@@ -32,6 +32,11 @@ typedef struct {
     IrOrigin branch;
     uint32_t prefix_branches;
     char fixed_inputs_sha256[65];
+    bool replay_build_attempted;
+    IrReplayBuildStatus replay_build_status;
+    uint32_t replay_build_issues, replay_selected_steps, replay_lifted_steps;
+    IrOrigin replay_stopped_origin;
+    uint8_t replay_stopped_size, replay_stopped_bytes[MAX_INSN_BYTES];
 } IrConcolicReadResult;
 
 /* Unused bytes keep their observations and have input ID zero. The selected
