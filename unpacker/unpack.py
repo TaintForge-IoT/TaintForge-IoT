@@ -284,14 +284,25 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
         # No original ELF is examined until after reconstruction from observed RAM.
         if oracle is not None:
             original = regular(oracle, MAX_INPUT_ELF, 'Original comparison oracle')
-            reference = ct_elf.read_elf(original)
+            reference = ct_elf.read_elf(original, allow_tls=True)
             oracle_receipt = ct_elf.code_oracle(regions, ct_elf.integer(report['oep'], 'oep'), reference)
+            original_tls, rebuilt_tls = reference.get('tls'), reconstruction.get('tls')
+            if original_tls is not None:
+                start = original_tls['offset']
+                initializer = reference['data'][start:start + original_tls['filesz']]
+                oracle_receipt['tls_template_exact'] = (rebuilt_tls is not None and
+                    all(original_tls[k] == rebuilt_tls[k] for k in
+                        ('address', 'filesz', 'memsz', 'flags', 'align')) and
+                    hashlib.sha256(initializer).hexdigest() == rebuilt_tls['initializer_sha256'])
+            elif rebuilt_tls is not None:
+                oracle_receipt['tls_template_exact'] = False
             oracle_receipt.update(original_sha256=reference['sha256'],
                 original_read_after_reconstruction=True, original_used_as_reconstruction_input=False,
                 original_prepack_history_authenticated=False)
             save(output / 'oracle.json', oracle_receipt)
-            require(oracle_receipt['entry_exact'] and oracle_receipt['complete_exact_match'],
-                    'REFERENCE_IMAGE_MISMATCH', 'Observed entry/executable bytes differ from the optional original')
+            require(oracle_receipt['entry_exact'] and oracle_receipt['complete_exact_match']
+                    and oracle_receipt.get('tls_template_exact', True),
+                    'REFERENCE_IMAGE_MISMATCH', 'Observed entry, executable bytes or TLS differ from the optional original')
             oracle_copy = inputs / 'original.elf'
             oracle_copy.write_bytes(reference['data'])
             oracle_copy.chmod(0o700)

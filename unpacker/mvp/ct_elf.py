@@ -269,31 +269,72 @@ def validate_stage_selection(report):
         reject('Selected stage file backing differs from detailed capture metadata')
 
 
-def read_elf(path):
-    path = Path(path)
-    if not ELF_HEADER.size <= path.stat().st_size <= MAX_BYTES:
-        raise CaptureError('UNSUPPORTED_PROFILE', 'ELF size is outside the supported budget')
-    data = path.read_bytes()
+def _program_headers(data, maximum):
     header = ELF_HEADER.unpack_from(data)
     ident, kind, machine, version, entry, phoff, _, _, ehsize, phsize, phnum, _, _, _ = header
     if (ident[:7] != b'\x7fELF\x01\x01\x01' or kind != 2 or machine != 3 or version != 1
             or ehsize != ELF_HEADER.size or phsize != PROGRAM_HEADER.size):
         raise CaptureError('UNSUPPORTED_PROFILE', 'Require little-endian i386 ELF32 ET_EXEC')
-    if not 1 <= phnum <= MAX_REGIONS + 3 or phoff < ehsize or phoff + phnum * phsize > len(data):
+    end = phoff + phnum * phsize
+    if not 1 <= phnum <= maximum or phoff < ehsize or end > len(data):
         raise CaptureError('INVALID_ELF', 'Invalid program-header table')
+    return entry, end, list(PROGRAM_HEADER.iter_unpack(data[phoff:end]))
+
+
+def _load_segments(headers, file_size):
     programs = []
-    for i in range(phnum):
-        ptype, offset, address, _, filesz, memsz, flags, align = PROGRAM_HEADER.unpack_from(data, phoff + i * phsize)
-        if ptype in (PT_DYNAMIC, PT_INTERP, PT_TLS):
-            raise CaptureError('UNSUPPORTED_PROFILE', 'Dynamic linking and TLS are outside the first profile')
+    for ptype, offset, address, _, filesz, memsz, flags, align in headers:
         if ptype == PT_LOAD:
-            if (filesz > memsz or offset + filesz > len(data) or address + memsz > 2**32
+            if (filesz > memsz or offset + filesz > file_size or address + memsz > 2**32
                     or flags & ~7 or align not in (0, 1) and (align & (align - 1) or (address - offset) % align)):
                 raise CaptureError('INVALID_ELF', 'Invalid PT_LOAD extent, permissions or alignment')
             programs.append(dict(address=address, offset=offset, filesz=filesz, memsz=memsz, flags=flags))
-    if not programs or not any(p['flags'] & 1 and p['address'] <= entry < p['address'] + p['memsz'] for p in programs):
+    return programs
+
+
+def _mapped_file_offset(loads, address, count):
+    end = address + count
+    owners = [p for p in loads if p['memsz'] and p['address'] < end
+              and address < p['address'] + p['memsz']]
+    if len(owners) == 1:
+        load = owners[0]
+        if (load['flags'] & 4 and load['address'] <= address
+                and end <= load['address'] + load['filesz']):
+            return load['offset'] + address - load['address']
+    return None
+
+
+def _tls_segment(headers, loads, file_size):
+    if len(headers) != 1:
+        raise CaptureError('INVALID_TLS', 'Require one unambiguous PT_TLS descriptor')
+    _, offset, address, _, filesz, memsz, flags, align = headers[0]
+    if (not 0 < memsz <= MAX_BYTES or filesz > memsz or flags != 4
+            or address + memsz > 2**32 or offset + filesz > file_size
+            or align > PAGE or align & (align - 1) or (address - offset) % max(1, align)):
+        raise CaptureError('INVALID_TLS', 'Invalid or unsupported PT_TLS extent, flags or alignment')
+    # The remainder of the TLS block is allocated and zeroed by the loader.
+    # Only the initializer has file bytes and a mapped image address.
+    if filesz and _mapped_file_offset(loads, address, filesz) != offset:
+        raise CaptureError('INVALID_TLS', 'TLS initializer needs a unique readable file-backed PT_LOAD')
+    return dict(address=address, offset=offset, filesz=filesz, memsz=memsz, flags=flags, align=align)
+
+
+def read_elf(path, *, allow_tls=False):
+    path = Path(path)
+    if not ELF_HEADER.size <= path.stat().st_size <= MAX_BYTES:
+        raise CaptureError('UNSUPPORTED_PROFILE', 'ELF size is outside the supported budget')
+    data = path.read_bytes()
+    entry, _, headers = _program_headers(data, MAX_REGIONS + (4 if allow_tls else 3))
+    tls = [p for p in headers if p[0] == PT_TLS]
+    if any(p[0] in (PT_DYNAMIC, PT_INTERP) for p in headers) or (tls and not allow_tls):
+        raise CaptureError('UNSUPPORTED_PROFILE', 'Require a static ELF and an enabled profile for TLS')
+    loads = _load_segments(headers, len(data))
+    if not any(p['flags'] & 1 and p['address'] <= entry < p['address'] + p['memsz'] for p in loads):
         raise CaptureError('INVALID_ELF', 'Entry is outside executable PT_LOAD memory')
-    return dict(entry=entry, loads=programs, data=data, sha256=hashlib.sha256(data).hexdigest())
+    image = dict(entry=entry, loads=loads, data=data, sha256=hashlib.sha256(data).hexdigest())
+    if tls:
+        image['tls'] = _tls_segment(tls, loads, len(data))
+    return image
 
 
 def load_capture(report_path, dump_path):
@@ -388,10 +429,37 @@ def code_oracle(regions, entry, reference):
                 entry_exact=entry == reference['entry'], complete_exact_match=expected > 0 and equal == expected)
 
 
+def _captured_tls(report, regions, entry):
+    first = regions[0]
+    base = first['address']
+    if (report.get('main_image_verified') is not True or not first['prot'] & 1
+            or report.get('base') is None or integer(report['base'], 'base') != base):
+        return None
+    # Restrict discovery to the mapped ELF header at the reported image base.
+    # The packed stub can leave a different header there at earlier captures.
+    try:
+        observed_entry, table_end, headers = _program_headers(first['data'][:PAGE], MAX_REGIONS)
+    except CaptureError:
+        return None
+    if observed_entry != entry:
+        return None
+    tls = [p for p in headers if p[0] == PT_TLS]
+    if not tls:
+        return None
+    loads = _load_segments(headers, MAX_BYTES)
+    if (any(p[0] in (PT_DYNAMIC, PT_INTERP) for p in headers)
+            or _mapped_file_offset(loads, base, table_end) != 0
+            or not any(p['flags'] & 1 and p['address'] <= entry < p['address'] + p['filesz']
+                       for p in loads)):
+        raise CaptureError('INVALID_TLS', 'Cannot bind the TLS header table to the captured static image')
+    return _tls_segment(tls, loads, MAX_BYTES)
+
+
 def rebuild(report_path, dump_path, output):
     output = Path(output)
     report, regions = load_capture(report_path, dump_path)
     entry = integer(report['oep'], 'oep')
+    tls = _captured_tls(report, regions, entry)
     groups = []
     for region in regions:
         if groups and groups[-1]['address'] + groups[-1]['size'] == region['address'] and groups[-1]['prot'] == region['prot']:
@@ -399,7 +467,7 @@ def rebuild(report_path, dump_path, output):
             groups[-1]['size'] += region['size']
         else:
             groups.append(dict(address=region['address'], size=region['size'], prot=region['prot'], parts=[region['data']]))
-    phnum = len(groups) + 3
+    phnum = len(groups) + 3 + (tls is not None)
     header_size = (ELF_HEADER.size + phnum * PROGRAM_HEADER.size + PAGE - 1) // PAGE * PAGE
     header_address = regions[0]['address'] - header_size
     if header_address < 0x10000:
@@ -420,11 +488,24 @@ def rebuild(report_path, dump_path, output):
                                          group['size'], group['size'], flags, PAGE))
         loads.append(dict(address=group['address'], offset=offset, size=group['size'], flags=flags))
         offset += group['size']
+    if tls is not None:
+        address, filesz, align = tls['address'], tls['filesz'], tls['align']
+        if filesz:
+            owner = next((p for p in loads if p['flags'] & 4 and p['address'] <= address
+                          and address + filesz <= p['address'] + p['size']), None)
+            if owner is None:
+                raise CaptureError('INVALID_TLS', 'TLS initializer is outside a readable captured PT_LOAD')
+            tls['offset'] = owner['offset'] + address - owner['address']
+        else:
+            tls['offset'] = address % max(1, align)
+        phdrs.append(PROGRAM_HEADER.pack(PT_TLS, tls['offset'], address, address,
+                                         filesz, tls['memsz'], tls['flags'], align))
     phdrs.append(PROGRAM_HEADER.pack(PT_GNU_STACK, 0, 0, 0, 0, 0, 6, 16))
     if output.exists():
         raise CaptureError('OUTPUT_EXISTS', f'Refusing to overwrite {output}')
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=output.name + '.', dir=output.parent)
+    tls_receipt = None
     try:
         with os.fdopen(fd, 'wb') as stream:
             metadata = header + b''.join(phdrs)
@@ -436,17 +517,28 @@ def rebuild(report_path, dump_path, output):
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o755)
-        verified = read_elf(temporary)
+        verified = read_elf(temporary, allow_tls=tls is not None)
+        if verified.get('tls') != tls:
+            raise CaptureError('REBUILD_MISMATCH', 'Rebuilt PT_TLS differs from the capture')
         for load in loads:
             raw = verified['data'][load['offset']:load['offset'] + load['size']]
             if raw != captured_bytes(regions, load['address'], load['size']):
                 raise CaptureError('REBUILD_MISMATCH', 'Rebuilt PT_LOAD bytes differ from the capture')
+        if tls is not None:
+            start = tls['offset']
+            initializer = verified['data'][start:start + tls['filesz']]
+            tls_receipt = dict(tls, source='captured_program_headers',
+                               header_address=regions[0]['address'],
+                               initializer_sha256=hashlib.sha256(initializer).hexdigest())
         os.link(temporary, output)
     finally:
         Path(temporary).unlink(missing_ok=True)
-    return dict(status='REBUILT_IMAGE', entry=f'0x{entry:x}', elf_sha256=sha256(output),
+    receipt = dict(status='REBUILT_IMAGE', entry=f'0x{entry:x}', elf_sha256=sha256(output),
                 elf_bytes=output.stat().st_size, metadata_address=f'0x{header_address:x}',
                 report_sha256=sha256(report_path), dump_sha256=sha256(dump_path),
                 capture_consistency=report.get('capture_consistency'),
                 capture_trace_seq=report.get('capture_trace_seq'), loads=loads,
                 process_snapshot=False, oep_proof='NOT_ESTABLISHED')
+    if tls_receipt is not None:
+        receipt['tls'] = tls_receipt
+    return receipt
