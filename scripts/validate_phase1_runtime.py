@@ -5,12 +5,75 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
 from pathlib import Path
 import subprocess
 import time
 
-from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1RuntimeError, digest
+from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1RuntimeError, digest, read_json
+
+
+CLEANUP_CASES = (
+    ("cleanup-ret", 0, "ret"),
+    ("failed-munmap", 1, None),
+    ("unrelated-munmap", 2, None),
+    ("unbound-jump", 3, None),
+    ("partial-target-write", 4, None),
+    ("cleanup-jmp-eax", 5, "jmp_eax"),
+    ("interrupted-return", 6, None),
+    ("overlapping-target", 7, None),
+)
+
+
+def validate_cleanup(attempt, binary, expected_transfer):
+    symbols = {}
+    for line in subprocess.check_output(["nm", "-n", str(binary)], text=True).splitlines():
+        address, _, symbol = line.split()
+        if symbol in ("cleanup", "target"):
+            symbols[symbol] = int(address, 16)
+    cleanup_pc, target_pc = symbols["cleanup"], symbols["target"]
+    assert cleanup_pc // 4096 == target_pc // 4096
+    assert (attempt.directory / "guest_stdout.log").read_bytes() == b"S37_SYNTHETIC_TARGET_REACHED\n"
+    capture = attempt.verify()
+    report = read_json(attempt.paths["report"])
+    events = attempt.events()
+    assert capture["runtime_observed"] and report["main_image_verified"]
+    assert not any(event["event_type"] in ("data_loss", "profile_lost") for event in events)
+    observed = [event for event in events if event["event_type"] == "oep_candidate_observed"]
+    cleanups = [event for event in observed if event["data"]["address"] == cleanup_pc]
+    targets = [event for event in observed if event["data"]["address"] == target_pc]
+    transfers = [event for event in events if event["event_type"] == "oep_cleanup_transfer_observed"]
+    unmappings = [event for event in events if event["event_type"] == "code_generation_changed"
+                  and "executed_mapping_unmapped" in event["incomplete_reasons"]]
+    assert len(cleanups) == 1
+    cleanup = cleanups[0]
+    failed_unmap = attempt.attempt_id == "attempt-failed-munmap"
+    if failed_unmap:
+        assert not unmappings
+        assert b"memory operation failed: num=91" in (attempt.directory / "analyzer_stderr.log").read_bytes()
+    else:
+        assert len(unmappings) == 1 and cleanup["event_seq"] < unmappings[0]["event_seq"]
+    if expected_transfer is None:
+        assert not transfers and not targets, "cleanup false positive"
+        assert capture["capture_status"] == ("success" if failed_unmap else "not_available")
+        return
+
+    assert len(transfers) == len(targets) == 1
+    transfer, target = transfers[0], targets[0]
+    assert transfer["data"] == {
+        "source_candidate_id": cleanup["data"]["candidate_id"],
+        "unmap_seq": cleanup["trace_seq"],
+        "unmapped_page": unmappings[0]["data"]["address"],
+        "transfer_seq": target["trace_seq"] - 1,
+        "address": target_pc,
+        "transfer": expected_transfer,
+    }
+    assert unmappings[0]["event_seq"] < transfer["event_seq"] < target["event_seq"]
+    assert target["analysis_epoch"] == cleanup["analysis_epoch"] + 1
+    assert target["data"]["observed_code_generation"] == cleanup["data"]["observed_code_generation"]
+    assert target["data"]["parent_candidate_id"] == 0
+    assert capture["capture_status"] == "success"
+    assert int(report["oep"], 16) == target_pc
+    assert report["capture_candidate_id"] == target["data"]["candidate_id"]
 
 
 def main() -> None:
@@ -27,17 +90,21 @@ def main() -> None:
     qemu_identity = runtime.validate_qemu(qemu)
     results = []
     binaries = {}
-    for name, definitions in (("layers", []), ("live", ["--defsym", "WAIT_FOR_INPUT=1"]),
-                              ("pages", ["--defsym", "SECOND_PAGE=1"]),
-                              ("fork", ["--defsym", "WITH_FORK=1"])):
+    fixtures = [("layers", "phase1_two_layers.S", ()),
+                ("live", "phase1_two_layers.S", ("--defsym", "WAIT_FOR_INPUT=1")),
+                ("pages", "phase1_two_layers.S", ("--defsym", "SECOND_PAGE=1")),
+                ("fork", "phase1_two_layers.S", ("--defsym", "WITH_FORK=1"))]
+    fixtures.extend((name, "phase1_cleanup_tail.S", ("--defsym", f"SCENARIO={variant}"))
+                    for name, variant, _ in CLEANUP_CASES)
+    for name, source, definitions in fixtures:
         obj, binary = output / f"{name}.o", output / name
-        subprocess.run(["as", "--32", *definitions, str(root / "tests/phase1_two_layers.S"), "-o", str(obj)], check=True)
+        subprocess.run(["as", "--32", *definitions, str(root / "tests" / source), "-o", str(obj)], check=True)
         subprocess.run(["ld", "-m", "elf_i386", str(obj), "-o", str(binary)], check=True)
         binaries[name] = binary
 
-    def run(name, *, extra=(), binary=None, flags=False, live=False, terminate=False):
+    def run(name, *, extra=(), binary=None, flags=False, live=False, terminate=False, ir=True):
         attempt = Phase1Run(runtime, "phase1-validation", name, name, output / name.replace("attempt", "run"), flags)
-        argument = attempt.plugin_argument(extra=extra)
+        argument = attempt.plugin_argument(ir=ir, extra=extra)
         with (attempt.directory / "guest_stdout.log").open("wb") as stdout, (attempt.directory / "analyzer_stderr.log").open("wb") as stderr:
             proc = subprocess.Popen([str(qemu), "-plugin", argument, str(binary or binaries["layers"])], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
             try:
@@ -76,6 +143,16 @@ def main() -> None:
         assert "PHASE1_TWO_LAYERS_OK" in (attempt.directory / "guest_stdout.log").read_text()
         assert all(e.get("status") != "guest_fake" for e in attempt.events())
         results.append({"test": attempt.attempt_id, "status": "PASS", "evidence": evidence})
+
+    for name, _, expected_transfer in CLEANUP_CASES:
+        # The binary and attempt directory need separate names.
+        binary = binaries[name]
+        attempt, code = run("attempt-" + name, binary=binary, ir=False,
+                            extra=("tf-capture=entry", "dse-check=off", "ir-trace-capacity=4096",
+                                   "tf-max-candidates=16", "tf-max-events=512", "runtime-log=summary"))
+        assert code == 0, name
+        validate_cleanup(attempt, binary, expected_transfer)
+        results.append({"test": name, "status": "PASS"})
     attempt, code = run("attempt-live", binary=binaries["live"], extra=("tf-selection-delay=8",), live=True)
     assert code == 0 and attempt.verify()["runtime_observed"]
     results.append({"test": "OEP event before exit; natural continuation; preserved stack", "status": "PASS"})

@@ -471,6 +471,10 @@ static struct { bool active, supported; } g_stage_pending_msync;
  * It is evidence about this run, never a semantic unpacker classification. */
 static __thread oep_cand_t *g_active_candidate;
 static __thread uint64_t prev_jump_owner_id;
+static __thread struct {
+    uint64_t candidate_id, unmapped_page, target;
+    bool jmp_eax;
+} g_cleanup_transfer;
 
 typedef struct {
     uint64_t pc;
@@ -3438,7 +3442,34 @@ static void apply_pending_mprotect(const pending_mmap_t *pending) {
     }
 }
 
-static void apply_pending_munmap(const pending_mmap_t *pending) {
+static void stage_note_cleanup_unmap(const TraceEntry *syscall, uint64_t first,
+                                     uint64_t last) {
+    const oep_cand_t *tail = g_active_candidate;
+    if (!syscall || !is_i386 || !g_phase1.enabled || !g_main_known || page_size != 4096 ||
+        !tail || !tail->code_page_bytes || tail->stale || tail->superseded ||
+        tail->epoch != g_phase1.epoch || tail->epoch == UINT64_MAX ||
+        tail->observed_seq > UINT64_MAX - 4 || syscall->seq_id != tail->observed_seq ||
+        syscall->seq_id != g_phase1.trace_seq || syscall->vcpu_index != tail->vcpu ||
+        syscall->pc != tail->addr || syscall->size != 2 ||
+        syscall->instr_bytes[0] != 0xcd || syscall->instr_bytes[1] != 0x80 ||
+        tail->addr < g_main_lo || tail->addr >= g_main_hi ||
+        tail->addr - tail->code_page > page_size - syscall->size ||
+        (first < g_main_hi && last + page_size > g_main_lo))
+        return;
+
+    uint64_t source_page = tail->jump_site & ~((uint64_t)page_size - 1U);
+    if (!tail->jump_site || source_page < first || source_page > last)
+        return;
+    const page_t *source = g_hash_table_lookup(pages, (gpointer)(uintptr_t)source_page);
+    if (!source || !source->exec_seen || !(source->prot & 0x4))
+        return;
+    g_cleanup_transfer.candidate_id = tail->candidate_id;
+    g_cleanup_transfer.unmapped_page = source_page;
+    g_cleanup_transfer.jmp_eax = false;
+    g_cleanup_transfer.target = 0;
+}
+
+static void apply_pending_munmap(const pending_mmap_t *pending, const TraceEntry *syscall) {
     if (!pending || !pending->active || pending->size == 0) {
         return;
     }
@@ -3460,6 +3491,7 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
     uint64_t page_last = last_addr & ~page_mask;
     uint64_t unmapped_size = (page_last - page_start) + (uint64_t)page_size;
 
+    stage_note_cleanup_unmap(syscall, page_start, page_last);
     stage_invalidate_mapping_range(page_start, unmapped_size);
     shadow_untaint_range(g_shadow, page_start, unmapped_size);
 
@@ -3624,6 +3656,66 @@ static oep_cand_t *stage_owner_for_instruction(const InsnExecCtx *instruction,
     return owner;
 }
 
+/* A tail may unmap the executable page that entered it, restore registers
+ * and return into older written bytes on its own page. This observation
+ * admits a fresh candidate after normal invalidation, without a STORE edge. */
+static bool stage_cleanup_entry(const InsnExecCtx *instruction, const page_t *page,
+                                uint64_t seq, uint32_t vcpu, bool adjacent_transfer) {
+    if (!g_cleanup_transfer.candidate_id)
+        return false;
+    const oep_cand_t *tail = g_active_candidate;
+    /* The old verdict is stale, but its page snapshot can still match live code. */
+    if (!tail || tail->candidate_id != g_cleanup_transfer.candidate_id ||
+        !tail->stale || g_phase1.epoch != tail->epoch + 1 ||
+        stage_owner_for_instruction(instruction, seq, vcpu) != tail) {
+        g_cleanup_transfer.candidate_id = 0;
+        return false;
+    }
+
+    uint64_t offset = seq - tail->observed_seq;
+    const uint8_t *bytes = instruction->instr_bytes;
+    if (offset == 1 && instruction->pc == tail->addr + 2 &&
+        instruction->size == 1 && bytes[0] == 0x61)
+        return false; /* POPAL */
+    if (offset == 2 && instruction->pc == tail->addr + 3 &&
+        instruction->size == 1 && (bytes[0] == 0xc3 || bytes[0] == 0x58)) {
+        g_cleanup_transfer.jmp_eax = bytes[0] == 0x58; /* RET or POP EAX */
+        return false;
+    }
+    bool jmp_eax = g_cleanup_transfer.jmp_eax;
+    if (offset == 3 && jmp_eax && instruction->pc == tail->addr + 4 &&
+        instruction->size == 3 && bytes[0] == 0x3e && bytes[1] == 0xff && bytes[2] == 0xe0 &&
+        dse_read_reg(DTA_REG_RAX, &g_cleanup_transfer.target))
+        return false; /* JMP DS:EAX */
+
+    g_cleanup_transfer.candidate_id = 0;
+    uint64_t transfer_pc = tail->addr + (jmp_eax ? 4 : 3);
+    uint64_t target_end = instruction->pc + instruction->size;
+    if (offset != (jmp_eax ? 4U : 3U) || !page || !page->wbitmap ||
+        page->mapping_epoch != tail->mapping_epoch ||
+        page->gen_written != tail->code_generation || !adjacent_transfer ||
+        prev_jump_owner_id != tail->candidate_id || prev_jump_site != transfer_pc ||
+        (jmp_eax ? (prev_target_reg != DTA_REG_RAX ||
+                    instruction->pc != (uint32_t)g_cleanup_transfer.target) : !prev_mem_target_valid) ||
+        instruction->pc < g_main_lo || target_end > g_main_hi ||
+        (instruction->pc < transfer_pc + (jmp_eax ? 3 : 1) && target_end > tail->addr))
+        return false;
+
+    /* A dynamic-exec flag or a single written byte is insufficient here. */
+    size_t first = instruction->pc - tail->code_page;
+    for (size_t byte = first; byte < first + instruction->size; ++byte)
+        if (!(page->wbitmap[byte >> 3] & (1U << (byte & 7U))))
+            return false;
+    char *payload = g_strdup_printf("{\"source_candidate_id\":%" PRIu64
+        ",\"unmap_seq\":%" PRIu64 ",\"unmapped_page\":%" PRIu64
+        ",\"transfer_seq\":%" PRIu64 ",\"address\":%" PRIu64 ",\"transfer\":\"%s\"}",
+        tail->candidate_id, tail->observed_seq, g_cleanup_transfer.unmapped_page,
+        prev_jump_seq_id, instruction->pc, jmp_eax ? "jmp_eax" : "ret");
+    tf_phase1_event(&g_phase1, "oep_cleanup_transfer_observed", "observed", NULL, payload);
+    g_free(payload);
+    return true;
+}
+
 static void stage_record_write(page_t *page, uint64_t address, uint32_t size,
                                 const oep_cand_t *owner, const InsnExecCtx *writer,
                                 uint64_t seq, uint32_t generation, uint32_t vcpu) {
@@ -3692,6 +3784,7 @@ static void stage_clear_producers(void) {
                 g_stage_memfd_files[file].store_pages[i]->producer_valid = false;
     g_active_candidate = NULL;
     prev_jump_owner_id = 0;
+    g_cleanup_transfer.candidate_id = 0;
 }
 
 /* Destroyed target or writer lifetimes cannot lend ownership to new bytes. */
@@ -5190,6 +5283,7 @@ static void phase1_release_owned(void) {
     oep_cands = NULL;
     g_active_candidate = NULL;
     prev_jump_owner_id = 0;
+    g_cleanup_transfer.candidate_id = 0;
     provenance_runtime_destroy();
     proc_executable_reset();
     g_clear_pointer(&g_main_image_path, g_free);
@@ -5366,7 +5460,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 apply_pending_mmap(&change, before);
             } else if (after < before) {
                 change.requested_addr = after; change.size = before - after;
-                apply_pending_munmap(&change);
+                apply_pending_munmap(&change, NULL);
             }
         }
         if (previous_aux->syscall && previous_aux->syscall->number == 6 &&
@@ -5592,6 +5686,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
             ir_plugin_check(vcpu_state, cpu_index, current_trace_seq_id, IR_RUNTIME_PROBE, 0, -1);
     }
     if (!meta) {
+        g_cleanup_transfer.candidate_id = 0;
         prev_jump_pending = false;
         prev_jump_site = 0;
         prev_jump_seq_id = 0;
@@ -5619,11 +5714,9 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
     }
 
-    /* A removed/rewritten unpacker invalidates the old epoch. Its tail and the
-     * original entry can share a page. Retry only an instruction wholly covered
-     * by a fresh contiguous write interval; old page bitmap bits cannot turn an
-     * unchanged internal jump into a new stage. Discovery is mode-independent. */
-    bool new_layer = stage_is_new_entry(cur_pg, vaddr, meta->size,
+    bool cleanup_entry = stage_cleanup_entry(exec_ctx, cur_pg, current_trace_seq_id,
+                                              cpu_index, prev_jump_matches);
+    bool new_layer = cleanup_entry || stage_is_new_entry(cur_pg, vaddr, meta->size,
                                         current_trace_seq_id, now_unpacked,
                                         prev_jump_matches);
     if (cur_pg)
@@ -5634,8 +5727,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         return;
     }
     if (new_layer) {
-        oep_cand_t *parent = stage_candidate_parent(cur_pg, vaddr, meta->size,
-                                                     current_trace_seq_id, cpu_index);
+        oep_cand_t *parent = cleanup_entry ? NULL :
+            stage_candidate_parent(cur_pg, vaddr, meta->size, current_trace_seq_id, cpu_index);
         oep_cand_t *candidate = g_new0(oep_cand_t, 1);
         candidate->addr = vaddr;
         candidate->has_prologue = cand_has_prologue(vaddr);
@@ -5958,6 +6051,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
     (void)a8;
     if (!phase1_admit())
         return;
+    g_cleanup_transfer.candidate_id = 0;
     if (g_stage_syscall_ordinal == UINT64_MAX) {
         tf_phase1_profile_lost(&g_phase1, "mapping_syscall_ordinal_exhausted");
         return;
@@ -6530,6 +6624,7 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
         return;
     (void)id;
     (void)vcpu_idx;
+    const TraceEntry *cleanup_syscall = NULL;
     if (g_trace && g_aux && is_i386) {
         PluginVcpuState *state = plugin_vcpu_state_get(vcpu_idx);
         if (state &&
@@ -6540,10 +6635,16 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
                 state->syscall_seq_id ? state->syscall_seq_id : state->current_aux_seq_id;
             const TraceEntry *entry = trace_find_seq(g_trace, seq, NULL);
             InsnAux *aux = entry ? (InsnAux *)dse_aux_for(g_aux, g_trace, entry) : NULL;
-            if (num >= 0 && (uint64_t)num <= UINT32_MAX)
-                (void)dse_aux_syscall_return(aux, seq, vcpu_idx, (uint32_t)num, (uint32_t)ret);
-            else if (aux && aux->syscall)
+            if (num >= 0 && (uint64_t)num <= UINT32_MAX) {
+                bool observed = dse_aux_syscall_return(aux, seq, vcpu_idx, (uint32_t)num,
+                                                        (uint32_t)ret);
+                if (observed && num == 91 && ret == 0 &&
+                    aux->syscall->args[0] == g_pending_mmap.requested_addr &&
+                    aux->syscall->args[1] == g_pending_mmap.size)
+                    cleanup_syscall = entry;
+            } else if (aux && aux->syscall) {
                 aux->syscall->invalid = true;
+            }
             if (aux && aux->syscall && aux->syscall->file && (num==5 || num==85)) {
                 if (!proc_executable_current()) aux->syscall->file->source_valid=false;
                 if (num==85) {
@@ -6613,7 +6714,7 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
         } else if (pending.syscall_num == 125 || pending.syscall_num == 380) {
             apply_pending_mprotect(&pending);
         } else if (pending.syscall_num == 91) {
-            apply_pending_munmap(&pending);
+            apply_pending_munmap(&pending, cleanup_syscall);
         }
     }
     if (syscall_failed) {
