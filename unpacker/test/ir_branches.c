@@ -1,4 +1,8 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "ir_branches.h"
+#include "ir_phase_profile.h"
 #include "ir_internal.h"
 
 #include <stdlib.h>
@@ -382,7 +386,9 @@ IrInvertResult ir_branch_invert(const IrBranches *c, IrBranchId id,
                   "incomplete/conflicting branch identity, observation or target");
             return r;
         }
+    uint64_t phase = ir_phase_start();
     smt = ir_smt_build(c->module, c->inputs, &o.smt, &r.build);
+    ir_phase_stop(IR_PHASE_SMT_ENCODE, phase);
     if (!smt) {
         error(&r, from_ir(r.build.status), r.build.message);
         r.failure_origin = r.build.origin;
@@ -398,18 +404,27 @@ IrInvertResult ir_branch_invert(const IrBranches *c, IrBranchId id,
         constraints[i] = (IrSmtBranchConstraint){c->entries[i].block,
                                                  i + 1 == id ? !c->entries[i].observed_taken
                                                              : c->entries[i].observed_taken};
-    if (!concrete(c, id, &o, &r, events, false))
+    phase = ir_phase_start();
+    bool baseline_matches = concrete(c, id, &o, &r, events, false);
+    ir_phase_stop(IR_PHASE_VERIFY_PREFIX, phase);
+    if (!baseline_matches)
         goto finish;
+    phase = ir_phase_start();
     r.model = ir_smt_query_branches(smt, constraints, id, &o.query);
+    ir_phase_stop(IR_PHASE_QUERY, phase);
     r.reasons |= r.model.reasons;
     switch (r.model.status) {
-    case IR_SMT_SAT:
-        if (concrete(c, id, &o, &r, events, true)) {
+    case IR_SMT_SAT: {
+        phase = ir_phase_start();
+        bool witness_matches = concrete(c, id, &o, &r, events, true);
+        ir_phase_stop(IR_PHASE_VERIFY_WITNESS, phase);
+        if (witness_matches) {
             r.failure_origin = (IrOrigin){0};
             error(&r, IR_INVERT_VERIFIED,
                   "boundary witness preserves the prefix and inverts the selected branch");
         }
         break;
+    }
     case IR_SMT_UNSAT:
         error(&r, IR_INVERT_UNSAT,
               "no inversion for the selected boundary inputs and observed prefix");

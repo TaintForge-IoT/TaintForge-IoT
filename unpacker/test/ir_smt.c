@@ -1,10 +1,15 @@
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "ir_smt.h"
 #include "ir_internal.h"
+#include "ir_phase_profile.h"
 
 #include <z3.h>
 #include <stdlib.h>
 #include <string.h>
+
+_Thread_local IrPhaseProfile *ir_phase_profile;
 
 /* Values and validity travel together. Opaque symbols represent missing
  * information, not candidate inputs. A defined query can never rely on them. */
@@ -1211,6 +1216,7 @@ static IrSmtAnswer query(IrSmt *s, const IrSmtConstraint *cs, const IrSmtBranchC
             answer_error(&a, IR_SMT_INVALID, "invalid sample value");
             return a;
         }
+    uint64_t phase = ir_phase_start();
     s->stage = "query_constraints"; s->instruction = 0;
     s->info.origin = (IrOrigin){0};
     if (!assign_ast(s, &certain, boolean(s, true)) || !assign_ast(s, &possible, certain)) goto backend_error;
@@ -1240,6 +1246,8 @@ static IrSmtAnswer query(IrSmt *s, const IrSmtConstraint *cs, const IrSmtBranchC
     }
     if (s->info.status != IR_OK || !certain || !possible)
         goto backend_error;
+    ir_phase_stop(IR_PHASE_QUERY_CONSTRAINTS, phase);
+    phase = UINT64_MAX;
     s->stage = "query_setup"; s->instruction = 0;
     solver = Z3_mk_solver(s->ctx);
     if (!z3_result(s, solver != NULL, "Z3_mk_solver"))
@@ -1354,6 +1362,8 @@ backend_error:
     answer_error(&a, status_from_ir(s->info.status),
                  s->info.status == IR_OK ? "Z3 query construction failed" : s->info.message);
 finish:
+    if (phase != UINT64_MAX)
+        ir_phase_stop(IR_PHASE_QUERY_CONSTRAINTS, phase);
     if (params_owned)
         Z3_params_dec_ref(s->ctx, params);
     if (model_owned)

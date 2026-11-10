@@ -1,6 +1,9 @@
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "ir_concolic.h"
 #include "ir_opt.h"
+#include "ir_phase_profile.h"
 #include "ir_ssa.h"
 #include <errno.h>
 #include <glib.h>
@@ -41,7 +44,10 @@ static IrConcolicReadResult invert_replay(const ReplayInput *input, IrReplay *re
     if (!replay || build.status != IR_REPLAY_READY || build.lifted_steps != count)
         goto done;
     out = unknown("baseline_observations");
-    if (ir_replay_check(replay, NULL).status != IR_REPLAY_CHECK_MATCH)
+    uint64_t phase = ir_phase_start();
+    bool replay_matches = ir_replay_check(replay, NULL).status == IR_REPLAY_CHECK_MATCH;
+    ir_phase_stop(IR_PHASE_REPLAY_CHECK, phase);
+    if (!replay_matches)
         goto done;
     const IrInputs *inputs = ir_replay_inputs(replay);
     for (uint32_t i = 0; i < source->count; ++i) {
@@ -64,10 +70,15 @@ static IrConcolicReadResult invert_replay(const ReplayInput *input, IrReplay *re
         goto done;
     out = unknown("ssa_or_optimization_limit");
     IrModule *module = ir_replay_module(replay);
-    if (ir_trace_ssa(module, NULL).analysis.status != IR_OK ||
-        ir_optimize(module, NULL).status != IR_OK)
+    phase = ir_phase_start();
+    bool optimized = ir_trace_ssa(module, NULL).analysis.status == IR_OK &&
+                     ir_optimize(module, NULL).status == IR_OK;
+    ir_phase_stop(IR_PHASE_SSA_OPTIMIZE, phase);
+    if (!optimized)
         goto done;
+    phase = ir_phase_start();
     branches = ir_branches_build(module, inputs, NULL, NULL);
+    ir_phase_stop(IR_PHASE_BRANCH_CATALOG, phase);
     out = unknown("branch_identity_or_evidence");
     if (!branches)
         goto done;
@@ -119,6 +130,20 @@ static IrConcolicReadResult invert_replay(const ReplayInput *input, IrReplay *re
     invert_options.smt.parameters = NULL;
     invert_options.smt.parameter_count = 0;
     inverted = ir_branch_invert(branches, selected, &invert_options);
+    if (ir_phase_profile) {
+        ir_phase_profile->prefix_constraints = inverted.prefix_count;
+        ir_phase_profile->encoded_values = inverted.build.lowered_values;
+        ir_phase_profile->solver_checks = inverted.model.solver_checks;
+        for (unsigned i = 0; i < G_N_ELEMENTS(ir_phase_profile->checks); ++i) {
+            const IrSmtCheck *check = &inverted.model.checks[i];
+            ir_phase_profile->checks[i].recorded = check->recorded;
+            ir_phase_profile->checks[i].returned = check->returned;
+            ir_phase_profile->checks[i].api_ok = check->api_ok;
+            ir_phase_profile->checks[i].result = check->result;
+            ir_phase_profile->checks[i].time =
+                (IrPhaseTime){.ns = check->elapsed_ns, .measured = check->clock_available};
+        }
+    }
     out.status = "UNKNOWN";
     out.reason = "inversion_incomplete";
     if (inverted.status == IR_INVERT_RESOURCE_LIMIT || inverted.status == IR_INVERT_OUT_OF_MEMORY)
@@ -202,7 +227,9 @@ IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolic
     options.x86.flat32_ram = true;
     options.max_steps = CONCOLIC_MAX_STEPS;
     IrReplayBuildInfo build;
+    uint64_t phase = ir_phase_start();
     IrReplay *replay = ir_replay_x86_build(input, &options, &build);
+    ir_phase_stop(IR_PHASE_LIFT, phase);
     IrStateId state = replay ? ir_replay_state(replay)->memory : 0;
     return invert_replay(input, replay, build, source, state, solve, limits);
 }
@@ -246,7 +273,9 @@ IrConcolicReadResult ir_concolic_stdin_sequence(const ReplayInput *input,
     options.max_steps = CONCOLIC_MAX_STEPS;
     options.stdin_source = file;
     IrReplayBuildInfo build;
+    uint64_t phase = ir_phase_start();
     IrReplay *replay = ir_replay_x86_build(input, &options, &build);
+    ir_phase_stop(IR_PHASE_LIFT, phase);
     IrStateId state = replay ? ir_replay_stdin_state(replay) : 0;
     return invert_replay(input, replay, build, &selection, state, solve, limits);
 }
@@ -900,6 +929,53 @@ static void json_string(FILE *f, const char *text) {
     fputc('"', f);
 }
 
+static void phase_time_json(FILE *f, IrPhaseTime time) {
+    if (time.measured)
+        fprintf(f, "%" PRIu64, time.ns);
+    else
+        fputs("null", f);
+}
+
+static void phase_profile_json(FILE *f, const IrPhaseProfile *profile, IrPhaseTime total) {
+    static const char *const names[IR_PHASE_COUNT] = {
+        [IR_PHASE_CAPTURE] = "capture_input",
+        [IR_PHASE_LIFT] = "lift",
+        [IR_PHASE_REPLAY_CHECK] = "replay_check",
+        [IR_PHASE_SSA_OPTIMIZE] = "ssa_optimize",
+        [IR_PHASE_BRANCH_CATALOG] = "branch_catalog",
+        [IR_PHASE_SMT_ENCODE] = "smt_encode",
+        [IR_PHASE_QUERY] = "smt_query",
+        [IR_PHASE_QUERY_CONSTRAINTS] = "query_constraints",
+        [IR_PHASE_VERIFY_PREFIX] = "verify_prefix",
+        [IR_PHASE_VERIFY_WITNESS] = "verify_witness",
+    };
+    fputs("\"phase_profile\":{\"schema\":1,\"total_ns\":", f);
+    phase_time_json(f, total);
+    fprintf(f, ",\"prefix_constraints\":%u,\"encoded_values\":%u,\"solver_checks\":%u,"
+            "\"phases_ns\":{", profile->prefix_constraints, profile->encoded_values, profile->solver_checks);
+    for (unsigned i = 0; i < IR_PHASE_COUNT; ++i) {
+        fprintf(f, "%s\"%s\":", i ? "," : "", names[i]);
+        phase_time_json(f, profile->phases[i]);
+    }
+    fputs("},\"checks\":[", f);
+    for (unsigned i = 0, written = 0; i < G_N_ELEMENTS(profile->checks); ++i) {
+        if (!profile->checks[i].recorded)
+            continue;
+        fprintf(f, "%s{\"pass\":\"%s\",\"returned\":%s,\"api_ok\":%s,\"result\":",
+                written++ ? "," : "", i ? "possible" : "certain",
+                profile->checks[i].returned ? "true" : "false",
+                profile->checks[i].api_ok ? "true" : "false");
+        if (profile->checks[i].returned)
+            fprintf(f, "%d", profile->checks[i].result);
+        else
+            fputs("null", f);
+        fputs(",\"elapsed_ns\":", f);
+        phase_time_json(f, profile->checks[i].time);
+        fputc('}', f);
+    }
+    fputs("]},", f);
+}
+
 static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *aux,
                    DcfgGraph *graph, uint64_t trigger) {
     if (!prefix_valid(run, trace, trigger)) {
@@ -942,8 +1018,13 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
     }
     for (uint32_t i = 0; i < n; ++i)
         seqs[i] = start + i;
+    IrPhaseProfile profile = {0};
+    IrPhaseProfile *previous_profile = ir_phase_profile;
+    ir_phase_profile = &profile;
+    uint64_t started = ir_phase_start();
     ReplayInput *input =
         replay_input_capture(trace, aux, seqs, (uint32_t)n, trigger, 16U * 1024U * 1024U, NULL);
+    ir_phase_stop(IR_PHASE_CAPTURE, started);
     IrConcolicRead source = run->guest_file || run->stdin_span
                                 ? run->read
                                 : (IrConcolicRead){.read_seq = run->source.read_seq,
@@ -966,10 +1047,13 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
     } else
         result = ir_concolic_read(input, &source, run->solve, NULL);
     replay_input_destroy(input);
+    IrPhaseTime total = ir_phase_elapsed(started);
+    ir_phase_profile = previous_profile;
     FILE *f = run->report;
     fprintf(f, "{\"schema\":%u,\"status\":\"%s\",\"reason\":\"%s\",",
             run->stdin_sequence ? 4U : run->stdin_span ? 3U : run->guest_file ? 2U : 1U,
             result.status, result.reason);
+    phase_profile_json(f, &profile, total);
     if (result.replay_build_attempted) {
         IrOrigin stopped = result.replay_stopped_origin;
         fprintf(f, "\"replay_build\":{\"status\":%u,\"issues\":%u,"
