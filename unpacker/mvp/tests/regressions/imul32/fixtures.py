@@ -1,4 +1,4 @@
-"""Use the existing 39 accepted fixed cases and three new IMUL32 cases."""
+"""Load fixed i386 regression inputs and check their independent output models."""
 import hashlib
 import importlib.util
 from pathlib import Path
@@ -10,10 +10,47 @@ from support import digest, read, require, route, ready
 
 ROOT = Path(__file__).resolve().parent
 ORDER = ('bt32', 'div32', 'signed_div32', 'bitscan32', 'rotate32', 'shrd32', 'mul32', 'shld32')
+CARRY = ROOT / 'data/bt_imm32'
+CARRY_PROFILE = 'bt-imm32-fixed-regressions-v1'
+CARRY_CASES = {
+    'adc8_cf-O2': ('adc', 8), 'adc16_cf-O2': ('adc', 16), 'adc32_cf-O2': ('adc', 32),
+    'sbb8_cf-O2': ('sbb', 8), 'sbb16_cf-O2': ('sbb', 16), 'sbb32_cf-O2': ('sbb', 32),
+    'inc8_of_keepcf-O2': ('inc', 8), 'dec16_of_keepcf-O2': ('dec', 16),
+}
+
+
+def carry_stdout(row, raw):
+    require(len(raw) == 12, 'Expected three input dwords')
+    word, other, carry = (int.from_bytes(raw[i:i + 4], 'little') for i in (0, 4, 8))
+    carry &= 1
+    width = row['operand_width']
+    modulus = 1 << width
+    mask = modulus - 1
+    sign = modulus // 2
+    left, right = word & mask, other & mask
+    operation = row['operation']
+    preserve_cf = operation in ('inc', 'dec')
+    delta = 1 if preserve_cf else right + carry
+    signed_left = left - modulus if left >= sign else left
+    signed_delta = 1 if preserve_cf else delta - (modulus if right >= sign else 0)
+    if operation in ('sbb', 'dec'):
+        delta, signed_delta = -delta, -signed_delta
+    total = left + delta
+    result = total & mask
+    cf = carry if preserve_cf else int(not 0 <= total <= mask)
+    of = int(not -sign <= signed_left + signed_delta < sign)
+    flags = cf | (int((result & 255).bit_count() % 2 == 0) << 2) | (int(result == 0) << 6)
+    flags |= ((result >> (width - 1)) << 7) | (of << 11)
+    score = of if preserve_cf else cf
+    register = (word & ~mask) | result
+    return (b'F\n' if score == row['compare_value'] else b'T\n') + b''.join(
+        value.to_bytes(4, 'little') for value in (score, register, flags))
 
 
 def stdout_model(case, raw, oracle=None):
     row = case['row']
+    if case['suite'] == 'bt_imm32':
+        return carry_stdout(row, raw)
     if case['suite'] == 'bt32':
         require(oracle is not None, 'The pinned native tokenizer oracle is required')
         return oracle(raw)
@@ -27,7 +64,44 @@ def fixed(case, label):
     return case['folder'] / label
 
 
-def load_cases(project=None):
+def load_carry_cases():
+    definition = read(CARRY / 'cases.json')
+    rows = definition['cases']
+    require(definition['profile'] == CARRY_PROFILE and len(rows) == len(CARRY_CASES) and
+            {r['id']: (r['operation'], r['operand_width']) for r in rows} == CARRY_CASES,
+            'BT immediate fixture inventory differs')
+    for row in rows:
+        expected = row['expected']
+        require(row['offsets'] == list(range(12)) and expected['branch_bytes'] == row['branch_bytes'] and
+                expected['baseline_route'][:-1] == expected['witness_route'][:-1],
+                'BT immediate fixture mutation scope or route differs')
+        for label, taken in (('seed', expected['baseline_taken']), ('witness', expected['witness_taken'])):
+            raw = bytes.fromhex(row['fixed'][label])
+            stdout = carry_stdout(row, raw)
+            require(hashlib.sha256(raw).hexdigest() == row[label + '_sha256'] and
+                    stdout.hex() == row['fixed'][label + '.stdout'] and stdout.startswith(b'T\n' if taken else b'F\n'),
+                    'BT immediate fixed input or arithmetic flags differ: ' + row['id'])
+        yield {'suite': 'bt_imm32', 'row': row, 'expected': expected, 'elf_hex': CARRY / (row['id'] + '.hex')}
+
+
+def load_cases(project=None, cohort='imul32'):
+    cases = []
+    if cohort != 'bt-imm32':
+        cases.extend(load_imul32_cases(project))
+    if cohort != 'imul32':
+        cases.extend(load_carry_cases())
+    for case in cases:
+        row, expected = case['row'], case['expected']
+        require(expected['branch_pc'] == row['pc'] and expected['baseline_taken'] != expected['witness_taken'],
+                'Selected branch identity differs')
+        row.setdefault('branch_bytes', expected['branch_bytes'])
+        raw = bytes.fromhex(case['elf_hex'].read_text())
+        require(hashlib.sha256(raw).hexdigest() == row['elf_sha256'], 'Fixed ELF bytes differ')
+        case['elf_bytes'] = raw
+    return cases
+
+
+def load_imul32_cases(project):
     cases = []
     catalog = read(ROOT / 'legacy-catalog.json') if project is not None else {}
     for name in ORDER if project is not None else ():
@@ -78,14 +152,6 @@ def load_cases(project=None):
                 expected['baseline_route'][:-1] == expected['witness_route'][:-1], 'IMUL32 witness does not invert the selected branch')
         cases.append(case)
     require(len(cases) == (42 if project is not None else 3), 'Permanent fixed-case inventory differs')
-    for case in cases:
-        row, expected = case['row'], case['expected']
-        require(expected['branch_pc'] == row['pc'] and expected['baseline_taken'] != expected['witness_taken'],
-                'Selected branch identity differs')
-        row.setdefault('branch_bytes', expected['branch_bytes'])
-        raw = bytes.fromhex(case['elf_hex'].read_text())
-        require(hashlib.sha256(raw).hexdigest() == row['elf_sha256'], 'Fixed ELF bytes differ')
-        case['elf_bytes'] = raw
     return cases
 
 
@@ -101,6 +167,20 @@ def materialize(case, directory):
     row = case['row']
     require(probes.instruction_bytes(binary, row['pc'], len(row['branch_bytes']) // 2).hex() == row['branch_bytes'],
             'Selected branch does not match its fixed ELF')
+    if case['suite'] == 'bt_imm32':
+        require(probes.instruction_bytes(binary, row['alu_pc'] - 4, 4).hex() == '0fbae200' and
+                probes.instruction_bytes(binary, row['alu_pc'], len(row['alu_bytes']) // 2).hex() == row['alu_bytes'],
+                'Fixed ELF is missing BT immediate or its consuming instruction')
+        folder = directory / row['id']
+        folder.mkdir(exist_ok=True)
+        for label, encoded in row['fixed'].items():
+            raw = bytes.fromhex(encoded)
+            path = folder / label
+            if path.exists():
+                require(path.read_bytes() == raw, 'Materialized BT input differs')
+            else:
+                path.write_bytes(raw)
+        case['folder'] = folder
     return binary
 
 

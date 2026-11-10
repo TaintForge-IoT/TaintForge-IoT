@@ -1,4 +1,4 @@
-"""Permanent 42-case integer regressions in one process with an inherited disk budget."""
+"""Fixed integer regressions in one process with an inherited disk budget."""
 import argparse
 from collections import Counter
 import hashlib
@@ -18,6 +18,19 @@ from support import check_guards, check_inversion, check_saved_witness, digest, 
 
 ROOT = Path(__file__).resolve().parent
 SUCCESS = 'PASS_INTEGER_CORE_THROUGH_IMUL32_REGRESSIONS'
+COHORTS = {
+    'imul32': ('integer-core-through-imul32-v1', SUCCESS),
+    'bt-imm32': (fixtures.CARRY_PROFILE, 'PASS_BT_IMM32_REGRESSIONS'),
+    'all': ('integer-core-through-bt-imm32-v1', 'PASS_INTEGER_CORE_THROUGH_BT_IMM32_REGRESSIONS'),
+}
+LEGACY_COUNTS = {'bt32': 6, 'div32': 3, 'signed_div32': 6, 'bitscan32': 6, 'rotate32': 6,
+                 'shrd32': 3, 'mul32': 3, 'shld32': 6, 'imul32': 3}
+
+
+def secondary_role(suite):
+    if suite in ('bt32', 'div32', 'bt_imm32'):
+        return None
+    return 'negative-divisor' if suite == 'signed_div32' else 'secondary'
 
 
 def expected_requests(cases, work):
@@ -25,18 +38,21 @@ def expected_requests(cases, work):
     for case in cases:
         directory = work / 'cases' / case['suite'] / case['row']['id']
         result.update(directory / name for name in ('inversion', 'saved-witness'))
-        if case['suite'] not in ('bt32', 'div32'):
-            result.add(directory / ('negative-divisor' if case['suite'] == 'signed_div32' else 'secondary'))
+        role = secondary_role(case['suite'])
+        if role:
+            result.add(directory / role)
     return result
 
 
-def run_cases(cases, work, params, requests, oracle, record):
+def run_cases(cases, work, params, requests, oracle, record, cohort='imul32'):
     for case in cases:
         row, expected = case['row'], case['expected']
         directory = work / 'cases' / case['suite'] / row['id']
         binary = fixtures.materialize(case, work / 'binaries' / case['suite'])
         arguments = dict(params, binary=binary, seed=fixtures.fixed(case, 'seed'), branch_pc=row['pc'],
                          offsets=row['offsets'], occurrence=row.get('occurrence', 1))
+        if case['suite'] == 'bt_imm32':
+            arguments.update(argv=[params['input_path']], seconds=40, memory_mib=512)
         record['guest_execution_requested'] |= not (directory / 'inversion').exists()
         save(work / 'summary.json', record)
         result = requests.execute('invert_file', arguments, directory / 'inversion')
@@ -49,8 +65,11 @@ def run_cases(cases, work, params, requests, oracle, record):
         for mode, raw in (('solve', seed), ('observe', candidate)):
             require((directory / 'inversion' / mode / 'logs/runtime_stdout.log').read_bytes() ==
                     fixtures.stdout_model(case, raw, oracle), 'Fresh candidate numeric/tokenizer output differs')
-        for label, role in [('witness', 'saved-witness')] + ([] if case['suite'] in ('bt32', 'div32') else
-                               [('secondary', 'negative-divisor' if case['suite'] == 'signed_div32' else 'secondary')]):
+        secondary = secondary_role(case['suite'])
+        observations = [('witness', 'saved-witness')]
+        if secondary:
+            observations.append(('secondary', secondary))
+        for label, role in observations:
             target = directory / role
             record['guest_execution_requested'] |= not target.exists()
             save(work / 'summary.json', record)
@@ -67,18 +86,24 @@ def run_cases(cases, work, params, requests, oracle, record):
             require((target / 'observe/logs/runtime_stdout.log').read_bytes() == fixtures.fixed(case, label + '.stdout').read_bytes() ==
                     fixtures.stdout_model(case, raw, oracle), 'Fixed witness/secondary numeric output differs')
         record['results'].append({'suite': case['suite'], 'id': row['id'], 'status': 'VERIFIED',
-                                  'saved_witness_reproduced': True, 'secondary_reproduced': case['suite'] not in ('bt32', 'div32'),
+                                  'saved_witness_reproduced': True, 'secondary_reproduced': secondary is not None,
                                   'fresh_candidate_sha256': result['candidate_sha256'], 'audit': 'PASS'})
         record['guest_executions_with_completed_receipts'] = requests.receipts
         save(work / 'summary.json', record)
         print(case['suite'] + ' ' + row['id'] + ': VERIFIED; saved witness and numeric checks PASS', flush=True)
     counts = Counter(item['suite'] for item in record['results'])
-    require(counts == {'bt32': 6, 'div32': 3, 'signed_div32': 6, 'bitscan32': 6, 'rotate32': 6,
-                       'shrd32': 3, 'mul32': 3, 'shld32': 6, 'imul32': 3} and requests.receipts == 159 and
-            requests.fresh + requests.reused == 117, 'Full permanent regression cohort is incomplete')
-    record.update(status=SUCCESS, verified_inversions=42, saved_witnesses=42, secondary_observations=33,
-                  negative_divisor_observations=6, suite_counts=dict(counts), api_analyses=117,
-                  guest_executions_with_completed_receipts=159, fresh_api_requests=requests.fresh,
+    expected = dict(LEGACY_COUNTS) if cohort != 'bt-imm32' else {}
+    if cohort != 'imul32':
+        expected['bt_imm32'] = len(fixtures.CARRY_CASES)
+    total = sum(expected.values())
+    secondary_count = sum(n for name, n in expected.items() if secondary_role(name))
+    analyses = 2 * total + secondary_count
+    require(counts == expected and requests.receipts == analyses + total and
+            requests.fresh + requests.reused == analyses, 'Permanent regression cohort is incomplete')
+    record.update(status=COHORTS[cohort][1], verified_inversions=total, saved_witnesses=total,
+                  secondary_observations=secondary_count, negative_divisor_observations=expected.get('signed_div32', 0),
+                  suite_counts=dict(counts), api_analyses=analyses,
+                  guest_executions_with_completed_receipts=requests.receipts, fresh_api_requests=requests.fresh,
                   reused_api_requests=requests.reused)
 
 
@@ -86,7 +111,20 @@ def verify_payload():
     expected = read(ROOT / 'suite-files.json')
     actual = {str(p.relative_to(ROOT)): digest(p) for p in ROOT.rglob('*')
               if p.is_file() and '__pycache__' not in p.parts and p != ROOT / 'suite-files.json'}
-    require(actual == expected, 'Installed IMUL32 regression payload differs')
+    require(actual == expected, 'Installed integer regression payload differs')
+
+
+def verify_runtime(cohort, identity, manifest):
+    previous = read(ROOT / 'runtime-identity.json')
+    if cohort == 'imul32':
+        require(identity == previous, 'Permanent runtime differs from the accepted IMUL32 plugin')
+        return
+    sources = {name.removeprefix('unpacker/test/'): expected
+               for name, expected in read(ROOT / 'project-pins.json').items() if name.startswith('unpacker/test/')}
+    inputs = manifest['build_inputs']
+    require(all(identity[key] == previous[key] for key in ('qemu_sha256', 'flags_receipt_sha256')) and
+            inputs['source_files'] == sources and inputs['qemu_header_sha256'] == digest(ROOT / 'sdk/qemu-plugin.h'),
+            'Expected the pinned QEMU and flags with a plugin built from the BT immediate sources')
 
 
 def main(argv=None):
@@ -95,7 +133,10 @@ def main(argv=None):
         parser.add_argument('--' + name, type=Path)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--offline-only', action='store_true')
+    parser.add_argument('--cohort', choices=COHORTS, default='imul32',
+                        help='original IMUL32 fixtures, BT immediate fixtures, or both with the BT immediate plugin')
     args = parser.parse_args(argv)
+    profile, success = COHORTS[args.cohort]
     verify_payload()
     parent = args.output_dir.expanduser().resolve(strict=True)
     require(parent.is_dir() and not parent.is_relative_to(ROOT), 'Keep output outside the permanent suite')
@@ -107,24 +148,29 @@ def main(argv=None):
         require(work.parent == parent and work.name.startswith('tfimulreg.') and not args.offline_only,
                 'Invalid permanent continuation directory')
         old = read(work / 'summary.json')
-        require(old['profile'] == 'integer-core-through-imul32-v1' and old['status'] in ('INCOMPLETE', SUCCESS),
-                'Only a recognised IMUL32 permanent run can be continued')
+        require(old['profile'] == profile and old['status'] in ('INCOMPLETE', success),
+                'Only a recognised permanent run of the selected cohort can be continued')
         reporting.preserve(work / 'summary.json')
         reporting.preserve(work / 'disk-admission.json')
     else:
         work = Path(tempfile.mkdtemp(prefix='tfimulreg.', dir=parent))
-    print('Permanent IMUL32 regression run: ' + str(work), flush=True)
+    name = 'IMUL32' if args.cohort == 'imul32' else args.cohort
+    print('Permanent ' + name + ' regression run: ' + str(work), flush=True)
     guards = {p: digest(p) for p in ROOT.rglob('*') if p.is_file() and '__pycache__' not in p.parts}
-    record = {'status': 'INCOMPLETE', 'profile': 'integer-core-through-imul32-v1', 'results': [],
+    record = {'status': 'INCOMPLETE', 'profile': profile, 'results': [],
               'guest_execution_requested': False, 'guest_executions_with_completed_receipts': 0,
               'afl_campaign_executed': False, 'universal_equivalence': False, 'successor_execution_proven': False,
-              'scope': '42 fixed inversions, 42 saved witnesses and 33 secondary observations, including six negative divisors'}
+              'scope': 'fixed inversions, saved witnesses and secondary observations of the selected integer cohort'}
     code, requests = 1, None
     try:
-        cases = fixtures.load_cases(project)
+        cases = fixtures.load_cases(project, args.cohort)
         for case in cases:
             binary = fixtures.materialize(case, work / 'binaries' / case['suite'])
             guards[binary] = case['row']['elf_sha256']
+            if case['suite'] == 'bt_imm32':
+                for label in case['row']['fixed']:
+                    path = fixtures.fixed(case, label)
+                    guards[path] = digest(path)
         save(work / 'suite-definition.json', [{k: v for k, v in case.items() if k not in ('elf_bytes', 'folder', 'elf_hex')}
                                                for case in cases])
         if args.offline_only:
@@ -143,7 +189,7 @@ def main(argv=None):
                 guards[path] = digest(path)
             identity = {'plugin_sha256': digest(plugin), 'manifest_sha256': digest(manifest_path), 'build_id': manifest['build_id'],
                         'qemu_sha256': digest(qemu), 'flags_receipt_sha256': digest(flags)}
-            require(identity == read(ROOT / 'runtime-identity.json'), 'Permanent runtime differs from the accepted IMUL32 plugin')
+            verify_runtime(args.cohort, identity, manifest)
             record['runtime_identity'] = identity
             baseline = None
             if args.storage_baseline:
@@ -152,7 +198,9 @@ def main(argv=None):
                 baseline = read(path)
                 guards[path] = digest(path)
             admission = storage.Admission(work, initial=baseline)
-            reference, record['legacy_oracle'] = fixtures.tokenizer_oracle(project, work, cases)
+            reference = None
+            if args.cohort != 'bt-imm32':
+                reference, record['legacy_oracle'] = fixtures.tokenizer_oracle(project, work, cases)
             params = dict(qemu=qemu, plugin=plugin, flags_receipt=flags, input_path='/etc/dta-input',
                           max_steps=1024, seconds=30, memory_mib=1024, argv=[])
             requests = runtime.Requests(api, unified, work, admission, identity, expected_requests(cases, work))
@@ -162,7 +210,7 @@ def main(argv=None):
             from sudo_session import SudoSession
             require(Path(sys.modules['sudo_session'].__file__).resolve() == ROOT / 'sudo_session.py', 'Wrong sudo session helper imported')
             with SudoSession(out=work / 'sudo-session.json'):
-                run_cases(cases, work, params, requests, reference, record)
+                run_cases(cases, work, params, requests, reference, record, args.cohort)
             admission.before_case('suite-exit')
             code = 0
     except BaseException as exc:

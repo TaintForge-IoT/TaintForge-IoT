@@ -493,11 +493,14 @@ static IrX86LiftStatus preflight(const IrX86Frontend *f, const cs_insn *insn) {
             x->operands[0].size == 4 && x->operands[1].size == 4 &&
             x->operands[2].type == X86_OP_REG && x->operands[2].reg == X86_REG_CL
             ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
-    if (insn->id == X86_INS_BT)
-        return x->op_count == 2 && register_ok(&x->operands[0]) &&
-            register_ok(&x->operands[1]) && x->operands[0].size == 4 &&
-            x->operands[1].size == 4 && x->prefix[2] != 0x66
+    if (insn->id == X86_INS_BT) {
+        const cs_x86_op *base = &x->operands[0], *index = &x->operands[1];
+        return x->op_count == 2 && register_ok(base) && base->size == 4 && x->prefix[2] != 0x66 &&
+            ((register_ok(index) && index->size == 4) ||
+             (index->type == X86_OP_IMM && insn->size == 4 && insn->bytes[0] == 0x0f &&
+              insn->bytes[1] == 0xba && (insn->bytes[2] & 0xf8) == 0xe0))
             ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    }
     if (insn->id == X86_INS_MUL)
         return insn->size >= 2 && insn->bytes[0] == 0xf7 &&
             (insn->bytes[1] & 0x38) == 0x20 && x->addr_size == 4 &&
@@ -1243,10 +1246,14 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
                 emit(&l, (IrInstSpec){.op = IR_OP_UNKNOWN, .type = ir_type_bv(1), .immediate = IR_REASON_UNDEFINED}));
     } else if (insn->id == X86_INS_BT) {
         IrValueId value = read_register(&l, x->operands[0].reg);
-        IrValueId index = binary(&l, IR_OP_AND, 32,
-            read_register(&l, x->operands[1].reg), constant(&l, 32, 31));
-        IrValueId carry = unary(&l, IR_OP_EXTRACT, 1,
-            binary(&l, IR_OP_LSHR, 32, value, index), 0);
+        IrValueId carry;
+        if (x->operands[1].type == X86_OP_IMM) {
+            carry = bit(&l, value, insn->bytes[3] & 31U);
+        } else {
+            IrValueId index = binary(&l, IR_OP_AND, 32,
+                read_register(&l, x->operands[1].reg), constant(&l, 32, 31));
+            carry = bit(&l, binary(&l, IR_OP_LSHR, 32, value, index), 0);
+        }
         r.flags_written = 0x37;
         r.flags_undefined = 0x36; /* PF/AF/SF/OF undefined; ZF and DF preserved. */
         for (unsigned i = 0; i < 6; ++i)
