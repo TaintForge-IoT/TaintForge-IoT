@@ -17,6 +17,8 @@ import time
 
 
 MAX_INPUT = 1024**2
+MAX_TIMEOUT = 600
+MAX_EXTENDED_TIMEOUT = 1200
 NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,95}\Z')
 RESERVED = {'stdout', 'stderr', 'stdin.bin', 'result.json', 'command.json'}
 
@@ -138,12 +140,13 @@ def _limits(timeout, file_limit):
 
 
 def run_process(command, case, directory, *, timeout=10, file_limit=1024**2,
-                rss_limit_mib=2048, environment=None):
+                rss_limit_mib=2048, environment=None, extended_timeout=False):
     case = validate_cases([case])[0]
     require(type(command) is list and command and all(type(a) is str and '\0' not in a for a in command),
             'INVALID_COMMAND', 'Require an explicit command argument list')
-    require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 600,
-            'INVALID_BUDGET', 'Timeout must be positive and at most 600 seconds')
+    maximum_timeout = MAX_EXTENDED_TIMEOUT if extended_timeout is True else MAX_TIMEOUT
+    require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= maximum_timeout,
+            'INVALID_BUDGET', f'Timeout must be positive and at most {maximum_timeout} seconds')
     require(type(file_limit) is int and 1 <= file_limit <= 64 * 1024**2
             and type(rss_limit_mib) is int and 32 <= rss_limit_mib <= 4096,
             'INVALID_BUDGET', 'Invalid file or resident-memory budget')

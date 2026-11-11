@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define TF_ELF_MAX_LOADS 512
+#define TF_ELF_I386_PAGE_SIZE 4096
 
 typedef bool (*TfElfRead)(void *context, uint64_t offset, uint8_t *bytes, size_t size);
 
@@ -43,6 +44,11 @@ typedef enum {
 TfElfStatus tf_elf_image_resolve(TfElfRead file_read, void *file_context, uint64_t file_size,
                                  TfElfRead guest_read, void *guest_context, const TfElfAux *aux,
                                  uint64_t seed_budget, TfElfImage *out);
+
+/* Identify a static ET_EXEC from its in-memory header page and observed entry.
+ * The caller must independently validate the live mappings of all LOAD pages. */
+bool tf_elf_i386_payload(const uint8_t *page, uint64_t base, uint64_t entry, TfElfImage *out);
+
 const char *tf_elf_status_name(TfElfStatus status);
 
 #endif

@@ -10,6 +10,8 @@ import subprocess
 import time
 
 from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1RuntimeError, digest, read_json
+from unpacker.mvp import ct_elf
+from unpacker.unpack import validate_capture
 
 
 CLEANUP_CASES = (
@@ -22,14 +24,44 @@ CLEANUP_CASES = (
     ("interrupted-return", 6, None),
     ("overlapping-target", 7, None),
 )
+HANDOFF_CASES = (
+    ("direct-call", 0, ("stage", "payload_entry")),
+    ("taken-jcc", 1, ("stage", "payload_entry")),
+    ("untaken-jcc", 2, ()),
+    ("ambiguous-jcc", 3, ()),
+    ("direct-call-without-write", 4, ()),
+    ("taken-jcc-without-write", 5, ()),
+    ("direct-jmp-executable-remap", 6, ("payload_entry",)),
+    ("direct-call-from-stub", 7, ("payload_entry",)),
+    ("taken-jcc-from-stub", 8, ("payload_entry",)),
+    ("direct-call-within-restored-code", 9, ("stage",)),
+    ("taken-jcc-within-restored-code", 10, ("stage",)),
+)
+SEQUENTIAL_CASES = (
+    ("fall-through", 0, ("payload_entry",)),
+    ("same-page-after-return", 1, ("helper", "payload_entry")),
+    ("same-written-range", 2, ("handoff",)),
+    ("fall-through-partial-write", 3, ()),
+    ("same-page-tail", 4, ("helper",)),
+    ("same-entry-twice", 5, ("helper",)),
+)
+PAYLOAD_LOAD_CASES = (
+    ("payload-loads", 0),
+    ("payload-wrong-entry", 1),
+    ("payload-remapped-data", 2),
+    ("payload-permission-mismatch", 3),
+)
+CAPTURE_ENTRY = ("tf-capture=entry", "dse-check=off", "ir-trace-capacity=4096",
+                 "tf-max-candidates=16", "tf-max-events=512", "runtime-log=summary")
+
+
+def symbol_addresses(binary):
+    rows = subprocess.check_output(["nm", "-n", str(binary)], text=True).splitlines()
+    return {name: int(address, 16) for address, _, name in (row.split() for row in rows)}
 
 
 def validate_cleanup(attempt, binary, expected_transfer):
-    symbols = {}
-    for line in subprocess.check_output(["nm", "-n", str(binary)], text=True).splitlines():
-        address, _, symbol = line.split()
-        if symbol in ("cleanup", "target"):
-            symbols[symbol] = int(address, 16)
+    symbols = symbol_addresses(binary)
     cleanup_pc, target_pc = symbols["cleanup"], symbols["target"]
     assert cleanup_pc // 4096 == target_pc // 4096
     assert (attempt.directory / "guest_stdout.log").read_bytes() == b"S37_SYNTHETIC_TARGET_REACHED\n"
@@ -76,6 +108,77 @@ def validate_cleanup(attempt, binary, expected_transfer):
     assert report["capture_candidate_id"] == target["data"]["candidate_id"]
 
 
+def validate_handoff(attempt, binary, expected_entries):
+    assert (attempt.directory / "guest_stdout.log").read_bytes() == b"PHASE1_OEP_HANDOFF_OK\n"
+    capture = attempt.verify()
+    report = read_json(attempt.paths["report"])
+    events = attempt.events()
+    assert capture["runtime_observed"] and report["main_image_verified"]
+    assert not any(event["event_type"] in ("data_loss", "profile_lost") for event in events)
+    symbols = symbol_addresses(binary)
+    expected = [symbols[name] for name in expected_entries]
+    observed = [event["data"] for event in events if event["event_type"] == "oep_candidate_observed"]
+    assert [event["address"] for event in observed] == expected
+    if expected:
+        assert capture["capture_status"] == "success"
+        assert int(report["oep"], 16) == expected[-1]
+        assert report["capture_candidate_id"] == observed[-1]["candidate_id"]
+    else:
+        assert capture["capture_status"] == "not_available"
+        assert int(report["oep"], 16) == 0
+    return events, observed
+
+
+def validate_sequential(name, attempt, binary, expected_entries):
+    events, candidates = validate_handoff(attempt, binary, expected_entries)
+    sequential = [event for event in events if event["event_type"] == "oep_fallthrough_entry_observed"]
+    reentries = [event for event in events if event["event_type"] == "oep_same_page_reentry_observed"]
+    if name == "fall-through":
+        assert len(sequential) == 1 and not reentries
+        entry = candidates[0]
+        evidence = sequential[0]["data"]
+        assert evidence["candidate_id"] == entry["candidate_id"]
+        assert evidence["address"] == entry["address"] == evidence["source_pc"] + 1
+        assert evidence["write_trace_seq"] < evidence["source_trace_seq"]
+        assert evidence["source_trace_seq"] + 1 == entry["observed_trace_seq"]
+    elif name == "same-page-after-return":
+        assert len(reentries) == 1 and not sequential
+        helper, entry = candidates
+        evidence = reentries[0]["data"]
+        assert helper["address"] // 4096 == entry["address"] // 4096
+        assert helper["observed_code_generation"] == entry["observed_code_generation"]
+        assert helper["observed_epoch"] == entry["observed_epoch"]
+        assert entry["parent_candidate_id"] == 0
+        assert evidence["helper_candidate_id"] == helper["candidate_id"]
+        assert evidence["candidate_id"] == entry["candidate_id"]
+        assert helper["observed_trace_seq"] < evidence["return_trace_seq"] <= evidence["transfer_trace_seq"]
+        assert evidence["transfer_trace_seq"] + 1 == entry["observed_trace_seq"]
+    else:
+        assert not sequential and not reentries
+
+
+def validate_payload_loads(attempt, binary, qemu, *, verified_image):
+    symbols = symbol_addresses(binary)
+    report, regions, _ = validate_capture(attempt)
+    assert int(report["oep"], 16) == symbols["payload_entry"]
+    observed = {region["address"]: region["prot"] for region in regions}
+    expected = {symbols["payload_header"]: 1, symbols["payload_entry"]: 5,
+                symbols["payload_rodata"]: 1, symbols["payload_data"]: 3,
+                symbols["payload_bss"]: 3}
+    assert symbols["scratch"] not in observed
+    assert (attempt.directory / "guest_stdout.log").read_bytes() == b"PHASE1_PAYLOAD_LOADS_OK\n"
+    if verified_image:
+        assert observed == expected
+        assert ct_elf.captured_bytes(regions, symbols["payload_bss"], 4096) == bytes(4096)
+        rebuilt = attempt.directory / "rebuilt.elf"
+        ct_elf.rebuild(attempt.paths["report"], attempt.paths["dump"], rebuilt)
+        replay = subprocess.run([str(qemu), str(rebuilt)], check=True, timeout=30, capture_output=True)
+        assert replay.stdout == b"PHASE1_PAYLOAD_LOADS_OK\n" and not replay.stderr
+    else:
+        assert observed[symbols["payload_entry"]] == 5
+        assert set(expected).intersection(observed) == {symbols["payload_entry"]}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plugin", required=True, type=Path)
@@ -96,6 +199,12 @@ def main() -> None:
                 ("fork", "phase1_two_layers.S", ("--defsym", "WITH_FORK=1"))]
     fixtures.extend((name, "phase1_cleanup_tail.S", ("--defsym", f"SCENARIO={variant}"))
                     for name, variant, _ in CLEANUP_CASES)
+    fixtures.extend((name, "phase1_oep_handoff.S", ("--defsym", f"SCENARIO={variant}"))
+                    for name, variant, _ in HANDOFF_CASES)
+    fixtures.extend((name, "phase1_oep_sequential.S", ("--defsym", f"SCENARIO={variant}"))
+                    for name, variant, _ in SEQUENTIAL_CASES)
+    fixtures.extend((name, "phase1_payload_loads.S", ("--defsym", f"SCENARIO={variant}"))
+                    for name, variant in PAYLOAD_LOAD_CASES)
     for name, source, definitions in fixtures:
         obj, binary = output / f"{name}.o", output / name
         subprocess.run(["as", "--32", *definitions, str(root / "tests" / source), "-o", str(obj)], check=True)
@@ -147,11 +256,29 @@ def main() -> None:
     for name, _, expected_transfer in CLEANUP_CASES:
         # The binary and attempt directory need separate names.
         binary = binaries[name]
-        attempt, code = run("attempt-" + name, binary=binary, ir=False,
-                            extra=("tf-capture=entry", "dse-check=off", "ir-trace-capacity=4096",
-                                   "tf-max-candidates=16", "tf-max-events=512", "runtime-log=summary"))
+        attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
         assert code == 0, name
         validate_cleanup(attempt, binary, expected_transfer)
+        results.append({"test": name, "status": "PASS"})
+    for name, _, expected_entries in HANDOFF_CASES:
+        binary = binaries[name]
+        attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
+        assert code == 0, name
+        _, candidates = validate_handoff(attempt, binary, expected_entries)
+        if len(candidates) == 2:
+            assert candidates[1]["parent_candidate_id"] == candidates[0]["candidate_id"]
+        results.append({"test": name, "status": "PASS"})
+    for name, _, expected_entries in SEQUENTIAL_CASES:
+        binary = binaries[name]
+        attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
+        assert code == 0, name
+        validate_sequential(name, attempt, binary, expected_entries)
+        results.append({"test": name, "status": "PASS"})
+    for name, variant in PAYLOAD_LOAD_CASES:
+        binary = binaries[name]
+        attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
+        assert code == 0, name
+        validate_payload_loads(attempt, binary, qemu, verified_image=variant == 0)
         results.append({"test": name, "status": "PASS"})
     attempt, code = run("attempt-live", binary=binaries["live"], extra=("tf-selection-delay=8",), live=True)
     assert code == 0 and attempt.verify()["runtime_observed"]

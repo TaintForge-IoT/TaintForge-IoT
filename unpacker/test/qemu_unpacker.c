@@ -345,6 +345,7 @@ static size_t page_size = 4096;
 #define MAX_PENDING_IOV 1024U
 #define GUEST_MAP_ANONYMOUS 0x20U
 #define GUEST_MAP_FIXED 0x10U
+#define GUEST_MAP_PRIVATE 0x02U
 #define MAX_AUXV_ARGC (1U << 20)
 
 typedef enum {
@@ -376,6 +377,7 @@ typedef struct {
     uint64_t producer_write_pc, producer_write_seq;
     uint32_t producer_write_generation, producer_vcpu;
     uint64_t mapping_epoch, guest_store_generation, producer_writer_mapping_epoch;
+    bool private_anonymous_mmap;
     /* Kind zero is deliberately anonymous/initial for zero-initialized pages.
      * File identity is observational metadata, not an assertion that a mapping
      * is immutable or that its current COW bytes still equal the file. */
@@ -434,6 +436,8 @@ typedef struct {
     uint32_t entry_size;
     uint64_t code_page;
     uint8_t *code_page_bytes;
+    uint64_t call_continuation, caller_mapping_epoch, return_trace_seq;
+    uint64_t same_page_successor_id;
     ProgramCapture capture;
 } oep_cand_t;
 
@@ -441,6 +445,7 @@ static oep_cand_t *g_selected_candidate;
 static uint64_t g_candidate_count;
 /* Mapping lifetimes and STORE ordinals are separate from code generations. */
 static uint64_t g_stage_syscall_ordinal, g_stage_guest_store_ordinal;
+static uint64_t g_payload_mapping_floor;
 static bool g_stage_mapping_identity;
 static bool g_stage_file_mapping_profile;
 static uint64_t g_stage_self_fd_epoch[64];
@@ -679,7 +684,7 @@ static bool g_layer_has_cand = false;
 static GList *oep_cands = NULL;
 static GHashTable *unmapped_pages = NULL; //for munmaped pages
 
-//addtional info for last indirect jump
+/* Pending transfer to the next observed instruction. */
 static __thread uint64_t prev_jump_site = 0;
 static __thread uint64_t prev_jump_seq_id = 0;
 static __thread int prev_target_reg = REG_INVALID;
@@ -689,6 +694,7 @@ static __thread uint64_t prev_mem_target_value = 0;
 static __thread bool prev_mem_target_valid = false;
 static __thread bool prev_target_tainted = false;
 static __thread bool prev_jump_direct = false;
+static __thread const InsnExecCtx *prev_call_or_jcc;
 
 typedef struct {
     uint64_t pc;
@@ -3340,12 +3346,15 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         }
     }
     bool fixed = (pending->flags & GUEST_MAP_FIXED) != 0;
+    bool private_anonymous = false;
     if (pending->syscall_num == 90 || pending->syscall_num == 192) {
         if (!pending->syscall_ordinal) {
             tf_phase1_profile_lost(&g_phase1, "mapping_syscall_identity_missing");
             return;
         }
         g_stage_mapping_identity = true;
+        private_anonymous = (pending->flags & (GUEST_MAP_ANONYMOUS | 3U)) ==
+                            (GUEST_MAP_ANONYMOUS | GUEST_MAP_PRIVATE);
     }
     stage_invalidate_mapping_range(page_start, mapped_size);
     uint32_t remap_generation = 0;
@@ -3364,6 +3373,7 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
             g_hash_table_insert(pages, key, page);
         }
         page->mapping_epoch = pending->syscall_ordinal;
+        page->private_anonymous_mmap = private_anonymous;
         stage_mapping_backing(page, pending, addr - page_start);
         if (fixed || ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key))) {
             if (pending->prot & 0x4)
@@ -4098,6 +4108,10 @@ static bool cand_rank_better(const oep_cand_t *a, const oep_cand_t *b) {
     if (a_in_main != b_in_main) {
         return a_in_main;
     }
+    bool a_returned_helper = a->same_page_successor_id != 0;
+    bool b_returned_helper = b->same_page_successor_id != 0;
+    if (a_returned_helper != b_returned_helper)
+        return !a_returned_helper;
 
     return cand_score_better(a, b);
 }
@@ -4344,20 +4358,101 @@ static bool read_auxv_from_stack(void) {
     return true;
 }
 
-//is page in boundaries
+static bool page_overlaps_main(uint64_t addr) {
+    return g_main_known && addr < g_main_hi &&
+           (addr >= g_main_lo || g_main_lo - addr < page_size);
+}
+
 static bool page_is_program(uint64_t addr, const page_t *p) {
     if (addr_in_lib(addr))
         return false;
     if (!g_main_known)
         return true;
-    if (addr < g_main_hi && (addr >= g_main_lo || g_main_lo - addr < page_size))
+    if (page_overlaps_main(addr))
         return true;
     if (p && (p->exec_seen || p->exec_after_write || p->dyn_exec))
         return true;
     return false;
 }
 
-static void capture_image(ProgramCapture *capture, uint64_t max_bytes) {
+static bool page_is_payload_mapping(uint64_t addr, const page_t *page) {
+    return page && page->private_anonymous_mmap && page->mapping_epoch > g_payload_mapping_floor &&
+           !page_overlaps_main(addr) && !addr_in_lib(addr);
+}
+
+static bool page_store_coverage(const page_t *page, size_t begin, size_t end) {
+    if (!page->wbitmap)
+        return false;
+    for (size_t byte = begin; byte < end; byte++) {
+        if (!(page->wbitmap[byte >> 3] & (1u << (byte & 7))))
+            return false;
+    }
+    return true;
+}
+
+static bool payload_loads_mapped(const TfElfImage *image) {
+    const uint64_t mask = ~((uint64_t)page_size - 1);
+    for (size_t i = 0; i < image->load_count; i++) {
+        const TfElfLoad *load = &image->loads[i];
+        const int prot = ((load->flags & 4) >> 2) | (load->flags & 2) | ((load->flags & 1) << 2);
+        for (uint64_t addr = load->address & mask; addr < load->address + load->memory_size;
+             addr += page_size) {
+            const page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
+            if (!page_is_payload_mapping(addr, page) || page->prot != prot)
+                return false;
+            /* File bytes were copied by the loader. The zero-fill tail only
+             * needs a live mapping and is captured with its actual bytes. */
+            uint64_t begin = MAX(addr, load->address);
+            uint64_t end = MIN(addr + page_size, load->address + load->file_size);
+            if (begin < end && !page_store_coverage(page, begin - addr, end - addr))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool find_payload_image(const GList *keys, uint64_t entry, TfElfImage *image) {
+    if (!entry || !is_i386 || page_size != TF_ELF_I386_PAGE_SIZE)
+        return false;
+    uint64_t entry_page = entry & ~((uint64_t)page_size - 1);
+    if (!page_is_payload_mapping(entry_page, g_hash_table_lookup(pages, (gpointer)(uintptr_t)entry_page)))
+        return false;
+
+    bool found = false;
+    for (const GList *key = keys; key; key = key->next) {
+        uint64_t addr = (uint64_t)(uintptr_t)key->data;
+        const page_t *page = g_hash_table_lookup(pages, key->data);
+        if (addr > entry_page)
+            break;
+        if (!page_is_payload_mapping(addr, page) || !(page->prot & 1) ||
+            !page_store_coverage(page, 0, 4))
+            continue;
+        uint8_t header[TF_ELF_I386_PAGE_SIZE];
+        TfElfImage observed;
+        if (!guest_read_bytes(addr, header, sizeof(header)) ||
+            !tf_elf_i386_payload(header, addr, entry, &observed) ||
+            !payload_loads_mapped(&observed))
+            continue;
+        if (found)
+            return false; /* More than one matching live header. */
+        *image = observed;
+        found = true;
+    }
+    return found;
+}
+
+static bool payload_contains_page(const TfElfImage *image, uint64_t addr) {
+    if (addr < image->lo || addr >= image->hi)
+        return false;
+    for (size_t i = 0; i < image->load_count; i++) {
+        const TfElfLoad *load = &image->loads[i];
+        if (addr < load->address + load->memory_size && load->address < addr + page_size)
+            return true;
+    }
+    return false;
+}
+
+static void capture_image(ProgramCapture *capture, uint64_t max_bytes, uint64_t entry) {
     if (g_phase1.capture_at_entry && !g_main_known) {
         capture->status = "unsupported";
         tf_phase1_event(&g_phase1, "capture_unavailable", "unsupported", "main_image_unverified",
@@ -4377,6 +4472,11 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes) {
         return;
     }
     GList *keys = g_list_sort(g_hash_table_get_keys(pages), compare_keys);
+    TfElfImage payload;
+    bool payload_found = find_payload_image(keys, entry, &payload);
+    if (payload_found)
+        fprintf(stderr, "[ELF-IMAGE] capture static payload base=0x%" PRIx64
+                " entry=0x%" PRIx64 " loads=%zu\n", payload.lo, entry, payload.load_count);
     if (!g_main_known)
         fprintf(stderr, "[WINDOW] UNKNOWN: dump retains observed non-library pages\n");
     g_static_binary = (lib_deps == NULL);
@@ -4396,7 +4496,8 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes) {
     for (GList *k = keys; k; k = k->next) {
         uint64_t address = (uint64_t)(uintptr_t)k->data;
         page_t *page = g_hash_table_lookup(pages, k->data);
-        if (!page || !page_is_program(address, page))
+        if (!page || !(payload_found ? payload_contains_page(&payload, address) :
+                       page_is_program(address, page)))
             continue;
         GByteArray *data = g_byte_array_new();
         const char *gap = NULL;
@@ -4488,7 +4589,7 @@ static void capture_candidate(oep_cand_t *candidate) {
     }
     capture->path = g_strdup_printf("%s.candidate-%" PRIu64, g_phase1.dump_path,
                                     candidate->candidate_id);
-    capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes));
+    capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes), candidate->addr);
     if (capture->committed)
         g_candidate_capture_bytes += capture->bytes;
     char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
@@ -4532,7 +4633,7 @@ static void do_dump_impl(uint64_t oep) {
     }
     if (!g_phase1.capture_at_entry) {
         ProgramCapture capture = {.path = g_strdup(g_phase1.dump_path)};
-        capture_image(&capture, g_phase1.max_dump_bytes);
+        capture_image(&capture, g_phase1.max_dump_bytes, 0);
         adopt_capture(&capture);
         capture_clear(&capture);
         return;
@@ -5360,16 +5461,25 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     phase1_release_owned();
 }
 
-static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
+static page_t *stage_page_for_pc(uint64_t pc) {
+    uint64_t address = pc & ~((uint64_t)page_size - 1U);
+    return g_hash_table_lookup(pages, (gpointer)(uintptr_t)address);
+}
+
+static uint64_t stage_mapping_epoch_for_pc(uint64_t pc) {
+    const page_t *page = stage_page_for_pc(pc);
+    return page ? page->mapping_epoch : 0;
+}
+
+static bool insn_is_unpacked(uint64_t vaddr, size_t size, bool require_write) {
     for (size_t i = 0; i < size; i++) {
         uint64_t addr = vaddr + i;
-        uint64_t page_addr = addr & ~(page_size - 1);
-        page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
+        const page_t *page = stage_page_for_pc(addr);
 
         if (!page || !(page->prot & 0x4))
             continue;
 
-        if (page->dyn_exec)
+        if (page->dyn_exec && !require_write)
             return true;
 
         if (page->wbitmap) {
@@ -5379,6 +5489,63 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
         }
     }
     return false;
+}
+
+static const TraceEntry *stage_fallthrough_source(const page_t *page, uint64_t pc,
+                                                  uint32_t size, uint64_t seq, uint32_t vcpu) {
+    if (!is_i386 || !page || page->exec_seen || page->candidate_seen || seq < 2 ||
+        !stage_entry_covered(page, pc, size) || page->producer_write_seq >= seq ||
+        page->producer_write_generation != page->gen_written)
+        return NULL;
+    const TraceEntry *prior = trace_find_seq(g_trace, seq - 1, NULL);
+    if (!prior || prior->vcpu_index != vcpu || !prior->size ||
+        !guest_pc_equal(prior->pc + prior->size, pc))
+        return NULL;
+    const InsnDesc *desc = trace_insn_desc_get(g_trace, prior->insn_desc_id);
+    const InsnMeta *meta = meta_lookup_id(prior->meta_id);
+    if (!desc || desc->effects.branch_kind != TRACE_BRANCH_NONE || !meta ||
+        (meta->family == DTA_FAMILY_UNSUPPORTED && meta->insn_id != X86_INS_NOP) ||
+        insn_is_unpacked(prior->pc, prior->size, true))
+        return NULL;
+    return prior;
+}
+
+static void stage_note_call_return(uint64_t pc, uint64_t seq, uint32_t vcpu) {
+    oep_cand_t *candidate = g_active_candidate;
+    if (!candidate || !candidate->call_continuation || candidate->return_trace_seq ||
+        candidate->vcpu != vcpu || candidate->epoch != g_phase1.epoch ||
+        !cand_selection_eligible(candidate) || prev_jump_owner_id != candidate->candidate_id ||
+        !prev_mem_target_valid || !guest_pc_equal(pc, candidate->call_continuation))
+        return;
+    const TraceEntry *prior = trace_find_seq(g_trace, prev_jump_seq_id, NULL);
+    const InsnDesc *desc = prior ? trace_insn_desc_get(g_trace, prior->insn_desc_id) : NULL;
+    if (desc && desc->effects.branch_kind == TRACE_BRANCH_RETURN &&
+        stage_mapping_epoch_for_pc(pc) == candidate->caller_mapping_epoch)
+        candidate->return_trace_seq = seq;
+}
+
+/* A returned helper and a later direct jump from its caller page provide two
+ * observed entries into one mapping generation. */
+static oep_cand_t *stage_same_page_helper(const page_t *page, uint64_t pc,
+                                         uint32_t size, uint32_t vcpu) {
+    oep_cand_t *helper = g_active_candidate;
+    uint64_t page_mask = ~((uint64_t)page_size - 1U);
+    if (!is_i386 || !page || !helper || !helper->return_trace_seq ||
+        helper->return_trace_seq > prev_jump_seq_id || helper->vcpu != vcpu ||
+        helper->epoch != g_phase1.epoch || !cand_selection_eligible(helper) ||
+        helper->code_page != (pc & page_mask) || page->candidate_seq != helper->observed_seq ||
+        page->mapping_epoch != helper->mapping_epoch || page->gen_written != helper->code_generation ||
+        !stage_entry_covered(page, pc, size) || page->producer_write_seq >= helper->observed_seq ||
+        page->producer_write_generation != page->gen_written ||
+        (pc < helper->addr + helper->entry_size && helper->addr < pc + size) ||
+        (prev_jump_site & page_mask) != (helper->jump_site & page_mask) ||
+        stage_mapping_epoch_for_pc(prev_jump_site) != helper->caller_mapping_epoch)
+        return NULL;
+    const TraceEntry *prior = trace_find_seq(g_trace, prev_jump_seq_id, NULL);
+    if (!prior || prior->vcpu_index != vcpu || prior->pc != prev_jump_site ||
+        insn_is_unpacked(prior->pc, prior->size, true))
+        return NULL;
+    return helper;
 }
 
 static bool capture_sparse_auxiliary(void) {
@@ -5696,16 +5863,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         prev_mem_target_valid = false;
         prev_target_tainted = false;
         prev_jump_direct = false;
+        prev_call_or_jcc = NULL;
         prev_jump_owner_id = 0;
         return;
     }
     //detect mov to upacked code
-    bool now_unpacked = insn_is_unpacked(vaddr, meta->size);
-    page_t *cur_pg = NULL;
-    if (now_unpacked) {
-        uint64_t page_addr = vaddr & ~(page_size - 1);
-        cur_pg = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
-    }
+    bool now_unpacked = insn_is_unpacked(vaddr, meta->size, false);
+    page_t *cur_pg = now_unpacked ? stage_page_for_pc(vaddr) : NULL;
 
     bool prev_jump_matches = prev_jump_pending && prev_jump_seq_id &&
                              prev_jump_seq_id != UINT64_MAX &&
@@ -5713,12 +5877,43 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     if (prev_jump_matches && prev_mem_target_valid) {
         prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
     }
+    if (prev_jump_matches)
+        stage_note_call_return(vaddr, current_trace_seq_id, cpu_index);
 
     bool cleanup_entry = stage_cleanup_entry(exec_ctx, cur_pg, current_trace_seq_id,
                                               cpu_index, prev_jump_matches);
     bool new_layer = cleanup_entry || stage_is_new_entry(cur_pg, vaddr, meta->size,
                                         current_trace_seq_id, now_unpacked,
                                         prev_jump_matches);
+    /* A CALL/Jcc entry must overlap a guest write in the current mapping. */
+    if (new_layer && prev_call_or_jcc && !insn_is_unpacked(vaddr, meta->size, true))
+        new_layer = false;
+    oep_cand_t *parent = NULL;
+    if (new_layer && !cleanup_entry) {
+        if (prev_call_or_jcc) {
+            /* Resolve ownership only for an admitted entry. Instruction contexts
+             * are retained until the plugin releases its callbacks. */
+            oep_cand_t *owner = stage_owner_for_instruction(prev_call_or_jcc, prev_jump_seq_id,
+                                                            cpu_index);
+            prev_jump_owner_id = owner ? owner->candidate_id : 0;
+        }
+        parent = stage_candidate_parent(cur_pg, vaddr, meta->size, current_trace_seq_id, cpu_index);
+        /* A transfer within written code needs a producer edge to identify a
+         * new unpacking stage. This excludes calls within a restored image. */
+        if (prev_call_or_jcc && !parent &&
+            insn_is_unpacked(prev_call_or_jcc->pc, prev_call_or_jcc->size, true))
+            new_layer = false;
+    }
+    const TraceEntry *fallthrough = NULL;
+    oep_cand_t *returned_helper = NULL;
+    if (!new_layer && cur_pg) {
+        if (!prev_jump_matches)
+            fallthrough = stage_fallthrough_source(cur_pg, vaddr, meta->size,
+                                                   current_trace_seq_id, cpu_index);
+        else if (prev_jump_direct && !prev_call_or_jcc)
+            returned_helper = stage_same_page_helper(cur_pg, vaddr, meta->size, cpu_index);
+        new_layer = fallthrough || returned_helper;
+    }
     if (cur_pg)
         cur_pg->exec_seen = true;
 
@@ -5727,8 +5922,6 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         return;
     }
     if (new_layer) {
-        oep_cand_t *parent = cleanup_entry ? NULL :
-            stage_candidate_parent(cur_pg, vaddr, meta->size, current_trace_seq_id, cpu_index);
         oep_cand_t *candidate = g_new0(oep_cand_t, 1);
         candidate->addr = vaddr;
         candidate->has_prologue = cand_has_prologue(vaddr);
@@ -5758,8 +5951,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->epoch = g_phase1.epoch;
         candidate->vcpu = cpu_index;
         candidate->entry_size = meta->size;
-        candidate->transfer_seq = prev_jump_seq_id;
+        candidate->transfer_seq = prev_jump_matches ? prev_jump_seq_id : 0;
         candidate->code_page = vaddr & ~((uint64_t)page_size - 1U);
+        if (prev_call_or_jcc && prev_jump_matches && prev_call_or_jcc->meta->insn_id == X86_INS_CALL &&
+            !insn_is_unpacked(prev_call_or_jcc->pc, prev_call_or_jcc->size, true)) {
+            candidate->call_continuation = (uint32_t)(prev_call_or_jcc->pc + prev_call_or_jcc->size);
+            candidate->caller_mapping_epoch = stage_mapping_epoch_for_pc(candidate->jump_site);
+        }
         /* The bounded causal policy supports ordinary 4 KiB i386 pages. A
          * missing snapshot leaves producer ownership unknown; it never turns
          * a later observation into a semantic proof. */
@@ -5786,6 +5984,27 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
 
         phase1_candidate_event("oep_candidate_observed", candidate, false);
         capture_candidate(candidate);
+        if (fallthrough) {
+            char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
+                ",\"source_pc\":%" PRIu64 ",\"source_trace_seq\":%" PRIu64
+                ",\"write_trace_seq\":%" PRIu64 ",\"address\":%" PRIu64 "}",
+                candidate->candidate_id, fallthrough->pc, fallthrough->seq_id,
+                cur_pg->producer_write_seq, vaddr);
+            tf_phase1_event(&g_phase1, "oep_fallthrough_entry_observed", "observed", NULL, payload);
+            g_free(payload);
+        }
+        if (returned_helper) {
+            returned_helper->same_page_successor_id = candidate->candidate_id;
+            char *payload = g_strdup_printf("{\"helper_candidate_id\":%" PRIu64
+                ",\"candidate_id\":%" PRIu64 ",\"return_trace_seq\":%" PRIu64
+                ",\"transfer_trace_seq\":%" PRIu64 ",\"address\":%" PRIu64 "}",
+                returned_helper->candidate_id, candidate->candidate_id, returned_helper->return_trace_seq,
+                prev_jump_seq_id, vaddr);
+            tf_phase1_event(&g_phase1, "oep_same_page_reentry_observed", "observed", NULL, payload);
+            g_free(payload);
+            if (g_selected_candidate == returned_helper)
+                stage_retract_selection("observed_same_page_entry_after_return");
+        }
         if (!g_dse_check_enabled)
             candidate->dse.reason = DSE_REASON_DISABLED;
         if (g_dse_check_enabled && prev_jump_matches) {
@@ -5855,6 +6074,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     prev_mem_target_valid = false;
     prev_target_tainted = false;
     prev_jump_direct = false;
+    prev_call_or_jcc = NULL;
     prev_jump_owner_id = 0;
     //if we are too long in unpacked code without proceeding further - we end the cycle
     if (now_unpacked && !oep_found && g_last_cand_icount &&
@@ -5928,15 +6148,26 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 prev_mem_target_valid = false;
             }
         }
-    } else if (meta->insn_id == X86_INS_JMP && meta->direct_target_valid) {
-        oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id, cpu_index);
-        prev_jump_site = vaddr;
-        prev_jump_seq_id = current_trace_seq_id;
-        prev_jump_pending = true;
-        prev_mem_target_value = meta->direct_target;
-        prev_mem_target_valid = true;
-        prev_jump_direct = true;
-        prev_jump_owner_id = owner ? owner->candidate_id : 0;
+    } else if (meta->direct_target_valid) {
+        bool direct_jmp = meta->insn_id == X86_INS_JMP;
+        bool call_or_jcc = is_i386 && (meta->insn_id == X86_INS_CALL ||
+            (meta->is_conditional_branch &&
+             !guest_pc_equal(meta->direct_target, vaddr + meta->size)));
+        if (direct_jmp || call_or_jcc) {
+            prev_jump_site = vaddr;
+            prev_jump_seq_id = current_trace_seq_id;
+            prev_jump_pending = true;
+            prev_mem_target_value = meta->direct_target;
+            prev_mem_target_valid = true;
+            prev_jump_direct = true;
+            if (call_or_jcc) {
+                prev_call_or_jcc = exec_ctx;
+            } else {
+                oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id,
+                                                                cpu_index);
+                prev_jump_owner_id = owner ? owner->candidate_id : 0;
+            }
+        }
     }
     //got
     if (meta->is_indirect_branch && meta->branch_target_reg == REG_INVALID &&
@@ -6670,6 +6901,10 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
     stage_pending_mutable_return(num, ret);
     stage_pending_msync_return(num, ret);
     const bool syscall_failed = syscall_ret_is_error(ret);
+    /* The page table does not model i386 mremap. Only fresh mmap lifetimes
+     * can identify a separate payload after a successful remap. */
+    if (!syscall_failed && is_i386 && num == 163)
+        g_payload_mapping_floor = g_stage_syscall_ordinal;
     if (syscall_failed) {
         if (is_i386 && num == 6 && g_pending_fd.active &&
             g_pending_fd.kind == PENDING_FD_CLOSE) {
