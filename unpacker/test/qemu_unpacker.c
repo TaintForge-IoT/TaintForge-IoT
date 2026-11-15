@@ -378,6 +378,8 @@ typedef struct {
     uint32_t producer_write_generation, producer_vcpu;
     uint64_t mapping_epoch, guest_store_generation, producer_writer_mapping_epoch;
     bool private_anonymous_mmap;
+    uint64_t mapping_owner, mapping_begin, mapping_end, protection_epoch;
+    uint64_t protection_seq;
     /* Kind zero is deliberately anonymous/initial for zero-initialized pages.
      * File identity is observational metadata, not an assertion that a mapping
      * is immutable or that its current COW bytes still equal the file. */
@@ -392,7 +394,7 @@ typedef struct {
     uint64_t base, bytes, seq, epoch, pc;
     uint32_t code_generation;
     bool base_set, committed;
-    const char *status;
+    const char *status, *layout;
 } ProgramCapture;
 
 static void page_destroy(void *pointer) {
@@ -1035,6 +1037,8 @@ typedef struct {
     int32_t fd;
     uint64_t offset;
     uint64_t syscall_ordinal;
+    uint64_t stage_owner;
+    uint64_t trace_seq;
 } pending_mmap_t;
 
 static __thread pending_mmap_t g_pending_mmap;
@@ -3374,6 +3378,11 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         }
         page->mapping_epoch = pending->syscall_ordinal;
         page->private_anonymous_mmap = private_anonymous;
+        if (private_anonymous && pending->prot == 3 && pending->stage_owner) {
+            page->mapping_owner = pending->stage_owner;
+            page->mapping_begin = page_start;
+            page->mapping_end = page_last + page_size;
+        }
         stage_mapping_backing(page, pending, addr - page_start);
         if (fixed || ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key))) {
             if (pending->prot & 0x4)
@@ -3431,6 +3440,11 @@ static void apply_pending_mprotect(const pending_mmap_t *pending) {
         page_t *page = g_hash_table_lookup(pages, key);
         if (page) {
             page->prot = prot;
+            page->protection_epoch = pending->stage_owner &&
+                pending->stage_owner == page->mapping_owner &&
+                page->mapping_begin == page_start && page->mapping_end == page_end
+                ? pending->syscall_ordinal : 0;
+            page->protection_seq = page->protection_epoch ? pending->trace_seq : 0;
         } else {
             page = g_new0(page_t, 1);
             page->prot = prot;
@@ -3664,6 +3678,21 @@ static oep_cand_t *stage_owner_for_instruction(const InsnExecCtx *instruction,
         memcmp(current, instruction->instr_bytes, instruction->size))
         return NULL;
     return owner;
+}
+
+static uint64_t stage_mapping_syscall_owner(unsigned int vcpu) {
+    if (!g_phase1.capture_at_entry || !is_i386 || !g_trace || !g_active_candidate ||
+        g_active_candidate->stale || g_active_candidate->epoch != g_phase1.epoch)
+        return 0;
+    const TraceEntry *entry = trace_find_seq(g_trace, g_phase1.trace_seq, NULL);
+    if (!entry || entry->pc != g_phase1.pc || entry->size != 2 ||
+        entry->instr_bytes[0] != 0xcd || entry->instr_bytes[1] != 0x80)
+        return 0;
+    InsnExecCtx ctx = {.pc = entry->pc, .size = entry->size,
+                      .code_generation = entry->code_generation};
+    memcpy(ctx.instr_bytes, entry->instr_bytes, entry->size);
+    const oep_cand_t *owner = stage_owner_for_instruction(&ctx, g_phase1.trace_seq, vcpu);
+    return owner ? owner->candidate_id : 0;
 }
 
 /* A tail may unmap the executable page that entered it, restore registers
@@ -3958,6 +3987,7 @@ static double g_oep_confidence = 0.0;
 static GString *g_oep_scoring = NULL;
 static bool image_captured = false;
 static const char *g_capture_status = "not_attempted";
+static const char *g_capture_layout = "tracked_program_pages";
 static GString *g_capture_gaps;
 static uint64_t g_capture_bytes, g_capture_seq, g_capture_epoch, g_capture_pc;
 static uint32_t g_capture_generation;
@@ -4411,7 +4441,8 @@ static bool payload_loads_mapped(const TfElfImage *image) {
     return true;
 }
 
-static bool find_payload_image(const GList *keys, uint64_t entry, TfElfImage *image) {
+static bool find_payload_image(const GList *keys, uint64_t entry, TfElfImage *image,
+                               bool *header_seen) {
     if (!entry || !is_i386 || page_size != TF_ELF_I386_PAGE_SIZE)
         return false;
     uint64_t entry_page = entry & ~((uint64_t)page_size - 1);
@@ -4429,9 +4460,10 @@ static bool find_payload_image(const GList *keys, uint64_t entry, TfElfImage *im
             continue;
         uint8_t header[TF_ELF_I386_PAGE_SIZE];
         TfElfImage observed;
-        if (!guest_read_bytes(addr, header, sizeof(header)) ||
-            !tf_elf_i386_payload(header, addr, entry, &observed) ||
-            !payload_loads_mapped(&observed))
+        if (!guest_read_bytes(addr, header, sizeof(header)) || memcmp(header, "\177ELF", 4))
+            continue;
+        *header_seen = true;
+        if (!tf_elf_i386_payload(header, addr, entry, &observed) || !payload_loads_mapped(&observed))
             continue;
         if (found)
             return false; /* More than one matching live header. */
@@ -4439,6 +4471,99 @@ static bool find_payload_image(const GList *keys, uint64_t entry, TfElfImage *im
         found = true;
     }
     return found;
+}
+
+/* Require data provenance from the packed main ELF for each initialized
+ * interval. Address taint and unknown labels cannot establish this origin. */
+static bool payload_store_origin(uint64_t begin, uint64_t end) {
+    for (uint64_t addr = begin; addr < end; ++addr) {
+        ProvLabelView label;
+        ProvRootSetView roots;
+        if (!prov_label_get(g_prov_registry, shadow_load_label(g_shadow, addr), &label) ||
+            !(label.complete_mask & PROV_COMPLETE_DATA) ||
+            !prov_root_set_get(g_prov_registry, label.data_roots, &roots) || roots.count != 1)
+            return false;
+        ProvRootKey root;
+        if (!prov_root_get(g_prov_registry, roots.roots[0], &root) ||
+            root.kind != PROV_ROOT_RESOURCE_BYTE || root.source_id != g_main_image_resource_id)
+            return false;
+    }
+    return true;
+}
+
+static bool headerless_mapping(uint64_t begin, int prot, const oep_cand_t *child,
+                               uint64_t previous_protection, uint64_t limit,
+                               const page_t **mapping) {
+    const page_t *first = g_hash_table_lookup(pages, (gpointer)(uintptr_t)begin);
+    if (!first || first->mapping_begin != begin || first->mapping_end <= begin ||
+        first->mapping_end > limit || first->mapping_epoch <= previous_protection ||
+        first->protection_epoch <= first->mapping_epoch ||
+        !first->protection_seq || first->protection_seq >= child->transfer_seq)
+        return false;
+
+    bool initialized = false, zero_tail = false;
+    for (uint64_t addr = begin; addr < first->mapping_end; addr += page_size) {
+        const page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
+        if (!page_is_payload_mapping(addr, page) || page->prot != prot ||
+            page->mapping_epoch != first->mapping_epoch || page->mapping_begin != begin ||
+            page->mapping_end != first->mapping_end || page->mapping_owner != child->parent_candidate_id ||
+            page->protection_epoch != first->protection_epoch || page->protection_seq != first->protection_seq)
+            return false;
+
+        if (!page->written && !page->wbitmap) {
+            /* Only a zero-filled tail of the same writable mmap can supply BSS. */
+            uint8_t bytes[TF_ELF_I386_PAGE_SIZE];
+            static const uint8_t zeros[TF_ELF_I386_PAGE_SIZE];
+            if (prot != 3 || !initialized || !guest_read_bytes(addr, bytes, sizeof(bytes)) ||
+                memcmp(bytes, zeros, sizeof(bytes)))
+                return false;
+            zero_tail = true;
+            continue;
+        }
+        if (zero_tail || !page->wbitmap || !page->producer_valid ||
+            page->producer_candidate_id != child->parent_candidate_id ||
+            page->producer_writer_mapping_epoch != child->parent_mapping_epoch ||
+            page->producer_vcpu != child->vcpu || page->producer_write_seq >= page->protection_seq ||
+            page->producer_begin < addr || page->producer_end > addr + page_size ||
+            page->producer_begin >= page->producer_end)
+            return false;
+        size_t lo = page->producer_begin - addr, hi = page->producer_end - addr;
+        for (size_t byte = 0; byte < page_size; ++byte) {
+            bool written = page->wbitmap[byte >> 3] & (1u << (byte & 7));
+            if (written != (lo <= byte && byte < hi))
+                return false;
+        }
+        if (!payload_store_origin(page->producer_begin, page->producer_end))
+            return false;
+        initialized = true;
+    }
+    *mapping = first;
+    return initialized;
+}
+
+/* Bounded layout observed for a separately loaded RX/R/RW static image.
+ * Without PHDRs there is no generic way to identify all of its mappings. */
+static bool find_headerless_payload(const oep_cand_t *child, uint64_t *start, uint64_t *end) {
+    if (!child || !child->parent_candidate_id || !is_i386 ||
+        page_size != TF_ELF_I386_PAGE_SIZE || !g_active_candidate ||
+        g_active_candidate->candidate_id != child->parent_candidate_id ||
+        g_active_candidate->stale || g_active_candidate->epoch != child->epoch ||
+        !g_shadow || !g_prov_registry || g_main_image_resource_id == PROV_RESOURCE_ID_INVALID)
+        return false;
+    const page_t *entry = g_hash_table_lookup(pages, (gpointer)(uintptr_t)child->code_page);
+    if (!entry || entry->mapping_epoch != child->mapping_epoch ||
+        entry->mapping_begin > child->code_page)
+        return false;
+    uint64_t begin = entry->mapping_begin;
+    uint64_t limit = MIN(begin + 1024 * 1024, UINT64_C(1) << 32);
+    const page_t *rx, *r, *rw;
+    if (!headerless_mapping(begin, 5, child, g_active_candidate->mapping_epoch, limit, &rx) ||
+        !headerless_mapping(rx->mapping_end, 1, child, rx->protection_epoch, limit, &r) ||
+        !headerless_mapping(r->mapping_end, 3, child, r->protection_epoch, limit, &rw))
+        return false;
+    *start = begin;
+    *end = rw->mapping_end;
+    return true;
 }
 
 static bool payload_contains_page(const TfElfImage *image, uint64_t addr) {
@@ -4452,7 +4577,7 @@ static bool payload_contains_page(const TfElfImage *image, uint64_t addr) {
     return false;
 }
 
-static void capture_image(ProgramCapture *capture, uint64_t max_bytes, uint64_t entry) {
+static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep_cand_t *candidate) {
     if (g_phase1.capture_at_entry && !g_main_known) {
         capture->status = "unsupported";
         tf_phase1_event(&g_phase1, "capture_unavailable", "unsupported", "main_image_unverified",
@@ -4473,10 +4598,18 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes, uint64_t 
     }
     GList *keys = g_list_sort(g_hash_table_get_keys(pages), compare_keys);
     TfElfImage payload;
-    bool payload_found = find_payload_image(keys, entry, &payload);
-    if (payload_found)
+    bool header_seen = false;
+    bool payload_found = find_payload_image(keys, candidate ? candidate->addr : 0, &payload, &header_seen);
+    uint64_t inferred_start = 0, inferred_end = 0;
+    if (payload_found) {
+        capture->layout = "mapped_elf_headers";
         fprintf(stderr, "[ELF-IMAGE] capture static payload base=0x%" PRIx64
-                " entry=0x%" PRIx64 " loads=%zu\n", payload.lo, entry, payload.load_count);
+                " entry=0x%" PRIx64 " loads=%zu\n", payload.lo, candidate->addr, payload.load_count);
+    } else if (!header_seen && find_headerless_payload(candidate, &inferred_start, &inferred_end)) {
+        capture->layout = "observed_stage_rx_r_rw";
+    } else {
+        capture->layout = "tracked_program_pages";
+    }
     if (!g_main_known)
         fprintf(stderr, "[WINDOW] UNKNOWN: dump retains observed non-library pages\n");
     g_static_binary = (lib_deps == NULL);
@@ -4496,8 +4629,12 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes, uint64_t 
     for (GList *k = keys; k; k = k->next) {
         uint64_t address = (uint64_t)(uintptr_t)k->data;
         page_t *page = g_hash_table_lookup(pages, k->data);
-        if (!page || !(payload_found ? payload_contains_page(&payload, address) :
-                       page_is_program(address, page)))
+        if (!page)
+            continue;
+        bool included = payload_found ? payload_contains_page(&payload, address) :
+                        inferred_end ? inferred_start <= address && address < inferred_end :
+                        page_is_program(address, page);
+        if (!included)
             continue;
         GByteArray *data = g_byte_array_new();
         const char *gap = NULL;
@@ -4589,7 +4726,7 @@ static void capture_candidate(oep_cand_t *candidate) {
     }
     capture->path = g_strdup_printf("%s.candidate-%" PRIu64, g_phase1.dump_path,
                                     candidate->candidate_id);
-    capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes), candidate->addr);
+    capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes), candidate);
     if (capture->committed)
         g_candidate_capture_bytes += capture->bytes;
     char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
@@ -4617,6 +4754,7 @@ static void adopt_capture(ProgramCapture *capture) {
     g_capture_epoch = capture->epoch;
     g_capture_pc = capture->pc;
     g_capture_generation = capture->code_generation;
+    g_capture_layout = capture->layout;
 }
 
 static void do_dump_impl(uint64_t oep) {
@@ -4633,7 +4771,7 @@ static void do_dump_impl(uint64_t oep) {
     }
     if (!g_phase1.capture_at_entry) {
         ProgramCapture capture = {.path = g_strdup(g_phase1.dump_path)};
-        capture_image(&capture, g_phase1.max_dump_bytes, 0);
+        capture_image(&capture, g_phase1.max_dump_bytes, NULL);
         adopt_capture(&capture);
         capture_clear(&capture);
         return;
@@ -4686,6 +4824,7 @@ static void write_report(void) {
             g_capture_gaps ? g_capture_gaps->str : "[]");
     fprintf(f_json,
             "  \"capture_method\":\"%s\",\n"
+            "  \"capture_layout\":\"%s\",\n"
             "  \"capture_candidate_id\":%" PRIu64 ",\n"
             "  \"candidate_capture_bytes\":%" PRIu64 ",\n"
             "  \"dse_check_enabled\":%s,\n"
@@ -4693,6 +4832,7 @@ static void write_report(void) {
             "  \"main_image_verified\":%s,\n"
             "  \"trace_capacity\":%u,\n",
             g_phase1.capture_at_entry ? "candidate_entry_before_instruction" : "finalization",
+            g_capture_layout,
             g_phase1.capture_at_entry && g_selected_candidate
                 ? g_selected_candidate->candidate_id : UINT64_C(0),
             g_candidate_capture_bytes, g_dse_check_enabled ? "true" : "false",
@@ -6757,6 +6897,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         g_pending_mmap.active = true;
         g_pending_mmap.syscall_num = num;
         g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
+        g_pending_mmap.stage_owner = stage_mapping_syscall_owner(vcpu_idx);
         g_pending_mmap.requested_addr = (uint32_t)a1;
         g_pending_mmap.size = (uint32_t)a2;
         g_pending_mmap.prot = (int)a3;
@@ -6772,6 +6913,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
             g_pending_mmap.active = true;
             g_pending_mmap.syscall_num = num;
             g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
+            g_pending_mmap.stage_owner = stage_mapping_syscall_owner(vcpu_idx);
             g_pending_mmap.requested_addr = args[0];
             g_pending_mmap.size = args[1];
             g_pending_mmap.prot = (int)args[2];
@@ -6788,6 +6930,10 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         g_pending_mmap.active = true;
         g_pending_mmap.syscall_num = num;
         g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
+        if (num == 125) {
+            g_pending_mmap.stage_owner = stage_mapping_syscall_owner(vcpu_idx);
+            g_pending_mmap.trace_seq = g_phase1.trace_seq;
+        }
         g_pending_mmap.requested_addr = (uint32_t)a1;
         g_pending_mmap.size = (uint32_t)a2;
         g_pending_mmap.prot = (num == 91) ? 0 : (int)(uint32_t)a3;
