@@ -201,8 +201,9 @@ done:
     return out;
 }
 
-IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolicRead *source,
-                                      bool solve, const IrInvertOptions *limits) {
+static IrConcolicReadResult concolic_read(const ReplayInput *input, const IrConcolicRead *source,
+                                          bool solve, const IrInvertOptions *limits,
+                                          IrReplayCountedLoop loop) {
     IrConcolicReadResult out = unknown("direct_read_evidence_missing");
     uint32_t count = replay_input_count(input);
     if (!source || !source->completed_read || !source->read_seq || source->read_seq == UINT64_MAX ||
@@ -224,6 +225,7 @@ IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolic
         last->entry.vcpu_index != source->vcpu)
         return unknown("read_boundary_identity");
     IrReplayOptions options = ir_replay_default_options();
+    options.counted_loop = loop;
     options.x86.flat32_ram = true;
     options.max_steps = CONCOLIC_MAX_STEPS;
     IrReplayBuildInfo build;
@@ -232,6 +234,11 @@ IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolic
     ir_phase_stop(IR_PHASE_LIFT, phase);
     IrStateId state = replay ? ir_replay_state(replay)->memory : 0;
     return invert_replay(input, replay, build, source, state, solve, limits);
+}
+
+IrConcolicReadResult ir_concolic_read(const ReplayInput *input, const IrConcolicRead *source,
+                                      bool solve, const IrInvertOptions *limits) {
+    return concolic_read(input, source, solve, limits, (IrReplayCountedLoop){0});
 }
 
 IrConcolicReadResult ir_concolic_stdin_sequence(const ReplayInput *input,
@@ -308,6 +315,9 @@ struct TfConcolic {
     FILE *report;
     uint32_t pc, occurrence, seen, max_steps, instructions;
     uint64_t first_seq, selected_seq;
+    IrReplayCountedLoop loop;
+    uint64_t loop_pc;
+    InsnDescId loop_descriptors[3];
     uint8_t expected;
     bool solve, pending, armed, finished;
     const char *failure;
@@ -876,9 +886,57 @@ static void entry_json(FILE *f, const TraceEntry *entry) {
     fputs("\"}", f);
 }
 
+/* The candidate is recognized on the second ADD. Its count comes from the
+ * preceding MOV, and every further raw instruction must match its position
+ * in the observed body until the final fall-through. */
+static void select_counted_loop(TfConcolic *run, const TraceBuffer *trace, const TraceEntry *entry) {
+    uint64_t seq = entry->seq_id;
+    if (!run->guest_file || !run->armed || seq - run->first_seq < 4U ||
+        seq - 4U <= run->source.read_seq ||
+        entry->size != 3 || entry->instr_bytes[0] != 0x83 ||
+        (entry->instr_bytes[1] & 0xf8) != 0xc0)
+        return;
+    const TraceEntry *init = trace_find_seq(trace, seq - 4U, NULL);
+    const TraceEntry *add = trace_find_seq(trace, seq - 3U, NULL);
+    const TraceEntry *dec = trace_find_seq(trace, seq - 2U, NULL);
+    const TraceEntry *jnz = trace_find_seq(trace, seq - 1U, NULL);
+    uint32_t iterations = ir_replay_counted_loop_iterations(init, add, dec, jnz);
+    if (!iterations || entry->pc != add->pc ||
+        entry->insn_desc_id != add->insn_desc_id ||
+        (run->pc >= add->pc && run->pc < add->pc + 6U))
+        return;
+    /* All raw evidence must still fit in the existing trace ring at exit. */
+    uint64_t through_exit = seq - 3U - run->first_seq + 3U * iterations;
+    if (through_exit < run->max_steps || through_exit >= trace->capacity ||
+        seq - 3U > UINT64_MAX - 3U * iterations)
+        return;
+    run->loop = (IrReplayCountedLoop){
+        .head_seq = seq - 3U, .resume_seq = seq - 3U + 3U * (iterations - 1U),
+        .iterations = iterations};
+    run->loop_pc = add->pc;
+    run->loop_descriptors[0] = add->insn_desc_id;
+    run->loop_descriptors[1] = dec->insn_desc_id;
+    run->loop_descriptors[2] = jnz->insn_desc_id;
+}
+
+static bool counted_loop_matches(const TfConcolic *run, const TraceEntry *entry) {
+    uint64_t seq = entry->seq_id;
+    uint64_t exit_seq = run->loop.resume_seq + 3U;
+    if (seq == exit_seq)
+        return entry->pc == run->loop_pc + 6U;
+    if (seq > exit_seq)
+        return true;
+    unsigned slot = (unsigned)((seq - run->loop.head_seq) % 3U);
+    static const uint8_t offsets[] = {0, 3, 4};
+    return entry->pc == run->loop_pc + offsets[slot] &&
+           entry->insn_desc_id == run->loop_descriptors[slot];
+}
+
 /* Validate the whole observed instruction prefix, including the read setup.
  * Cross-run equality is checked later by PC/bytes/order, never local IDs. */
 static bool prefix_valid(const TfConcolic *run, const TraceBuffer *trace, uint64_t trigger) {
+    if (run->loop.head_seq && run->loop.resume_seq + 3U > run->selected_seq)
+        return false;
     for (uint64_t seq = run->first_seq; seq < trigger; ++seq) {
         InsnOccurrence occurrence;
         const TraceEntry *entry = trace_find_seq(trace, seq, NULL);
@@ -898,6 +956,20 @@ static bool prefix_valid(const TfConcolic *run, const TraceBuffer *trace, uint64
              occurrence.branch_outcome == BRANCH_OUTCOME_UNKNOWN ||
              occurrence.observed_branch_target != next->pc))
             return false;
+        uint64_t exit_seq = run->loop.resume_seq + 3U;
+        if (run->loop.head_seq && seq >= run->loop.head_seq && seq < exit_seq) {
+            if (!counted_loop_matches(run, entry) || !occurrence.dynamic_effects_available ||
+                occurrence.incomplete_reasons || occurrence.mem_read_total || occurrence.mem_write_total ||
+                occurrence.desc_id != entry->insn_desc_id || desc->pc != entry->pc ||
+                desc->code_generation != entry->code_generation || desc->size != entry->size ||
+                desc->size > MAX_INSN_BYTES || memcmp(desc->bytes, entry->instr_bytes, desc->size) ||
+                desc->arch != TRACE_ARCH_X86 || desc->mode != TRACE_MODE_32)
+                return false;
+            if ((seq - run->loop.head_seq) % 3U == 2U &&
+                occurrence.branch_outcome != (seq + 1U == exit_seq ? BRANCH_OUTCOME_NOT_TAKEN
+                                                                   : BRANCH_OUTCOME_TAKEN))
+                return false;
+        }
     }
     return true;
 }
@@ -1011,13 +1083,17 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
     }
     uint64_t seqs[CONCOLIC_MAX_STEPS];
     uint64_t start = run->source.read_seq + (run->stdin_sequence ? 0 : 1);
-    uint64_t n = run->selected_seq - start + 1;
-    if (!n || n > CONCOLIC_MAX_STEPS) {
+    uint64_t omitted = run->loop.resume_seq - run->loop.head_seq;
+    uint64_t n = run->selected_seq - start + 1 - omitted;
+    if (!n || n + (omitted != 0) > CONCOLIC_MAX_STEPS) {
         fail(run, "instruction_budget");
         return;
     }
-    for (uint32_t i = 0; i < n; ++i)
-        seqs[i] = start + i;
+    for (uint32_t i = 0; i < n; ++i, ++start) {
+        if (start == run->loop.head_seq)
+            start = run->loop.resume_seq;
+        seqs[i] = start;
+    }
     IrPhaseProfile profile = {0};
     IrPhaseProfile *previous_profile = ir_phase_profile;
     ir_phase_profile = &profile;
@@ -1045,7 +1121,7 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
         source.read_seq = run->reads[0].seq;
         source.address = run->reads[0].address;
     } else
-        result = ir_concolic_read(input, &source, run->solve, NULL);
+        result = concolic_read(input, &source, run->solve, NULL, run->loop);
     replay_input_destroy(input);
     IrPhaseTime total = ir_phase_elapsed(started);
     ir_phase_profile = previous_profile;
@@ -1146,6 +1222,10 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
                 "\"byte\":%u,\"candidate\":%u,\"input_id\":%u,",
                 run->source.byte, result.candidates[0], result.inputs[0]);
     }
+    if (omitted)
+        fprintf(f, "\"counted_loop\":{\"head_seq\":%" PRIu64 ",\"resume_seq\":%" PRIu64
+                   ",\"iterations\":%u},", run->loop.head_seq, run->loop.resume_seq,
+                run->loop.iterations);
     fprintf(f,
             "\"read_seq\":%" PRIu64 ",\"address\":%u,\"flags_verified\":true,"
             "\"fixed_inputs_sha256\":\"%s\",\"branch_pc\":%u,\"occurrence\":%u,"
@@ -1155,6 +1235,8 @@ static void report(TfConcolic *run, const TraceBuffer *trace, const DseAuxRing *
             run->selected_seq, branch.branch_outcome == BRANCH_OUTCOME_TAKEN ? "true" : "false",
             result.target_known ? "true" : "false", result.target, result.prefix_branches);
     for (uint64_t seq = run->first_seq; seq < trigger; ++seq) {
+        if (seq == run->loop.head_seq)
+            seq = run->loop.resume_seq;
         if (seq != run->first_seq)
             fputc(',', f);
         fputs("{\"instruction\":", f);
@@ -1198,7 +1280,16 @@ void tf_concolic_instruction(TfConcolic *run, const TraceBuffer *trace, const Ds
         report(run, trace, aux, graph, seq);
         return;
     }
-    if (run->instructions >= run->max_steps) {
+    if (run->loop.head_seq && !counted_loop_matches(run, entry))
+        run->loop = (IrReplayCountedLoop){0};
+    if (!run->loop.head_seq)
+        select_counted_loop(run, trace, entry);
+    uint64_t omitted = 0;
+    if (run->loop.head_seq) {
+        uint64_t through = seq < run->loop.resume_seq ? seq : run->loop.resume_seq;
+        omitted = through - run->loop.head_seq;
+    }
+    if (run->instructions - omitted + (omitted != 0) >= run->max_steps) {
         fail(run, "instruction_budget");
         return;
     }

@@ -15,6 +15,8 @@ def main(argv=None):
     parser.add_argument('--seed', action='append', dest='seeds', type=Path, required=True)
     parser.add_argument('--input-path', required=True)
     parser.add_argument('--arg', dest='argv', action='append', default=[])
+    parser.add_argument('--queue-batch-size', type=int,
+                        help='DSE starts per queue invocation (default: the full start budget)')
     for name, default in (('max-candidates', 24), ('max-jobs', 8), ('max-occurrences', 4),
                           ('max-steps', 1024), ('max-sites', 4096), ('seconds', 30),
                           ('memory-mib', 1024), ('wall-seconds', 3600)):

@@ -15,6 +15,9 @@
 #define DSE_SYSCALL_PATH_BYTES 4096U
 #define DSE_EXECUTABLE_SNAPSHOT_BYTES (4U * 1024U * 1024U)
 #define DSE_PROC_EXE_API 1
+#define DSE_PROC_EXE_PAGE_BYTES 4096U
+#define DSE_MEMFD_BOUNDARY_PAGE_BYTES 4096U
+#define DSE_MEMFD_BOUNDARY_WRITE_ORDINAL 4U
 #define DSE_BRK_STATE_MAGIC UINT32_C(0x42520101)
 
 /* Optional, value-owned /proc/self/exe contract. Source bytes/name come from
@@ -24,6 +27,8 @@ typedef struct {
     uint16_t path_size, link_size;
     uint32_t content_size, reply_size;
     uint64_t source_identity;
+    /* A certified read-only open preceding the first-page mmap2. */
+    uint64_t open_seq, open_boundary;
     bool path_observed, path_valid, source_observed, source_valid;
     bool reply_observed, reply_valid, content_valid;
     uint8_t path[DSE_SYSCALL_PATH_BYTES]; /* Includes NUL. */
@@ -94,6 +99,66 @@ typedef struct {
     uint8_t read_valid[DSE_MAX_MEM_ACCESSES];
 } DseSourceObservation;
 
+/* Owned witness for the first full write to one zeroed, shared memfd page.
+ * The verified create, resize and map precede the replay window. */
+typedef struct {
+    uint64_t create_seq, resize_seq, mmap_seq, write_seq;
+    uint32_t fd, flags, size, address;
+    bool verified;
+} DseMemfdBoundary;
+
+#define DSE_TLS_SEGMENTS 2U /* FS, GS */
+#define DSE_TLS_GS 1U
+#define DSE_TLS_FIRST_SLOT 6U
+#define DSE_TLS_SLOTS 3U
+
+/* Value-owned memory and segment-cache snapshot at an i386 TLS syscall. */
+typedef struct {
+    uint32_t gdt_base;
+    uint32_t user_desc[4];
+    uint32_t slot[DSE_TLS_SLOTS][2];
+    uint32_t base[DSE_TLS_SEGMENTS], selector[DSE_TLS_SEGMENTS];
+    bool valid;
+} DseTlsSnapshot;
+
+typedef struct {
+    uint32_t gdt_base;
+    uint32_t before[2], after[2];
+    bool before_valid, after_valid;
+} DseGsLoadObservation;
+
+typedef struct {
+    uint64_t low, high;
+    uint8_t slot; /* XMM index plus one. */
+    bool valid;
+} DseXmmObservation;
+
+#define DSE_I386_SIG_UNBLOCK 1U
+#define DSE_SIGMASK_STATE_MAGIC UINT32_C(0x534d0101)
+#define DSE_I386_SIGINT 2U
+#define DSE_SIGACTION_STATE_MAGIC UINT32_C(0x53410101)
+#define DSE_SIGACTION_WORDS 5U
+
+typedef struct {
+    uint64_t mask;
+    bool observed, no_pending;
+} DseSigmaskSnapshot;
+
+typedef struct {
+    /* handler, flags, restorer, and the two words of sa_mask */
+    uint32_t words[DSE_SIGACTION_WORDS];
+    bool observed;
+} DseSigactionSnapshot;
+
+#define DSE_STDIO_MAX_BYTES 256U
+
+typedef struct {
+    uint64_t device, inode, offset, file_size;
+    uint32_t length;
+    bool before_valid, after_valid;
+    uint8_t bytes[DSE_STDIO_MAX_BYTES];
+} DseStdioObservation;
+
 /* An entry/return pair belongs to one exact dynamic instruction. The aux ring
  * and ReplayInput own separate copies; a missing pair never implies no effect. */
 typedef struct {
@@ -122,13 +187,18 @@ typedef struct {
      * and resource accounting include its bytes as well as the header. */
     uint8_t *write_values;
     DseSyscallFileObservation *file;
+    DseMemfdBoundary memfd_boundary;
     /* Value-owned tf_brk_state_v1 snapshots, read at syscall entry and at the
      * next instruction. No heap state is inferred from the return alone. */
     uint32_t brk_initial, brk_before, brk_after;
     bool brk_entry_valid, brk_post_valid;
+    DseTlsSnapshot tls_before, tls_after;
+    uint64_t sigmask_set;
+    bool sigmask_set_valid;
+    DseSigmaskSnapshot sigmask_before, sigmask_after;
+    DseSigactionSnapshot sigaction_input, sigaction_before, sigaction_after;
+    DseStdioObservation stdio;
 } DseSyscallObservation;
-
-#define DSE_TLS_SEGMENTS 2U /* FS, GS */
 
 /* Value-owned provenance for DF on the observed prefix. A completed, ordinary
  * CLD/STD creates it; every intervening instruction must preserve DF and have
@@ -173,6 +243,8 @@ typedef struct {
     uint32_t tls_base[DSE_TLS_SEGMENTS];
     uint16_t tls_selector[DSE_TLS_SEGMENTS];
     uint8_t tls_valid_mask;
+    DseGsLoadObservation gs_load;
+    DseXmmObservation xmm_after;
     DseSyscallObservation *syscall;
     bool syscall_metadata_lost;
     bool next_pc_valid;
@@ -234,6 +306,8 @@ const char *dse_aux_es_contract_issue(const InsnAux *aux);
  * base qualify. This does not certify the segment's limit/type. */
 void dse_aux_set_tls(InsnAux *aux, unsigned segment, uint32_t base, uint32_t selector,
                      bool read_ok);
+RegId dse_x86_mov_gs_source(const TraceEntry *entry);
+uint32_t dse_x86_tls_gdt_offset(uint16_t selector);
 bool dse_aux_syscall_enter(DseAuxRing *ring, InsnAux *aux, const TraceEntry *entry, uint32_t number,
                            const uint32_t args[6]);
 bool dse_aux_syscall_return(InsnAux *aux, uint64_t seq_id, uint32_t vcpu_index, uint32_t number,
@@ -258,15 +332,25 @@ const char *dse_aux_ir_mmap_issue(const TraceEntry *entry, const InsnAux *aux,
                                   uint32_t normalized[6]);
 const char *dse_aux_msync_issue(const TraceEntry *entry, const InsnAux *aux);
 void dse_aux_syscall_brk_state(InsnAux *aux, const uint32_t words[4], bool valid, bool post);
+const char *dse_aux_set_thread_area_issue(const TraceEntry *entry, const InsnAux *aux,
+                                         unsigned *slot);
+const char *dse_aux_set_tid_address_issue(const TraceEntry *entry, const InsnAux *aux);
+const char *dse_aux_sigprocmask_issue(const TraceEntry *entry, const InsnAux *aux);
+const char *dse_aux_sigaction_issue(const TraceEntry *entry, const InsnAux *aux);
 const char *dse_aux_brk_issue(const TraceEntry *entry, const InsnAux *aux);
 bool dse_aux_syscall_write(DseAuxRing *ring, InsnAux *aux, const uint8_t *bytes, size_t size);
 const char *dse_aux_write_issue(const TraceEntry *entry, const InsnAux *aux);
 const char *dse_aux_close_issue(const TraceEntry *entry, const InsnAux *aux);
+const char *dse_aux_stdio_issue(const TraceEntry *entry, const InsnAux *aux);
 bool dse_aux_syscall_path(DseAuxRing *ring, InsnAux *aux, const uint8_t *path, size_t size);
 bool dse_aux_syscall_executable(DseAuxRing *ring, InsnAux *aux, uint64_t identity,
                                  const uint8_t *link, size_t link_size,
                                  const uint8_t *contents, size_t content_size);
 bool dse_aux_syscall_readlink_reply(InsnAux *aux, const uint8_t *bytes, size_t size);
+bool dse_aux_executable_mmap_shape(const DseSyscallObservation *syscall);
+bool dse_aux_syscall_executable_mmap(DseAuxRing *ring, InsnAux *aux, uint64_t identity,
+                                    uint64_t open_seq, uint64_t open_boundary,
+                                    const uint8_t page[DSE_PROC_EXE_PAGE_BYTES]);
 const char *dse_aux_open_executable_issue(const TraceEntry *entry, const InsnAux *aux);
 const char *dse_aux_readlink_executable_issue(const TraceEntry *entry, const InsnAux *aux);
 size_t dse_aux_syscall_owned_bytes(const DseSyscallObservation *s);

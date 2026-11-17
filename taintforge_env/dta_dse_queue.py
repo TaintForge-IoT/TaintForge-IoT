@@ -241,7 +241,7 @@ def _controller_arguments(state):
             **{name: limits[name] for name in ('max_occurrences', 'max_steps', 'max_sites', 'seconds', 'memory_mib')}}
 
 
-def _collect(queue, state, sources):
+def _collect(queue, state, sources, *, completed_attempts=None, attempt_details=None):
     seeds, origins, changed, adopted = {}, {}, False, 0
 
     def add(raw_seeds, origin):
@@ -264,6 +264,11 @@ def _collect(queue, state, sources):
         _require(request['opposite_observed_elsewhere'] is False and request['observed_site']['vcpu'] == 0,
                  'Queue contains an ineligible source hint')
         if row['status'] == 'PENDING':
+            continue
+        origin = 'DSE:' + identifier
+        if (completed_attempts is not None and identifier in completed_attempts and
+                row['status'] in ('VERIFIED', 'NONPROOF')):
+            add(completed_attempts[identifier], origin)
             continue
         attempt = row['attempts'][0]
         try:
@@ -301,7 +306,12 @@ def _collect(queue, state, sources):
             _require(isinstance(raw, bytes) and _sha(raw) == sha, 'Audited controller seed bytes changed')
             if sha in data['seeds']:
                 _require(data['seeds'][sha] == raw, 'Controller changed an admitted baseline seed')
-        add({sha: raw for sha, raw in audited['seeds'].items() if sha not in data['seeds']}, 'DSE:' + identifier)
+        new_seeds = {sha: raw for sha, raw in audited['seeds'].items() if sha not in data['seeds']}
+        add(new_seeds, origin)
+        if completed_attempts is not None:
+            completed_attempts[identifier] = new_seeds
+        if attempt_details is not None:
+            attempt_details[identifier] = (request, report, frozenset(audited['seeds']))
     return seeds, origins, changed, adopted
 
 
@@ -452,9 +462,10 @@ def enqueue_analyses(*, queue, analyses):
                         admitted_jobs=admitted, duplicate_jobs=duplicates, adopted_completed_attempts=recovered)
 
 
-def _audit_locked(queue, state):
+def _audit_locked(queue, state, *, completed_attempts=None, attempt_details=None):
     sources = _sources(queue, state)
-    seeds, origins, changed, adopted = _collect(queue, state, sources)
+    seeds, origins, changed, adopted = _collect(queue, state, sources, completed_attempts=completed_attempts,
+                                                attempt_details=attempt_details)
     if changed:
         _commit(queue, state, seeds, origins)
     else:
@@ -463,10 +474,18 @@ def _audit_locked(queue, state):
 
 
 def audit_queue(*, queue):
+    summary, _, _ = _audit_queue(queue=queue, include_attempts=False)
+    return summary
+
+
+def _audit_queue(*, queue, include_attempts):
+    """Optionally return the audited journal and selected attempt details in memory."""
     with _lock(queue) as queue:
         state = _load(queue)
-        _, adopted = _audit_locked(queue, state)
-        return _summary(queue, state, audited=True, action='audited', adopted_completed_attempts=adopted)
+        attempts = {} if include_attempts else None
+        _, adopted = _audit_locked(queue, state, attempt_details=attempts)
+        summary = _summary(queue, state, audited=True, action='audited', adopted_completed_attempts=adopted)
+        return summary, state, attempts
 
 
 def queue_status(*, queue):
@@ -498,7 +517,20 @@ def _stopped(queue, state):
     return record is not None and record['nonce'] != state.get('acknowledged_stop_nonce')
 
 
-def run_queue(*, queue, max_jobs=1, wall_seconds=900):
+def run_queue(*, queue, max_jobs=1, wall_seconds=900, on_job_complete=None):
+    """Run pending jobs in FIFO order, optionally reporting each committed job.
+
+    The callback receives the job ID and elapsed seconds under the queue lock.
+    A callback error propagates after the completed attempt has been committed.
+    A batch reaudits the saved history before returning an audited result.
+    """
+    result, _ = _run_queue(queue=queue, max_jobs=max_jobs, wall_seconds=wall_seconds,
+                           on_job_complete=on_job_complete, include_exit_audit=False)
+    return result
+
+
+def _run_queue(*, queue, include_exit_audit, max_jobs=1, wall_seconds=900, on_job_complete=None):
+    """Return the run summary and, when requested, details from the batch-exit audit."""
     _limit(max_jobs, 4096, 'jobs per queue invocation')
     _limit(wall_seconds, 172800, 'soft between-job wall time')
     with _lock(queue) as queue:
@@ -508,7 +540,9 @@ def run_queue(*, queue, max_jobs=1, wall_seconds=900):
         if previous_stop is not None and previous_stop['nonce'] != state.get('acknowledged_stop_nonce'):
             state['acknowledged_stop_nonce'] = previous_stop['nonce']
             _save_state(queue, state)
-        sources, adopted = _audit_locked(queue, state)
+        # Reuse only the seed additions audited during this lock acquisition.
+        completed_attempts = {} if max_jobs > 1 else None
+        _, adopted = _audit_locked(queue, state, completed_attempts=completed_attempts)
         launched, stopped = 0, False
         for identifier in state['order']:
             if any(row['status'] == 'BLOCKED_RECOVERY' for row in state['jobs'].values()):
@@ -522,6 +556,7 @@ def run_queue(*, queue, max_jobs=1, wall_seconds=900):
             starts = sum(len(item['attempts']) for item in state['jobs'].values())
             if launched == max_jobs or starts == state['config']['limits']['max_total_starts'] or time.monotonic() - start >= wall_seconds:
                 break
+            job_started = time.monotonic()
             directory = queue / 'attempts' / identifier / '0001'
             _canonical(directory)
             _require(not directory.exists(), 'Unrecorded attempt output already exists')
@@ -536,7 +571,8 @@ def run_queue(*, queue, max_jobs=1, wall_seconds=900):
                 _require(canonical_hash(returned) == canonical_hash(_read(directory / 'summary.json')),
                          'Controller return differs from its saved result')
                 sources = _sources(queue, state)
-                seeds, origins, changed, recovered = _collect(queue, state, sources)
+                seeds, origins, changed, recovered = _collect(queue, state, sources,
+                                                            completed_attempts=completed_attempts)
                 adopted += recovered
                 _require(row['status'] in ('VERIFIED', 'NONPROOF'), 'Fresh attempt did not pass its saved evidence audit')
                 _load(queue)  # Recheck source code/runtime and the committed pre-execution journal.
@@ -548,7 +584,19 @@ def run_queue(*, queue, max_jobs=1, wall_seconds=900):
                     row['error'] = f'{type(exc).__name__}: {exc}'[:2000]
                     _save_state(queue, state)
                 raise
-        _load(queue)
-        return _summary(queue, state, audited=True, stopped=stopped or _stopped(queue, state), action='run',
-                        started_this_run=launched, adopted_completed_attempts=adopted,
-                        soft_wall_seconds=wall_seconds, wall_seconds=time.monotonic() - start)
+            if on_job_complete is not None:
+                on_job_complete(identifier, time.monotonic() - job_started)
+        exit_audit = None
+        if completed_attempts is not None and launched:
+            attempt_details = {} if include_exit_audit else None
+            _, recovered = _audit_locked(queue, state, attempt_details=attempt_details)
+            adopted += recovered
+            if attempt_details is not None and not recovered:
+                audit_summary = _summary(queue, state, audited=True, action='audited',
+                                         adopted_completed_attempts=0)
+                exit_audit = (audit_summary, state, attempt_details)
+        _require(_load(queue) == state, 'Queue journal changed during FIFO execution')
+        result = _summary(queue, state, audited=True, stopped=stopped or _stopped(queue, state), action='run',
+                          started_this_run=launched, adopted_completed_attempts=adopted,
+                          soft_wall_seconds=wall_seconds, wall_seconds=time.monotonic() - start)
+        return result, exit_audit

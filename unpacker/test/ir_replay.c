@@ -12,6 +12,10 @@ typedef struct {
     IrOrigin read_origin;
 } ReplayByte;
 
+#define IR_CLEAR_CHILD_TID_KEY UINT64_C(0x20002)
+#define IR_SIGNAL_MASK_KEY UINT64_C(0x20003)
+#define IR_SIGNAL_ACTION_KEY_BASE UINT64_C(0x20004)
+
 struct IrReplay {
     IrModule *module;
     IrOrigin current_origin;
@@ -35,6 +39,10 @@ struct IrReplay {
     IrBits initial_gpr[IR_X86_GPR_COUNT];
     IrBits initial_flags[IR_X86_FLAG_COUNT];
     IrBits initial_tls[IR_X86_TLS_COUNT];
+    IrStateId clear_child_tid;
+    IrStateId signal_mask;
+    IrStateId sigint_action[DSE_SIGACTION_WORDS];
+    uint64_t stdin_device, stdin_inode, stdin_file_size, stdin_next_offset;
     IrReplayObservation *observations;
     uint32_t observation_count, observation_capacity;
     ReplayByte *memory;
@@ -44,7 +52,7 @@ struct IrReplay {
     IrReplayTarget target;
     uint32_t undefined_flags; /* Architectural status along the unrolled path. */
     bool allocation_failed;
-    uint64_t trigger_seq;
+    uint64_t first_seq, trigger_seq;
     IrInputs *inputs;
     IrStatus input_status;
     uint64_t input_scan_work;
@@ -64,6 +72,24 @@ size_t ir_replay_allocated_bytes(const IrReplay *r) {
 }
 
 static const unsigned flag_bit[IR_X86_FLAG_COUNT] = {0, 2, 4, 6, 7, 11, 10};
+
+uint32_t ir_replay_counted_loop_iterations(const TraceEntry *init, const TraceEntry *add,
+                                           const TraceEntry *dec, const TraceEntry *jnz) {
+    if (!init || !add || !dec || !jnz || add->pc > UINT32_MAX - 6U ||
+        init->size != 5 || init->pc + 5U != add->pc || init->instr_bytes[0] != 0xb9 ||
+        add->size != 3 || add->instr_bytes[0] != 0x83 ||
+        (add->instr_bytes[1] & 0xf8) != 0xc0 ||
+        (add->instr_bytes[1] & 7) == DTA_REG_RCX ||
+        (add->instr_bytes[1] & 7) == DTA_REG_RSP ||
+        dec->pc != add->pc + 3U || dec->size != 1 || dec->instr_bytes[0] != 0x49 ||
+        jnz->pc != add->pc + 4U || jnz->size != 2 ||
+        jnz->instr_bytes[0] != 0x75 || jnz->instr_bytes[1] != 0xfa)
+        return 0;
+    uint32_t iterations = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        iterations |= (uint32_t)init->instr_bytes[1U + i] << (8U * i);
+    return iterations >= 2U && iterations <= 8192U ? iterations : 0;
+}
 
 IrReplayOptions ir_replay_default_options(void) {
     IrReplayOptions options = {.module = ir_default_limits(),
@@ -402,6 +428,36 @@ static bool observe_tls(IrReplay *r, IrBlockId block, IrOrigin origin, const Ins
     return result;
 }
 
+static bool observe_xmm_after(IrReplay *r, IrBlockId block, const ReplayStep *step,
+                              const DseXmmObservation *xmm_after, unsigned xmm) {
+    IrOrigin origin = origin_of(step);
+    const uint64_t words[] = {xmm_after->low, xmm_after->high};
+    for (unsigned half = 0; half < 2; ++half) {
+        IrValueId value = ir_emit_value(r->module, block, (IrInstSpec){
+            .op = IR_OP_READ_STATE, .type = ir_type_bv(64), .state = r->state.xmm[xmm][half], .origin = origin});
+        if (!add_observation(r, (IrReplayObservation){.kind = IR_REPLAY_XMM_QWORD,
+                .origin = origin, .value = value, .width = 64, .index = 2U * xmm + half,
+                .expected_valid = true, .expected = words[half]}))
+            return false;
+    }
+    return true;
+}
+
+static void record_movq_load(IrReplay *r, const ReplayStep *step, const DseXmmObservation *xmm_after,
+                             unsigned xmm) {
+    IrReplayMovq *evidence = &r->info.movq;
+    if (!evidence->loads) {
+        evidence->first_seq = step->entry.seq_id;
+        evidence->first_pc = (uint32_t)step->entry.pc;
+        evidence->low = xmm_after->low;
+        evidence->high = xmm_after->high;
+        evidence->xmm = (uint8_t)xmm;
+        evidence->size = step->descriptor.size;
+        memcpy(evidence->bytes, step->descriptor.bytes, evidence->size);
+    }
+    ++evidence->loads;
+}
+
 
 static bool syscall_instruction(const InsnDesc *d) {
     return d->native_insn_id == X86_INS_INT || d->native_insn_id == X86_INS_SYSENTER ||
@@ -443,6 +499,19 @@ static bool kernel_write(IrReplay *r,IrX86Frontend *f,IrBlockId b,IrOrigin o,
         .mem_write_count=1,.mem_write_total=1,
         .mem_writes={{.kind=TRACE_MEM_WRITE,.address=address,.size=1,.value=observed,.value_valid=true}}};
     return observe_memory(r,o,lift,&occurrence,NULL);
+}
+
+static bool copy_in_disjoint_from_code(const ReplayInput *input, uint32_t address, uint32_t length) {
+    uint64_t end = (uint64_t)address + length;
+    uint32_t count = replay_input_count(input);
+    for (uint32_t i = 0; length && i <= count; ++i) {
+        const ReplayStep *step = i == count ? replay_input_trigger(input) : replay_input_step(input, i);
+        if (!step || step->entry.pc > UINT32_MAX ||
+            step->entry.pc + (uint64_t)step->entry.size > (UINT64_C(1) << 32) ||
+            ((uint64_t)address < step->entry.pc + step->entry.size && step->entry.pc < end))
+            return false;
+    }
+    return true;
 }
 
 static uint32_t lift_stdin_read(IrReplay *r, IrX86Frontend *f, IrBlockId b,
@@ -536,6 +605,440 @@ static uint32_t environment_failure(IrReplay *r) {
     r->info.environment_reason=ir_environment_issue(r->environment);
     return ir_environment_budget(r->environment)?IR_REPLAY_BUDGET:IR_REPLAY_SYSCALL_MODEL;
 }
+
+static uint32_t lift_set_tid_address(IrReplay *r, IrBlockId block, const ReplayStep *step,
+                                     const InsnAux *aux) {
+    const char *issue = dse_aux_set_tid_address_issue(&step->entry, aux);
+    if (issue) {
+        r->info.environment_reason = issue;
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    const DseSyscallObservation *s = aux->syscall;
+    IrReplaySetTidAddress *evidence = &r->info.set_tid_address;
+    if (evidence->count && evidence->tid != s->result) {
+        r->info.environment_reason = "set_tid_address_tid_changed";
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    if (r->environment && ir_environment_has_state(r->environment) &&
+        !ir_environment_order(r->environment, s->boundary_id, step->entry.seq_id,
+                              step->entry.vcpu_index, s->boundary_ordered))
+        return environment_failure(r);
+    if (!r->clear_child_tid) {
+        r->clear_child_tid = ir_state_add(r->module, ir_type_bv(32), IR_CLEAR_CHILD_TID_KEY, false);
+        if (!r->clear_child_tid)
+            return IR_REPLAY_BUDGET;
+    }
+    IrOrigin origin = origin_of(step);
+    IrValueId number = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = r->state.gpr[DTA_REG_RAX], .origin = origin});
+    replay_guard(r, block, origin, number, 32, s->number);
+    IrValueId address = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = r->state.gpr[DTA_REG_RBX], .origin = origin});
+    replay_guard(r, block, origin, address, 32, s->args[0]);
+    (void)ir_emit_effect(r->module, block, (IrInstSpec){
+        .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->clear_child_tid,
+        .args = {address}, .origin = origin});
+    IrValueId registered = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = r->clear_child_tid, .origin = origin});
+    if (!add_observation(r, (IrReplayObservation){.kind = IR_REPLAY_CLEAR_CHILD_TID, .origin = origin,
+            .value = registered, .width = 32, .expected_valid = true, .expected = s->args[0]}))
+        return IR_REPLAY_BUDGET;
+    IrValueId result = replay_constant(r, block, origin, 32, s->result);
+    (void)ir_emit_effect(r->module, block, (IrInstSpec){
+        .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->state.gpr[DTA_REG_RAX],
+        .args = {result}, .origin = origin});
+    if (!evidence->count) {
+        *evidence = (IrReplaySetTidAddress){.first_seq = step->entry.seq_id, .pc = (uint32_t)step->entry.pc,
+            .tid = s->result, .first_address = s->args[0]};
+    }
+    ++evidence->count;
+    evidence->last_address = s->args[0];
+    r->info.syscall_present = false;
+    r->info.stopped_syscall = (DseSyscallObservation){0};
+    return 0;
+}
+
+static void guard_syscall_args(IrReplay *r, IrBlockId block, IrOrigin origin,
+                               const DseSyscallObservation *s, unsigned argc) {
+    const unsigned regs[] = {DTA_REG_RAX, DTA_REG_RBX, DTA_REG_RCX, DTA_REG_RDX, DTA_REG_RSI};
+    const uint32_t expected[] = {s->number, s->args[0], s->args[1], s->args[2], s->args[3]};
+    for (unsigned i = 0; i <= argc; ++i) {
+        IrValueId arg = ir_emit_value(r->module, block, (IrInstSpec){
+            .op = IR_OP_READ_STATE, .type = ir_type_bv(32),
+            .state = r->state.gpr[regs[i]], .origin = origin});
+        replay_guard(r, block, origin, arg, 32, expected[i]);
+    }
+}
+
+static IrValueId observed_signal_mask(IrReplay *r, IrBlockId block, IrOrigin origin, uint64_t expected) {
+    IrType mask_type = ir_type_bv(64);
+    if (!r->signal_mask) {
+        /* Only the first in-window observation supplies a boundary value. */
+        r->signal_mask = ir_state_add(r->module, mask_type, IR_SIGNAL_MASK_KEY, false);
+        IrValueId initial = replay_constant(r, block, origin, 64, expected);
+        if (!r->signal_mask || !ir_emit_effect(r->module, block, (IrInstSpec){
+                .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->signal_mask,
+                .args = {initial}, .origin = origin}))
+            return 0;
+    }
+    IrValueId value = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = mask_type, .state = r->signal_mask, .origin = origin});
+    replay_guard(r, block, origin, value, 64, expected);
+    return value;
+}
+
+static uint32_t lift_sigprocmask(IrReplay *r, IrX86Frontend *f, IrBlockId block,
+                               const ReplayStep *step, const InsnAux *aux) {
+    const char *issue = dse_aux_sigprocmask_issue(&step->entry, aux);
+    if (issue) {
+        r->info.environment_reason = issue;
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    const DseSyscallObservation *s = aux->syscall;
+    uint32_t address = s->args[1];
+    if (!ir_x86_range_permitted(f, address, sizeof(s->sigmask_set), IR_X86_ACCESS_READ))
+        return IR_REPLAY_MEMORY_MODEL;
+    if (r->environment && ir_environment_has_state(r->environment) &&
+        !ir_environment_order(r->environment, s->boundary_id, step->entry.seq_id,
+                              step->entry.vcpu_index, s->boundary_ordered))
+        return environment_failure(r);
+
+    IrOrigin origin = origin_of(step);
+    guard_syscall_args(r, block, origin, s, 4);
+    IrValueId requested = kernel_read(r, f, block, origin, address, sizeof(s->sigmask_set),
+                                     s->sigmask_set);
+    if (!requested)
+        return IR_REPLAY_BUDGET;
+    replay_guard(r, block, origin, requested, 64, s->sigmask_set);
+    IrType mask_type = ir_type_bv(64);
+    IrValueId before = observed_signal_mask(r, block, origin, s->sigmask_before.mask);
+    if (!before)
+        return IR_REPLAY_BUDGET;
+    IrValueId retained = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_NOT, .type = mask_type, .args = {requested}, .origin = origin});
+    IrValueId after = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_AND, .type = mask_type, .args = {before, retained}, .origin = origin});
+    if (!ir_emit_effect(r->module, block, (IrInstSpec){
+            .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->signal_mask,
+            .args = {after}, .origin = origin}) ||
+        !add_observation(r, (IrReplayObservation){.kind = IR_REPLAY_SIGNAL_MASK, .origin = origin,
+            .value = after, .width = 64, .expected_valid = true, .expected = s->sigmask_after.mask}))
+        return IR_REPLAY_BUDGET;
+    IrValueId result = replay_constant(r, block, origin, 32, 0);
+    (void)ir_emit_effect(r->module, block, (IrInstSpec){
+        .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->state.gpr[DTA_REG_RAX],
+        .args = {result}, .origin = origin});
+    IrReplaySigprocmask *evidence = &r->info.sigprocmask;
+    if (!evidence->count) {
+        *evidence = (IrReplaySigprocmask){.first_seq = s->seq_id, .pc = (uint32_t)s->pc,
+            .address = address, .requested = s->sigmask_set,
+            .before = s->sigmask_before.mask, .after = s->sigmask_after.mask};
+    }
+    ++evidence->count;
+    r->info.syscall_present = false;
+    r->info.stopped_syscall = (DseSyscallObservation){0};
+    return 0;
+}
+
+static uint32_t lift_sigaction(IrReplay *r, IrX86Frontend *f, IrBlockId block,
+                              const ReplayStep *step, const InsnAux *aux) {
+    const char *issue = dse_aux_sigaction_issue(&step->entry, aux);
+    if (issue) {
+        r->info.environment_reason = issue;
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    const DseSyscallObservation *s = aux->syscall;
+    uint32_t address = s->args[1];
+    if (!ir_x86_range_permitted(f, address, sizeof(s->sigaction_input.words), IR_X86_ACCESS_READ))
+        return IR_REPLAY_MEMORY_MODEL;
+    if (r->environment && ir_environment_has_state(r->environment) &&
+        !ir_environment_order(r->environment, s->boundary_id, step->entry.seq_id,
+                              step->entry.vcpu_index, s->boundary_ordered))
+        return environment_failure(r);
+
+    IrOrigin origin = origin_of(step);
+    guard_syscall_args(r, block, origin, s, 4);
+    if (!observed_signal_mask(r, block, origin, s->sigmask_before.mask))
+        return IR_REPLAY_BUDGET;
+    IrType word_type = ir_type_bv(32);
+    for (unsigned i = 0; i < DSE_SIGACTION_WORDS; ++i) {
+        uint32_t old_word = s->sigaction_before.words[i];
+        uint32_t input_word = s->sigaction_input.words[i];
+        if (!r->sigint_action[i]) {
+            r->sigint_action[i] = ir_state_add(r->module, word_type, IR_SIGNAL_ACTION_KEY_BASE + i, false);
+            IrValueId initial = replay_constant(r, block, origin, 32, old_word);
+            if (!r->sigint_action[i] || !ir_emit_effect(r->module, block, (IrInstSpec){
+                    .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->sigint_action[i],
+                    .args = {initial}, .origin = origin}))
+                return IR_REPLAY_BUDGET;
+        }
+        IrValueId before = ir_emit_value(r->module, block, (IrInstSpec){
+            .op = IR_OP_READ_STATE, .type = word_type, .state = r->sigint_action[i], .origin = origin});
+        replay_guard(r, block, origin, before, 32, old_word);
+        IrValueId requested = kernel_read(r, f, block, origin, address + i * 4U, 4, input_word);
+        if (!requested)
+            return IR_REPLAY_BUDGET;
+        replay_guard(r, block, origin, requested, 32, input_word);
+        if (!ir_emit_effect(r->module, block, (IrInstSpec){
+                .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->sigint_action[i],
+                .args = {requested}, .origin = origin}) ||
+            !add_observation(r, (IrReplayObservation){
+                .kind = IR_REPLAY_SIGNAL_ACTION, .index = i, .origin = origin, .value = requested,
+                .width = 32, .expected_valid = true, .expected = s->sigaction_after.words[i]}))
+            return IR_REPLAY_BUDGET;
+    }
+    IrValueId result = replay_constant(r, block, origin, 32, 0);
+    (void)ir_emit_effect(r->module, block, (IrInstSpec){
+        .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->state.gpr[DTA_REG_RAX],
+        .args = {result}, .origin = origin});
+    IrReplaySigaction *evidence = &r->info.sigaction;
+    if (!evidence->count) {
+        *evidence = (IrReplaySigaction){.first_seq = s->seq_id, .pc = (uint32_t)s->pc,
+            .address = address, .signal = s->args[0], .thread_mask = s->sigmask_before.mask};
+        memcpy(evidence->before, s->sigaction_before.words, sizeof(evidence->before));
+        memcpy(evidence->after, s->sigaction_after.words, sizeof(evidence->after));
+    }
+    ++evidence->count;
+    evidence->last_handler = s->sigaction_after.words[0];
+    r->info.syscall_present = false;
+    r->info.stopped_syscall = (DseSyscallObservation){0};
+    return 0;
+}
+
+static bool tls_guard_word(IrReplay *r, IrX86Frontend *f, IrBlockId block,
+                           IrOrigin origin, uint32_t address, uint32_t expected) {
+    IrValueId value = kernel_read(r, f, block, origin, address, 4, expected);
+    if (!value)
+        return false;
+    replay_guard(r, block, origin, value, 32, expected);
+    return true;
+}
+
+static bool tls_write_word(IrReplay *r, IrX86Frontend *f, IrBlockId block,
+                           IrOrigin origin, uint32_t address, uint32_t word) {
+    for (unsigned byte = 0; byte < 4; ++byte) {
+        uint8_t value = (uint8_t)(word >> (8 * byte));
+        if (!kernel_write(r, f, block, origin, address + byte, value, value))
+            return false;
+    }
+    return true;
+}
+
+static bool mov_gs_memory_matches(const InsnOccurrence *occ, const DseGsLoadObservation *gs,
+                                  uint32_t address, bool writes_accessed) {
+    if (!occ->dynamic_effects_available ||
+        (occ->incomplete_reasons & (TRACE_OCCURRENCE_READ_OVERFLOW | TRACE_OCCURRENCE_WRITE_OVERFLOW |
+                                   TRACE_OCCURRENCE_RANGE_UNKNOWN)) ||
+        occ->mem_read_count != 2 || occ->mem_read_total != 2 ||
+        occ->mem_write_count != writes_accessed || occ->mem_write_total != writes_accessed)
+        return false;
+    for (unsigned i = 0; i < 2; ++i) {
+        const TraceMemoryEffect *event = &occ->mem_reads[i];
+        if (event->kind != TRACE_MEM_READ || event->size != 4 || event->address != address + 4U * i ||
+            (event->value_valid && event->value != gs->before[i]))
+            return false;
+    }
+    const TraceMemoryEffect *event = &occ->mem_writes[0];
+    return !writes_accessed || (event->kind == TRACE_MEM_WRITE && event->size == 4 &&
+        event->address == address + 4U && (!event->value_valid || event->value == gs->after[1]));
+}
+
+static uint32_t lift_mov_gs(IrReplay *r, IrX86Frontend *f, IrBlockId block,
+                            const ReplayStep *step, const InsnAux *aux,
+                            const ReplayStep *next, const InsnAux *after, RegId source) {
+    if (!aux || !(aux->reg_value_valid_mask & (1U << source))) {
+        r->info.environment_reason = "mov_gs_source_unobserved";
+        return IR_REPLAY_OBSERVATION_MISSING;
+    }
+    uint16_t selector = (uint16_t)aux->reg_vals[source];
+    uint32_t offset = dse_x86_tls_gdt_offset(selector);
+    if (!offset) {
+        r->info.environment_reason = "mov_gs_selector_unsupported";
+        return IR_REPLAY_UNSUPPORTED;
+    }
+    const DseGsLoadObservation *gs = &aux->gs_load;
+    if (!gs->before_valid || !gs->after_valid || !gs->gdt_base || (gs->gdt_base & 4095U) ||
+        !after || identity_issues(next, step->entry.vcpu_index) ||
+        next->entry.seq_id != step->entry.seq_id + 1U ||
+        next->entry.pc != (uint32_t)(step->entry.pc + 2U) ||
+        !(after->tls_valid_mask & (1U << DSE_TLS_GS)) ||
+        (aux->reg_value_valid_mask & after->reg_value_valid_mask & 255U) != 255U ||
+        !aux->eflags_valid || !after->eflags_valid) {
+        r->info.environment_reason = "mov_gs_boundary_unobserved";
+        return IR_REPLAY_OBSERVATION_MISSING;
+    }
+    uint32_t low = gs->before[0], high = gs->before[1];
+    const uint32_t accessed = 1U << 8;
+    /* Present, writable ring-3 data segment with 32-bit defaults and a
+     * 4 GiB effective limit, in the form emitted by set_thread_area. */
+    if ((low & 0xffffU) != 0xffffU || (high & (0x00ffff00U & ~accessed)) != 0x00dff200U) {
+        r->info.environment_reason = "mov_gs_descriptor_unsupported";
+        return IR_REPLAY_UNSUPPORTED;
+    }
+    uint32_t base = (low >> 16) | ((high & 0xffU) << 16) | (high & 0xff000000U);
+    uint32_t accessed_high = high | accessed;
+    if (after->tls_selector[DSE_TLS_GS] != selector || after->tls_base[DSE_TLS_GS] != base ||
+        gs->after[0] != low || gs->after[1] != accessed_high ||
+        after->eflags_before != aux->eflags_before) {
+        r->info.environment_reason = "mov_gs_post_state_mismatch";
+        return IR_REPLAY_OBSERVATION_SHAPE;
+    }
+    for (unsigned i = 0; i < IR_X86_GPR_COUNT; ++i)
+        if (after->reg_vals[i] != aux->reg_vals[i]) {
+            r->info.environment_reason = "mov_gs_register_changed";
+            return IR_REPLAY_OBSERVATION_SHAPE;
+        }
+    uint32_t address = gs->gdt_base + offset;
+    bool writes_accessed = high != accessed_high;
+    if (!mov_gs_memory_matches(&step->occurrence, gs, address, writes_accessed)) {
+        r->info.environment_reason = "mov_gs_gdt_accesses_unverified";
+        return IR_REPLAY_OBSERVATION_SHAPE;
+    }
+    if (!ir_x86_range_permitted(f, address, 8, IR_X86_ACCESS_READ) ||
+        (writes_accessed && !ir_x86_range_permitted(f, address + 4U, 4, IR_X86_ACCESS_WRITE)))
+        return IR_REPLAY_MEMORY_MODEL;
+    IrOrigin origin = origin_of(step);
+    IrValueId gpr = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = r->state.gpr[source], .origin = origin});
+    IrValueId low16 = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_EXTRACT, .type = ir_type_bv(16), .args = {gpr}, .origin = origin});
+    replay_guard(r, block, origin, low16, 16, selector);
+    if (!tls_guard_word(r, f, block, origin, address, low) ||
+        !tls_guard_word(r, f, block, origin, address + 4U, high) ||
+        (writes_accessed && !tls_write_word(r, f, block, origin, address + 4U, accessed_high)))
+        return IR_REPLAY_BUDGET;
+    IrValueId base_value = replay_constant(r, block, origin, 32, base);
+    (void)ir_emit_effect(r->module, block, (IrInstSpec){
+        .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->state.tls_base[DSE_TLS_GS],
+        .args = {base_value}, .origin = origin});
+    if (!observe_tls(r, block, origin, after, 1U << DSE_TLS_GS))
+        return IR_REPLAY_BUDGET;
+    IrReplayMovGs *evidence = &r->info.mov_gs;
+    if (!evidence->count) {
+        *evidence = (IrReplayMovGs){.first_seq = step->entry.seq_id, .pc = (uint32_t)step->entry.pc,
+            .selector = selector, .base = base, .address = address,
+            .gdt_high_before = high, .gdt_high_after = accessed_high};
+    }
+    ++evidence->count;
+    evidence->accessed_writes += writes_accessed;
+    return 0;
+}
+
+static uint32_t lift_set_thread_area(IrReplay *r, IrX86Frontend *f, IrBlockId block,
+                                     const ReplayStep *step, const InsnAux *aux) {
+    unsigned slot;
+    const char *issue = dse_aux_set_thread_area_issue(&step->entry, aux, &slot);
+    if (issue) {
+        r->info.environment_reason = issue;
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    const DseSyscallObservation *s = aux->syscall;
+    const DseTlsSnapshot *before = &s->tls_before, *after = &s->tls_after;
+    uint32_t address = s->args[0], gdt = before->gdt_base;
+    uint32_t table = gdt + DSE_TLS_FIRST_SLOT * 8U;
+    uint32_t slot_address = gdt + slot * 8U;
+    if (!ir_x86_range_permitted(f, address, 16, IR_X86_ACCESS_READ) ||
+        !ir_x86_range_permitted(f, address, 4, IR_X86_ACCESS_WRITE) ||
+        !ir_x86_range_permitted(f, table, DSE_TLS_SLOTS * 8U, IR_X86_ACCESS_READ) ||
+        !ir_x86_range_permitted(f, slot_address, 8, IR_X86_ACCESS_WRITE))
+        return IR_REPLAY_MEMORY_MODEL;
+    if (r->environment && ir_environment_has_state(r->environment) &&
+        !ir_environment_order(r->environment, s->boundary_id, step->entry.seq_id,
+                              step->entry.vcpu_index, s->boundary_ordered))
+        return environment_failure(r);
+    IrOrigin origin = origin_of(step);
+    const unsigned regs[] = {DTA_REG_RAX, DTA_REG_RBX};
+    const uint32_t values[] = {s->number, address};
+    for (unsigned i = 0; i < 2; ++i) {
+        IrValueId value = ir_emit_value(r->module, block, (IrInstSpec){
+            .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = r->state.gpr[regs[i]], .origin = origin});
+        replay_guard(r, block, origin, value, 32, values[i]);
+    }
+    for (unsigned i = 0; i < 4; ++i)
+        if (!tls_guard_word(r, f, block, origin, address + i * 4U, before->user_desc[i]))
+            return IR_REPLAY_BUDGET;
+    for (unsigned i = 0; i < DSE_TLS_SLOTS; ++i)
+        for (unsigned j = 0; j < 2; ++j)
+            if (!tls_guard_word(r, f, block, origin, table + i * 8U + j * 4U, before->slot[i][j]))
+                return IR_REPLAY_BUDGET;
+    const uint32_t *installed = after->slot[slot - DSE_TLS_FIRST_SLOT];
+    if (!tls_write_word(r, f, block, origin, address, slot) ||
+        !tls_write_word(r, f, block, origin, slot_address, installed[0]) ||
+        !tls_write_word(r, f, block, origin, slot_address + 4U, installed[1]))
+        return IR_REPLAY_BUDGET;
+    IrValueId result = replay_constant(r, block, origin, 32, 0);
+    (void)ir_emit_effect(r->module, block, (IrInstSpec){
+        .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->state.gpr[DTA_REG_RAX],
+        .args = {result}, .origin = origin});
+    if (!r->info.modeled_set_thread_area) {
+        r->info.first_set_thread_area_seq = step->entry.seq_id;
+        r->info.tls_syscall_pc = (uint32_t)step->entry.pc;
+        r->info.tls_desc_address = address;
+        r->info.tls_gdt_base = gdt;
+        r->info.tls_slot = slot;
+        r->info.tls_base = before->user_desc[1];
+    }
+    ++r->info.modeled_set_thread_area;
+    r->info.syscall_present = false;
+    r->info.stopped_syscall = (DseSyscallObservation){0};
+    return 0;
+}
+
+static uint32_t bind_executable_source(IrReplay *r, const DseSyscallFileObservation *src, IrOrigin origin) {
+    if (src->content_size > r->options.max_executable_bytes) {
+        r->info.environment_reason = "executable_snapshot_budget";
+        return IR_REPLAY_BUDGET;
+    }
+    if (r->executable_state) {
+        if (r->executable_size != src->content_size ||
+            (src->content_size && memcmp(r->executable_bytes, src->contents, src->content_size))) {
+            r->info.environment_reason = "executable_contents_changed";
+            return IR_REPLAY_SYSCALL_MODEL;
+        }
+        return 0;
+    }
+    r->executable_state = ir_state_add(r->module, ir_type_mem(32), IR_PROC_EXE_INPUT_KEY, false);
+    if (!r->executable_state) return IR_REPLAY_BUDGET;
+    r->executable_bytes = src->content_size ? malloc(src->content_size) : NULL;
+    if (src->content_size && !r->executable_bytes) {
+        r->allocation_failed = true;
+        return IR_REPLAY_BUDGET;
+    }
+    if (src->content_size) memcpy(r->executable_bytes, src->contents, src->content_size);
+    r->executable_size = src->content_size;
+    r->executable_origin = origin;
+    r->info.executable_snapshot_bytes = src->content_size;
+    return 0;
+}
+
+static uint32_t import_boundary_executable(IrReplay *r, IrBlockId block, IrOrigin origin,
+                                           const DseSyscallObservation *s) {
+    const DseSyscallFileObservation *src = s->file;
+    if (!dse_aux_executable_mmap_shape(s) || !src->source_observed || !src->source_valid ||
+        !src->source_identity || !src->content_valid || !src->contents ||
+        src->content_size != DSE_PROC_EXE_PAGE_BYTES ||
+        !src->open_seq || src->open_seq >= r->first_seq ||
+        !src->open_boundary || src->open_boundary >= s->boundary_id) {
+        r->info.environment_reason = "executable_boundary_unverified";
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    if (r->executable_identity && r->executable_identity != src->source_identity) {
+        r->info.environment_reason = "executable_identity_changed";
+        return IR_REPLAY_SYSCALL_MODEL;
+    }
+    uint32_t issue = bind_executable_source(r, src, origin);
+    if (issue) return issue;
+    r->executable_identity = src->source_identity;
+    IrValueId source = ir_emit_value(r->module, block, (IrInstSpec){.op=IR_OP_READ_STATE,
+        .type=ir_type_mem(32),.state=r->executable_state,.origin=origin});
+    /* This file view contains exactly one verified page. Requests extending
+     * beyond it are outside the model even if the executable is larger. */
+    if (!ir_environment_file_open(r->environment, block, origin, s->args[4], 0,
+                                  src->open_boundary, src->content_size, source))
+        return environment_failure(r);
+    return 0;
+}
+
 static uint32_t lift_file_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
                                   const ReplayStep *step,const InsnAux *aux) {
     const DseSyscallObservation *s=aux->syscall;
@@ -573,6 +1076,12 @@ static uint32_t lift_file_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
         ok=ir_environment_resize(r->environment,b,o,s->args[0],s->args[1]);
     } else if(map) {
         const uint32_t *a=mapped;
+        bool import_executable = r->options.observed_proc_exe_boundary && s->number == 192 &&
+                                 s->file && !ir_environment_file_present(r->environment, a[4]);
+        if (import_executable) {
+            uint32_t failed = import_boundary_executable(r, b, o, s);
+            if (failed) return failed;
+        }
         uint64_t end=(uint64_t)s->result+(((uint64_t)a[1]+4095U)&~UINT64_C(4095));
         for(unsigned i=0;s->number==90 && i<6;++i) {
             IrValueId value=kernel_read(r,f,b,o,s->args[0]+i*4U,4,a[i]);
@@ -583,6 +1092,11 @@ static uint32_t lift_file_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
         if(ok) {
             IrStatus status=ir_x86_map_memory(f,s->result,end,a[2]);
             if(status!=IR_OK) return status==IR_RESOURCE_LIMIT?IR_REPLAY_BUDGET:IR_REPLAY_MEMORY_MODEL;
+            if (import_executable) {
+                r->info.boundary_executable_open_seq = s->file->open_seq;
+                r->info.boundary_executable_mmap_seq = s->seq_id;
+                r->info.boundary_executable_fd = a[4];
+            }
         }
     } else if(writing) {
         if(!ir_environment_write_check(r->environment,s->args[0],s->args[1],s->result))
@@ -646,23 +1160,8 @@ static uint32_t lift_proc_exe_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
         replay_guard(r,b,o,value,8,src->path[i]);
     }
     if(opening) {
-        if(src->content_size>r->options.max_executable_bytes) {
-            r->info.environment_reason="executable_snapshot_budget";return IR_REPLAY_BUDGET;
-        }
-        if(r->executable_state) {
-            if(r->executable_size!=src->content_size ||
-                (src->content_size && memcmp(r->executable_bytes,src->contents,src->content_size))) {
-                r->info.environment_reason="executable_contents_changed";return IR_REPLAY_SYSCALL_MODEL;
-            }
-        } else {
-            r->executable_state=ir_state_add(r->module,ir_type_mem(32),IR_PROC_EXE_INPUT_KEY,false);
-            if(!r->executable_state) return IR_REPLAY_BUDGET;
-            r->executable_bytes=src->content_size?malloc(src->content_size):NULL;
-            if(src->content_size && !r->executable_bytes) {r->allocation_failed=true;return IR_REPLAY_BUDGET;}
-            if(src->content_size) memcpy(r->executable_bytes,src->contents,src->content_size);
-            r->executable_size=src->content_size;r->executable_origin=o;
-            r->info.executable_snapshot_bytes=src->content_size;
-        }
+        uint32_t failed = bind_executable_source(r, src, o);
+        if (failed) return failed;
         IrValueId source=ir_emit_value(r->module,b,(IrInstSpec){.op=IR_OP_READ_STATE,
             .type=ir_type_mem(32),.state=r->executable_state,.origin=o});
         if(!ir_environment_file_open(r->environment,b,o,s->result,s->args[1],src->source_identity,
@@ -679,10 +1178,76 @@ static uint32_t lift_proc_exe_syscall(IrReplay *r,IrX86Frontend *f,IrBlockId b,
     return 0;
 }
 
+static uint32_t lift_stdio(IrReplay *r, IrX86Frontend *f, IrBlockId block, const ReplayInput *input,
+                           const ReplayStep *step, const InsnAux *aux) {
+    const char *issue = dse_aux_stdio_issue(&step->entry, aux);
+    if (issue) {
+        r->info.environment_reason = issue;
+        return IR_REPLAY_SYSCALL_OBSERVATION;
+    }
+    const DseSyscallObservation *s = aux->syscall;
+    const DseStdioObservation *io = &s->stdio;
+    IrReplayStdio *evidence = &r->info.stdio;
+    bool reading = s->number == 3;
+    if (reading && (ir_environment_file_present(r->environment, s->args[0]) ||
+                    (evidence->read_count && (io->device != r->stdin_device ||
+                     io->inode != r->stdin_inode || io->file_size != r->stdin_file_size ||
+                     io->offset != r->stdin_next_offset)))) {
+        r->info.environment_reason = "stdin_descriptor_or_offset_changed";
+        return IR_REPLAY_SYSCALL_MODEL;
+    }
+    if (!reading && evidence->close_seq) {
+        r->info.environment_reason = "stdout_already_closed";
+        return IR_REPLAY_SYSCALL_MODEL;
+    }
+    uint32_t address = s->args[1];
+    if (reading && io->length &&
+        (!ir_x86_range_permitted(f, address, io->length, IR_X86_ACCESS_WRITE) ||
+         !copy_in_disjoint_from_code(input, address, io->length))) {
+        r->info.environment_reason = "stdin_copy_in_unverified";
+        return IR_REPLAY_MEMORY_MODEL;
+    }
+    if (r->environment && ir_environment_has_state(r->environment) &&
+        !ir_environment_order(r->environment, s->boundary_id, s->seq_id, s->vcpu_index, s->boundary_ordered))
+        return environment_failure(r);
+
+    IrOrigin origin = origin_of(step);
+    guard_syscall_args(r, block, origin, s, reading ? 3 : 1);
+    if (reading) {
+        for (uint32_t i = 0; i < io->length; ++i)
+            if (!kernel_write(r, f, block, origin, address + i, io->bytes[i], io->bytes[i]))
+                return IR_REPLAY_BUDGET;
+        if (!evidence->read_count) {
+            r->stdin_device = io->device;
+            r->stdin_inode = io->inode;
+            r->stdin_file_size = io->file_size;
+            evidence->read_seq = s->seq_id;
+            evidence->read_pc = (uint32_t)s->pc;
+            evidence->read_address = address;
+            evidence->read_requested = s->args[2];
+            evidence->read_returned = s->result;
+        }
+        r->stdin_next_offset = io->offset + io->length;
+        ++evidence->read_count;
+        evidence->read_bytes += io->length;
+    } else {
+        evidence->close_seq = s->seq_id;
+        evidence->close_pc = (uint32_t)s->pc;
+    }
+    IrValueId result = replay_constant(r, block, origin, 32, s->result);
+    if (!ir_emit_effect(r->module, block, (IrInstSpec){
+            .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = r->state.gpr[DTA_REG_RAX],
+            .args = {result}, .origin = origin}))
+        return IR_REPLAY_BUDGET;
+    r->info.syscall_present = false;
+    r->info.stopped_syscall = (DseSyscallObservation){0};
+    return 0;
+}
+
 /* A syscall observation is an environment contract, never a substitute for
  * instruction semantics. No generic "clobber EAX and continue" fallback. */
-static uint32_t lift_syscall(IrReplay *r, IrX86Frontend *f, IrBlockId block, const ReplayStep *step,
-                             const InsnAux *aux) {
+static uint32_t lift_syscall(IrReplay *r, IrX86Frontend *f, IrBlockId block, const ReplayInput *input,
+                             const ReplayStep *step, const InsnAux *aux) {
     const DseSyscallObservation *e = aux ? aux->syscall : NULL;
     const TraceEntry *t = &step->entry;
     if (e) {
@@ -698,6 +1263,17 @@ static uint32_t lift_syscall(IrReplay *r, IrX86Frontend *f, IrBlockId block, con
         e->pc != t->pc || e->vcpu_index != t->vcpu_index || e->descriptor_id != t->insn_desc_id ||
         e->bytes_hash != t->bytes_hash || e->code_generation != t->code_generation)
         return IR_REPLAY_SYSCALL_OBSERVATION;
+    if (e->number == 243 && r->options.observed_set_thread_area)
+        return lift_set_thread_area(r, f, block, step, aux);
+    if (e->number == 258 && r->options.observed_set_tid_address)
+        return lift_set_tid_address(r, block, step, aux);
+    if (e->number == 175 && r->options.observed_sigprocmask)
+        return lift_sigprocmask(r, f, block, step, aux);
+    if (e->number == 174 && r->options.observed_sigaction)
+        return lift_sigaction(r, f, block, step, aux);
+    if (r->options.observed_stdio && ((e->number == 3 && e->args[0] == 0) ||
+        (e->number == 6 && e->args[0] == 1 && !ir_environment_file_present(r->environment, e->args[0]))))
+        return lift_stdio(r, f, block, input, step, aux);
     if (r->stdin_state && e->number == 3 && r->options.x86.flat32_ram &&
         step->descriptor.size == 2 && step->descriptor.bytes[0] == 0xcd &&
         step->descriptor.bytes[1] == 0x80)
@@ -1037,6 +1613,58 @@ static void flag_definedness(IrReplay *r, IrBlockId b, IrOrigin origin, IrX86Lif
     ir_module_build_phase(r->module, previous);
 }
 
+static bool lift_counted_loop(IrReplay *r, IrX86Frontend *frontend, IrBlockId block,
+                              const ReplayInput *input, uint32_t index) {
+    const IrReplayCountedLoop *loop = &r->options.counted_loop;
+    const ReplayStep *init = index ? replay_input_step(input, index - 1U) : NULL;
+    const ReplayStep *add = replay_input_step(input, index);
+    const ReplayStep *dec = replay_input_step(input, index + 1U);
+    const ReplayStep *jnz = replay_input_step(input, index + 2U);
+    if (!init || !dec || !jnz || !loop->iterations ||
+        init->entry.seq_id + 1U != loop->head_seq ||
+        dec->entry.seq_id != add->entry.seq_id + 1U || jnz->entry.seq_id != add->entry.seq_id + 2U ||
+        identity_issues(dec, add->entry.vcpu_index) || identity_issues(jnz, add->entry.vcpu_index) ||
+        ir_replay_counted_loop_iterations(&init->entry, &add->entry, &dec->entry, &jnz->entry)
+            != loop->iterations ||
+        loop->resume_seq - loop->head_seq != 3U * (loop->iterations - 1U))
+        return false;
+
+    IrOrigin origin = origin_of(add);
+    IrStateId counter = r->state.gpr[DTA_REG_RCX];
+    IrStateId accumulator = r->state.gpr[add->entry.instr_bytes[1] & 7U];
+    IrValueId initial_count = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = counter, .origin = origin});
+    replay_guard(r, block, origin, initial_count, 32, loop->iterations);
+    IrValueId initial_acc = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_READ_STATE, .type = ir_type_bv(32), .state = accumulator, .origin = origin});
+    /* Calculate the inputs to the last omitted iteration, then lift its ADD
+     * and DEC normally. This also reconstructs their EFLAGS before the final
+     * retained iteration, including CF preserved by DEC. */
+    uint32_t addend = (uint32_t)(int8_t)add->entry.instr_bytes[2];
+    IrValueId delta = replay_constant(r, block, origin, 32, addend * (loop->iterations - 2U));
+    IrValueId sum = ir_emit_value(r->module, block, (IrInstSpec){
+        .op = IR_OP_ADD, .type = ir_type_bv(32), .args = {initial_acc, delta}, .origin = origin});
+    IrValueId two = replay_constant(r, block, origin, 32, 2);
+    if (!ir_emit_effect(r->module, block, (IrInstSpec){
+            .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = accumulator,
+            .args = {sum}, .origin = origin}) ||
+        !ir_emit_effect(r->module, block, (IrInstSpec){
+            .op = IR_OP_WRITE_STATE, .type = ir_type_void(), .state = counter,
+            .args = {two}, .origin = origin}))
+        return false;
+    IrX86LiftResult previous_add = ir_x86_lift(frontend, block, &add->descriptor, origin);
+    if (previous_add.status != IR_X86_LIFT_OK || previous_add.control != IR_X86_FALLTHROUGH ||
+        previous_add.memory_count)
+        return false;
+    flag_definedness(r, block, origin, previous_add);
+    IrX86LiftResult previous_dec = ir_x86_lift(frontend, block, &dec->descriptor, origin_of(dec));
+    if (previous_dec.status != IR_X86_LIFT_OK || previous_dec.control != IR_X86_FALLTHROUGH ||
+        previous_dec.memory_count)
+        return false;
+    flag_definedness(r, block, origin_of(dec), previous_dec);
+    return ir_module_status(r->module) == IR_OK;
+}
+
 
 /* Stateful IR values are local to a block until trace SSA. Carry conditional
  * definedness as internal BV1 state, assigned before its first read. These are
@@ -1248,6 +1876,10 @@ static bool stdin_source_shape(const ReplayInput *input, const IrReplayOptions *
     *prefix = 0;
     if (!source) return true;
     if (!options->x86.flat32_ram || options->observed_files || options->observed_proc_exe ||
+        options->observed_proc_exe_boundary || options->observed_memfd_boundary ||
+        options->observed_set_thread_area || options->observed_mov_gs || options->observed_set_tid_address ||
+        options->observed_sigprocmask || options->observed_sigaction || options->observed_stdio ||
+        options->x86.movq_xmm_memory || options->x86.sse2_dwords || options->x86.lock_or32 ||
         options->observed_munmap || options->observed_mprotect || !source->bytes ||
         !source->size || source->size > IR_REPLAY_STDIN_MAX_FILE || !source->reads ||
         !source->count || source->count > IR_REPLAY_STDIN_MAX_READS ||
@@ -1270,17 +1902,51 @@ static bool stdin_source_shape(const ReplayInput *input, const IrReplayOptions *
          * model refuses copy-in over any executed instruction rather than
          * treating a changed future instruction as the old captured code.
          * Include the trigger boundary and full byte intervals, not only PCs. */
-        uint64_t end = (uint64_t)read->address+read->returned;
-        for (uint32_t j = 0; read->returned && j <= replay_input_count(input); ++j) {
-            const ReplayStep *step = j == replay_input_count(input)
-                ? replay_input_trigger(input) : replay_input_step(input, j);
-            if (!step || step->entry.pc > UINT32_MAX ||
-                step->entry.pc+(uint64_t)step->entry.size > (UINT64_C(1)<<32)) return false;
-            if ((uint64_t)read->address < step->entry.pc+step->entry.size &&
-                step->entry.pc < end) return false;
-        }
+        if (!copy_in_disjoint_from_code(input, read->address, read->returned)) return false;
     }
     return true;
+}
+
+static const DseMemfdBoundary *find_boundary_memfd(const ReplayInput *input, const ReplayStep *first) {
+    for (uint32_t i = 0; i < replay_input_count(input); ++i) {
+        const ReplayStep *step = replay_input_step(input, i);
+        if (identity_issues(step, first->entry.vcpu_index) || !step->occurrence.execution_complete)
+            return NULL;
+        if (!syscall_instruction(&step->descriptor)) continue;
+        /* The write must be the first syscall in the window. Its certificate
+         * proves a single still-live shared mapping with no earlier stores. */
+        const InsnAux *aux = saved_aux(input, step);
+        if (!aux || !aux->syscall || aux->syscall->number != 4) return NULL;
+        const DseSyscallObservation *s = aux->syscall;
+        const DseMemfdBoundary *seed = &s->memfd_boundary;
+        if (!seed->verified || !seed->create_seq || seed->create_seq >= seed->resize_seq ||
+            seed->resize_seq >= seed->mmap_seq || seed->mmap_seq >= first->entry.seq_id ||
+            seed->write_seq != step->entry.seq_id || s->boundary_id != DSE_MEMFD_BOUNDARY_WRITE_ORDINAL ||
+            seed->fd != s->args[0] || seed->fd < 3 || seed->fd >= 64 ||
+            (seed->flags != 16 && seed->flags != 17) || !seed->size ||
+            seed->size > DSE_MEMFD_BOUNDARY_PAGE_BYTES || seed->size != s->args[2] ||
+            seed->size != s->result || !seed->address ||
+            (seed->address & (DSE_MEMFD_BOUNDARY_PAGE_BYTES - 1U)) ||
+            dse_aux_write_issue(&step->entry, aux)) return NULL;
+        return seed;
+    }
+    return NULL;
+}
+
+static uint32_t bind_boundary_memfd(IrReplay *r, IrX86Frontend *frontend, IrBlockId block,
+                                    const ReplayStep *first, const DseMemfdBoundary *seed) {
+    IrOrigin origin = origin_of(first);
+    if (!ir_environment_order(r->environment, DSE_MEMFD_BOUNDARY_WRITE_ORDINAL - 1U,
+                               seed->mmap_seq, first->entry.vcpu_index, true) ||
+        !ir_environment_file_create(r->environment, block, origin, seed->fd, seed->flags, 1) ||
+        !ir_environment_resize(r->environment, block, origin, seed->fd, seed->size) ||
+        !ir_environment_map(r->environment, block, origin, seed->fd, seed->address, seed->size, 0, 1, 3))
+        return environment_failure(r);
+    IrStatus status = ir_x86_map_memory(frontend, seed->address,
+                                       (uint64_t)seed->address + DSE_MEMFD_BOUNDARY_PAGE_BYTES, 3);
+    if (status != IR_OK) return status == IR_RESOURCE_LIMIT ? IR_REPLAY_BUDGET : IR_REPLAY_MEMORY_MODEL;
+    r->info.boundary_memfd = *seed;
+    return 0;
 }
 
 IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *options,
@@ -1295,6 +1961,16 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
         return NULL;
     /* Explicit upper bounds also keep growth arithmetic valid on 32-bit hosts. */
     if (opts.observed_proc_exe && (!opts.observed_files || !opts.x86.flat32_ram)) return NULL;
+    if (opts.observed_proc_exe_boundary &&
+        (!opts.observed_files || !opts.x86.flat32_ram || opts.observed_proc_exe)) return NULL;
+    if (opts.observed_memfd_boundary && (!opts.observed_files || !opts.x86.flat32_ram)) return NULL;
+    if ((opts.observed_set_thread_area || opts.observed_mov_gs) &&
+        (!opts.x86.tls32_ram || !opts.x86.flat32_ram)) return NULL;
+    if ((opts.observed_set_tid_address || opts.observed_sigprocmask || opts.observed_sigaction ||
+         opts.observed_stdio) &&
+        !opts.x86.flat32_ram) return NULL;
+    if ((opts.x86.movq_xmm_memory || opts.x86.sse2_dwords || opts.x86.lock_or32) &&
+        !opts.x86.flat32_ram) return NULL;
     if (opts.max_executable_bytes>DSE_EXECUTABLE_SNAPSHOT_BYTES) return NULL;
     uint32_t stdin_prefix = 0;
     if (!stdin_source_shape(input, &opts, &stdin_prefix)) return NULL;
@@ -1354,6 +2030,7 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
     uint32_t vcpu = trigger->entry.vcpu_index;
     uint32_t issues = identity_issues(trigger, vcpu);
     const ReplayStep *first = r->info.selected_steps ? replay_input_step(input, 0) : trigger;
+    r->first_seq = first->entry.seq_id;
     issues |= identity_issues(first, vcpu);
     for (unsigned i = 0; i < IR_X86_GPR_COUNT; ++i)
         r->initial_gpr[i] = ir_bits_unknown(IR_REASON_UNBOUND_STATE);
@@ -1364,6 +2041,13 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
     if (issues) {
         stop(r, block, issues, origin_of(first));
         goto complete;
+    }
+    if (opts.observed_memfd_boundary) {
+        const DseMemfdBoundary *seed = find_boundary_memfd(input, first);
+        if (seed && (issues = bind_boundary_memfd(r, frontend, block, first, seed))) {
+            stop(r, block, issues, origin_of(first));
+            goto complete;
+        }
     }
     if (opts.capture_target) {
         IrX86LiftResult target =
@@ -1384,6 +2068,7 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
                 r->initial_flags[i] =
                     ir_bits_known((initial->eflags_before >> flag_bit[i]) & 1U, 1);
     }
+    uint8_t xmm_initialized = 0;
     for (uint32_t i = 0; i < r->info.selected_steps; ++i) {
         const ReplayStep *step = replay_input_step(input, i);
         IrOrigin origin = origin_of(step);
@@ -1413,6 +2098,13 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
         }
         if(r->environment && !ir_environment_fetch(r->environment,block,origin,
                 (uint32_t)step->entry.pc,step->descriptor.bytes,step->descriptor.size)) goto fatal;
+        if (step->entry.seq_id == opts.counted_loop.resume_seq &&
+            !lift_counted_loop(r, frontend, block, input, i)) {
+            if (ir_module_status(r->module) != IR_OK)
+                goto fatal;
+            stop(r, block, IR_REPLAY_GAP, origin);
+            goto complete;
+        }
         if (!checkpoint(r, block, origin, aux)) {
             if (r->allocation_failed || ir_module_status(r->module) != IR_OK)
                 goto fatal;
@@ -1420,10 +2112,60 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             goto complete;
         }
         ir_module_build_phase(r->module, IR_BUILD_X86);
+        const ReplayStep *next =
+            i + 1U < r->info.selected_steps ? replay_input_step(input, i + 1U) : trigger;
+        const InsnOccurrence *occ = &step->occurrence;
+        const InsnAux *lock_after = NULL;
+        if (opts.x86.lock_or32 && ir_x86_is_lock_or32(&step->descriptor)) {
+            /* The serialized collector must observe both halves of the RMW.
+             * The next instruction's checkpoint compares the defined flags. */
+            lock_after = saved_aux(input, next);
+            const TraceMemoryEffect *read = &occ->mem_reads[0], *write = &occ->mem_writes[0];
+            if (!lock_after || !lock_after->eflags_valid || !occ->mem_read_count ||
+                !occ->mem_write_count || !read->value_valid || !write->value_valid) {
+                r->info.environment_reason = "lock_or32_rmw_unobserved";
+                stop(r, block, IR_REPLAY_OBSERVATION_MISSING, origin);
+                goto complete;
+            }
+            if (read->address != write->address || (read->address & 3U)) {
+                r->info.environment_reason = "lock_or32_rmw_shape";
+                stop(r, block, IR_REPLAY_OBSERVATION_SHAPE, origin);
+                goto complete;
+            }
+        }
+        RegId gs_source = opts.observed_mov_gs ? dse_x86_mov_gs_source(&step->entry) : REG_INVALID;
+        unsigned xmm = 0;
+        IrX86MovqForm movq = opts.x86.movq_xmm_memory
+            ? ir_x86_movq_memory(step->descriptor.bytes, step->descriptor.size, &xmm) : IR_X86_MOVQ_NONE;
+        IrX86Sse2DwordForm dword = opts.x86.sse2_dwords
+            ? ir_x86_sse2_dword_form(step->descriptor.bytes, step->descriptor.size, &xmm)
+            : IR_X86_SSE2_DWORD_NONE;
+        if (movq == IR_X86_MOVQ_STORE && !(xmm_initialized & (1U << xmm))) {
+            r->info.environment_reason = "movq_xmm_source_before_window";
+            stop(r, block, IR_REPLAY_OBSERVATION_MISSING, origin);
+            goto complete;
+        }
+        if (dword == IR_X86_SSE2_PUNPCKLDQ) {
+            unsigned source = step->descriptor.bytes[3] & 7U;
+            unsigned required = (1U << xmm) | (1U << source);
+            if ((xmm_initialized & required) != required) {
+                r->info.environment_reason = "punpckldq_xmm_source_before_window";
+                stop(r, block, IR_REPLAY_OBSERVATION_MISSING, origin);
+                goto complete;
+            }
+        }
+        bool xmm_write = movq == IR_X86_MOVQ_LOAD || dword != IR_X86_SSE2_DWORD_NONE;
+        if (xmm_write &&
+            (!aux || !aux->xmm_after.valid || aux->xmm_after.slot != xmm + 1U)) {
+            r->info.environment_reason = movq == IR_X86_MOVQ_LOAD ? "movq_xmm_result_unobserved"
+                                                                  : "sse2_dword_result_unobserved";
+            stop(r, block, IR_REPLAY_OBSERVATION_MISSING, origin);
+            goto complete;
+        }
         IrX86LiftResult lift;
         if (syscall_instruction(&step->descriptor)) {
             ir_module_build_phase(r->module, IR_BUILD_ENVIRONMENT);
-            issues = lift_syscall(r, frontend, block, step, aux);
+            issues = lift_syscall(r, frontend, block, input, step, aux);
             if (issues) {
                 stop(r, block, issues, origin);
                 goto complete;
@@ -1431,6 +2173,13 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             lift = (IrX86LiftResult){
                 .status = ir_module_status(r->module) == IR_OK ? IR_X86_LIFT_OK : IR_X86_LIFT_ERROR,
                 .target_gpr = -1};
+        } else if (gs_source != REG_INVALID) {
+            issues = lift_mov_gs(r, frontend, block, step, aux, next, saved_aux(input, next), gs_source);
+            if (issues) {
+                stop(r, block, issues, origin);
+                goto complete;
+            }
+            lift = (IrX86LiftResult){.status = IR_X86_LIFT_OK, .target_gpr = -1};
         } else
             lift = ir_x86_lift(frontend, block, &step->descriptor, origin);
         bool repeated = lift.status == IR_X86_LIFT_REPEAT;
@@ -1463,7 +2212,8 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
         }
         ++r->info.lifted_steps;
         flag_definedness(r, block, origin, lift);
-        issues = repeated ? 0 : memory_shape(lift, &step->occurrence);
+        /* The verified MOV GS helper accounts for its implicit GDT accesses. */
+        issues = repeated || gs_source != REG_INVALID ? 0 : memory_shape(lift, &step->occurrence);
         if (issues) {
             stop(r, block, issues, origin);
             goto complete;
@@ -1474,16 +2224,42 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             stop(r, block, IR_REPLAY_BUDGET, origin);
             goto complete;
         }
+        if (xmm_write) {
+            if (!observe_xmm_after(r, block, step, &aux->xmm_after, xmm)) {
+                if (r->allocation_failed || ir_module_status(r->module) != IR_OK)
+                    goto fatal;
+                stop(r, block, IR_REPLAY_BUDGET, origin);
+                goto complete;
+            }
+            xmm_initialized |= (uint8_t)(1U << xmm);
+            if (movq == IR_X86_MOVQ_LOAD) {
+                record_movq_load(r, step, &aux->xmm_after, xmm);
+            } else {
+                IrReplaySse2Dwords *evidence = &r->info.sse2_dwords;
+                if (!evidence->first_seq) {
+                    evidence->first_seq = step->entry.seq_id;
+                    evidence->first_pc = (uint32_t)step->entry.pc;
+                }
+                if (dword == IR_X86_SSE2_MOVD)
+                    ++evidence->movd_count;
+                else
+                    ++evidence->punpckldq_count;
+            }
+        } else if (movq == IR_X86_MOVQ_STORE) {
+            ++r->info.movq.stores;
+        }
         ir_module_build_phase(r->module, IR_BUILD_CONTROL);
-        const ReplayStep *next =
-            i + 1U < r->info.selected_steps ? replay_input_step(input, i + 1U) : trigger;
         issues = identity_issues(next, vcpu);
         if (issues) {
             stop(r, block, issues, origin_of(next));
             goto complete;
         }
         uint64_t fallthrough = (uint32_t)(step->entry.pc + step->entry.size);
-        if (step->entry.seq_id == UINT64_MAX || next->entry.seq_id != step->entry.seq_id + 1U) {
+        bool counted_loop_edge = opts.counted_loop.head_seq &&
+            step->entry.seq_id + 1U == opts.counted_loop.head_seq &&
+            next->entry.seq_id == opts.counted_loop.resume_seq && next != trigger;
+        if (step->entry.seq_id == UINT64_MAX ||
+            (next->entry.seq_id != step->entry.seq_id + 1U && !counted_loop_edge)) {
             stop(r, block, IR_REPLAY_GAP, origin_of(next));
             goto complete;
         }
@@ -1491,7 +2267,6 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             stop(r, block, IR_REPLAY_GAP, origin);
             goto complete;
         }
-        const InsnOccurrence *occ = &step->occurrence;
         uint64_t successor = fallthrough;
         bool taken = false;
         if (occ->incomplete_reasons & TRACE_OCCURRENCE_BRANCH_MISMATCH) {
@@ -1535,6 +2310,27 @@ IrReplay *ir_replay_x86_build(const ReplayInput *input, const IrReplayOptions *o
             (aux && aux->next_pc_valid && aux->next_pc != occ->next_pc)) {
             stop(r, block, IR_REPLAY_CONTROL_MISMATCH, origin);
             goto complete;
+        }
+        if (lock_after) {
+            IrReplayLockOr32 *lock = &r->info.lock_or32;
+            if (!lock->count) {
+                lock->first_seq = step->entry.seq_id;
+                lock->pc = (uint32_t)step->entry.pc;
+                lock->address = (uint32_t)occ->mem_reads[0].address;
+                lock->before = (uint32_t)occ->mem_reads[0].value;
+                lock->after = (uint32_t)occ->mem_writes[0].value;
+                lock->eflags_after = lock_after->eflags_before;
+                lock->size = step->descriptor.size;
+                memcpy(lock->bytes, step->descriptor.bytes, lock->size);
+            }
+            ++lock->count;
+            if (step->descriptor.bytes[1] == 0x83) {
+                if (!lock->immediate_count) {
+                    lock->first_immediate_seq = step->entry.seq_id;
+                    lock->first_immediate_pc = (uint32_t)step->entry.pc;
+                }
+                ++lock->immediate_count;
+            }
         }
         if (lift.control != IR_X86_FALLTHROUGH) {
             if (lift.control == IR_X86_CONDITIONAL &&

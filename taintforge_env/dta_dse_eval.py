@@ -116,7 +116,8 @@ def _write_csv(path, rows):
 
 def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, argv=(), out,
                   max_candidates=24, max_jobs=8, max_occurrences=4, max_steps=1024,
-                  max_sites=4096, seconds=30, memory_mib=1024, wall_seconds=3600):
+                  max_sites=4096, seconds=30, memory_mib=1024, wall_seconds=3600,
+                  queue_batch_size=None):
     """Run a fresh bounded experiment; a nonproof measurement is a valid result.
 
     ``wall_seconds`` is checked between operations, never used as evidence that
@@ -127,6 +128,9 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
              'Evaluate one to four initial seed files')
     _limit(max_candidates, 128, 'DTA candidates')
     _limit(max_jobs, 128, 'evaluation DSE starts')
+    if queue_batch_size is None:
+        queue_batch_size = max_jobs
+    _limit(queue_batch_size, 128, 'DSE queue batch size')
     _limit(wall_seconds, 172800, 'soft evaluation wall time')
     limits = dta_dse_queue._limits(max_total_starts=max_jobs, max_queue_jobs=4096,
         max_occurrences=max_occurrences, max_steps=max_steps, max_sites=max_sites,
@@ -159,7 +163,7 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
         'measurement_completed': False, 'inputs': [identity for _, identity, _ in sources],
         'input_path': input_path, 'argv': argv, 'budgets': dict(limits, soft_wall_seconds=wall_seconds),
         'analyses': [], 'jobs': [], 'candidate_replays': [], 'timings': {},
-        'queue': str(out / 'queue')}
+        'queue': str(out / 'queue'), 'queue_batch_size': queue_batch_size, 'queue_invocations': 0}
 
     def intact():
         for path, identity, maximum in sources:
@@ -168,12 +172,14 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
     def remaining():
         return int(deadline - time.monotonic())
 
-    def analyze(seed, directory, candidates):
+    def analyze(seed, directory, candidates, *, expected_seed_sha256=None):
         budget = remaining()
         _require(budget >= 1, 'Evaluation soft wall budget exhausted before a required full replay')
         intact()
         t0 = time.monotonic()
         seed_identity = _pin(seed, 4096)[1]
+        _require(expected_seed_sha256 is None or seed_identity['sha256'] == expected_seed_sha256,
+                 'Replay seed differs from the audited candidate')
         result = dta_analysis.analyze_file(binary=binary, qemu=qemu, plugin=plugin, seed=seed,
             input_path=input_path, argv=argv, out=directory, max_candidates=candidates,
             seconds=seconds, memory_mib=memory_mib, wall_seconds=min(7200, budget))
@@ -209,29 +215,37 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
             analyses=[Path(row['directory']) for row in report['analyses']])
         atomic_json(out / 'admission.json', admitted)
         durations = {}
-        for index in range(max_jobs):
-            if remaining() < 1:
-                break
-            snapshot = dta_dse_queue.queue_status(queue=queue)
-            if snapshot['counts']['PENDING'] == 0 or snapshot['counts']['BLOCKED_RECOVERY']:
-                break
-            before = _json(queue / 'state.json')
-            pending = next(identifier for identifier in before['order'] if before['jobs'][identifier]['status'] == 'PENDING')
-            print(f'dta-dse-eval: DSE job {index + 1}/{max_jobs} {pending[:12]}', flush=True)
-            t0 = time.monotonic()
-            result = dta_dse_queue.run_queue(queue=queue, max_jobs=1, wall_seconds=max(1, remaining()))
-            duration = time.monotonic() - t0
-            if result['started_this_run'] == 0:
-                break
-            durations[pending] = duration
+        queue_wall_seconds = 0.0
+
+        def record_job(identifier, duration):
+            durations[identifier] = duration
             atomic_json(out / 'job-timings.json', durations)
-            if result['status'] in ('QUEUE_BLOCKED', 'QUEUE_STOPPED'):
+            print(f'dta-dse-eval: DSE job {len(durations)}/{max_jobs} {identifier[:12]} completed',
+                  flush=True)
+
+        jobs_left = max_jobs
+        exit_audit = None
+        while jobs_left:
+            snapshot = dta_dse_queue.queue_status(queue=queue)
+            if snapshot['counts']['PENDING'] == 0 or snapshot['status'] in ('QUEUE_BLOCKED', 'QUEUE_STOPPED'):
                 break
-        audited = dta_dse_queue.audit_queue(queue=queue)
+            budget = remaining()
+            if budget < 1:
+                break
+            t0 = time.monotonic()
+            report['queue_invocations'] += 1
+            result, exit_audit = dta_dse_queue._run_queue(queue=queue, max_jobs=min(queue_batch_size, jobs_left),
+                wall_seconds=budget, on_job_complete=record_job, include_exit_audit=True)
+            queue_wall_seconds += time.monotonic() - t0
+            jobs_left -= result['started_this_run']
+            if result['started_this_run'] == 0 or result['status'] in ('QUEUE_BLOCKED', 'QUEUE_STOPPED'):
+                break
+        if exit_audit is None:
+            exit_audit = dta_dse_queue._audit_queue(queue=queue, include_attempts=True)
+        audited, state, attempt_details = exit_audit
         _require(audited['evidence_audited'] is True and audited['counts']['BLOCKED_RECOVERY'] == 0,
                  'Queue ended with incomplete worker or cleanup evidence')
         atomic_json(out / 'queue-audit.json', audited)
-        state = _json(queue / 'state.json')
         candidates = {}
         for identifier in state['order']:
             item = state['jobs'][identifier]
@@ -244,39 +258,34 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
                 continue
             directory = _inside(item['attempts'][0]['directory'], queue)
             source = Path(state['analyses'][item['analysis_id']]['path'])
-            checked = dta_dse.audit_selected_corpus(directory=directory, analysis=source,
-                qemu=qemu, plugin=plugin, flags_receipt=flags_receipt,
-                request_id=item['request_id'], max_occurrences=max_occurrences, max_steps=max_steps,
-                max_sites=max_sites, seconds=seconds, memory_mib=memory_mib)
-            request = checked['request']
+            request, controller, seed_hashes = attempt_details.pop(identifier)
             row['branch_pc'] = request['observed_site']['pc']
             row['desired_outcome'] = request['desired_outcome']
-            row['reasons'] = _job_reasons(directory, checked['report'])
+            row['reasons'] = _job_reasons(directory, controller)
             if item['status'] == 'VERIFIED':
-                native_jobs = checked['report']['jobs']
+                native_jobs = controller['jobs']
                 _require(len(native_jobs) == 1 and native_jobs[0]['status'] == 'VERIFIED',
                          'Verified queue task does not identify exactly one verified native inversion')
                 candidate_sha = native_jobs[0]['candidate_sha256']
-                raw = checked['seeds'][candidate_sha]
-                _require(hashlib.sha256(raw).hexdigest() == candidate_sha,
-                         'Verified DSE candidate contents changed')
+                _require(candidate_sha in seed_hashes, 'Verified candidate missing from its audited attempt corpus')
                 row['candidate_sha256'] = candidate_sha
-                candidates.setdefault(candidate_sha, {'raw': raw, 'jobs': []})['jobs'].append((row, request, source))
+                candidates.setdefault(candidate_sha, []).append((row, request, source))
         full_outcomes, validated_seeds = set(), {}
-        for candidate_sha, candidate in sorted(candidates.items()):
+        for candidate_sha, jobs in sorted(candidates.items()):
             print('dta-dse-eval: full candidate reruns ' + candidate_sha[:12], flush=True)
-            seed = queue / 'seeds' / candidate_sha
-            _require(_pin(seed, 4096)[1]['sha256'] == candidate_sha and seed.read_bytes() == candidate['raw'],
+            seed, identity = _pin(queue / 'seeds' / candidate_sha, 4096)
+            raw = seed.read_bytes()
+            _require(identity['sha256'] == candidate_sha and hashlib.sha256(raw).hexdigest() == candidate_sha,
                      'Published queue candidate changed')
             directory = out / 'candidate-replays' / candidate_sha
-            saved, handoff, stdout, duration = analyze(seed, directory, 1)
-            for _, _, source in candidate['jobs']:
+            saved, handoff, stdout, duration = analyze(seed, directory, 1, expected_seed_sha256=candidate_sha)
+            for _, _, source in jobs:
                 _full_environment(source, directory, input_path, candidate_sha)
             signatures = [set(tuple(pair) for pair in row['observed_branch_outcomes']) for row in saved['runs']]
             _require(signatures[0] == signatures[1], 'Repeated full candidate branch outcomes differ')
             for case in ('baseline', 'repeat'):
-                groups = parse_trace(directory / case / 'logs/trace.log', input_path, len(candidate['raw']))['groups']
-                for job, request, _ in candidate['jobs']:
+                groups = parse_trace(directory / case / 'logs/trace.log', input_path, len(raw))['groups']
+                for job, request, _ in jobs:
                     site = request['observed_site']
                     matching = [group for group in groups if (group['vcpu'], group['pc'], group['occurrence']) ==
                                 (site['vcpu'], site['pc'], site['occurrence'])]
@@ -284,19 +293,20 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
                              matching[0]['outcome'] == request['desired_outcome'],
                              'Full DSE candidate rerun lost its selected diagnostic branch occurrence')
             fresh = signatures[0] - baseline_outcomes
-            for job, _, _ in candidate['jobs']:
+            for job, _, _ in jobs:
                 job['new_full_run_outcomes'] = len(fresh)
             full_outcomes.update(signatures[0])
-            validated_seeds[candidate_sha] = candidate['raw']
+            validated_seeds[candidate_sha] = raw
             report['candidate_replays'].append({'sha256': candidate_sha, 'directory': str(directory),
                 'new_outcomes_vs_all_DTA': [list(pair) for pair in sorted(fresh)], 'wall_seconds': duration,
                 'full_runs': 2, 'stdout_sha256': hashlib.sha256(stdout[0]).hexdigest(),
                 'summary_sha256': _pin(directory / 'summary.json', 8 * 1024**2)[1]['sha256'],
-                'guest_exit': stdout[1], 'job_ids': [row['job_id'] for row, _, _ in candidate['jobs']]})
+                'guest_exit': stdout[1], 'job_ids': [row['job_id'] for row, _, _ in jobs]})
         # Reopen the original queue and every candidate's complete evidence after
         # all execution, before publishing a separate corpus for downstream use.
-        final_audit = dta_dse_queue.audit_queue(queue=queue)
-        _require(final_audit == audited, 'Queue evidence changed during full candidate validation')
+        final_audit, final_state, _ = dta_dse_queue._audit_queue(queue=queue, include_attempts=False)
+        _require(final_audit == audited and final_state == state,
+                 'Queue evidence changed during full candidate validation')
         for candidate in report['candidate_replays']:
             directory = Path(candidate['directory'])
             _require(_pin(directory / 'summary.json', 8 * 1024**2)[1]['sha256'] == candidate['summary_sha256'],
@@ -315,8 +325,11 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
             sha = row['sha256']
             seed, identity = _pin(queue / 'seeds' / sha, 4096)
             _require(identity['sha256'] == sha, 'Final source corpus bytes changed')
-            if sha in baseline_seeds or sha in validated_seeds:
+            if sha in baseline_seeds:
                 accepted[sha] = seed.read_bytes()
+            elif sha in validated_seeds:
+                _require(seed.read_bytes() == validated_seeds[sha], 'Final queue seed differs from its reruns')
+                accepted[sha] = validated_seeds[sha]
             else:
                 _require(False, 'Final corpus contains an unvalidated candidate')
         pending = out / '.seeds.pending'
@@ -339,7 +352,8 @@ def evaluate_file(*, binary, qemu, plugin, flags_receipt, seeds, input_path, arg
             seeds=str(out / 'seeds'), queue_status=audited['status'],
             reason_counts={reason: sum(reason in row['reasons'] for row in report['jobs'])
                            for reason in sorted({value for row in report['jobs'] for value in row['reasons']})})
-        report['timings'].update(DSE_job_wall_seconds=sum(durations.values()),
+        # Keep the aggregate inclusive of queue-entry audits in both modes.
+        report['timings'].update(DSE_job_wall_seconds=queue_wall_seconds,
             full_replay_wall_seconds=sum(row['wall_seconds'] for row in report['candidate_replays']))
         atomic_json(out / 'manifest.json', {'schema': 1, 'profile': PROFILE,
             'target_sha256': sources[0][1]['sha256'], 'input_path': input_path, 'argv': argv,

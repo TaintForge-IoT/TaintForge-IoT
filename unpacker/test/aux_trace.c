@@ -180,6 +180,22 @@ void dse_aux_set_tls(InsnAux *aux, unsigned segment, uint32_t base, uint32_t sel
     aux->tls_selector[segment] = valid ? (uint16_t)selector : 0;
 }
 
+RegId dse_x86_mov_gs_source(const TraceEntry *entry) {
+    /* Unprefixed MOV GS, r/m16 with a register ModR/M operand. */
+    if (entry->size != 2 || entry->instr_bytes[0] != 0x8e ||
+        (entry->instr_bytes[1] & 0xf8U) != 0xe8U)
+        return REG_INVALID;
+    return (RegId)(entry->instr_bytes[1] & 7U);
+}
+
+uint32_t dse_x86_tls_gdt_offset(uint16_t selector) {
+    unsigned slot = selector >> 3;
+    if ((selector & 7U) != 3 || slot < DSE_TLS_FIRST_SLOT ||
+        slot >= DSE_TLS_FIRST_SLOT + DSE_TLS_SLOTS)
+        return 0;
+    return slot * 8U;
+}
+
 size_t dse_aux_syscall_owned_bytes(const DseSyscallObservation *s) {
     if (!s || s->write_size > DSE_SYSCALL_WRITE_BYTES ||
         (s->file && s->file->content_size > DSE_EXECUTABLE_SNAPSHOT_BYTES)) return 0;
@@ -351,16 +367,30 @@ bool dse_aux_syscall_write(DseAuxRing *ring, InsnAux *aux, const uint8_t *bytes,
     return true;
 }
 
+static bool syscall_file_allocate(DseAuxRing *ring, DseSyscallObservation *s, size_t size) {
+    size_t bytes = sizeof(*s->file) + size;
+    if (ring->dynamic_bytes > ring->max_dynamic_bytes ||
+        bytes > ring->max_dynamic_bytes - ring->dynamic_bytes) return false;
+    DseSyscallFileObservation *file = calloc(1, sizeof(*file));
+    if (!file) return false;
+    if (size) {
+        file->contents = malloc(size);
+        if (!file->contents) {
+            free(file);
+            return false;
+        }
+    }
+    s->file = file;
+    ring->dynamic_bytes += bytes;
+    return true;
+}
+
 bool dse_aux_syscall_path(DseAuxRing *ring, InsnAux *aux, const uint8_t *path, size_t size) {
     DseSyscallObservation *s = aux ? aux->syscall : NULL;
     if (!ring || !s || (s->number != 5 && s->number != 85) || s->invalid ||
         s->returned || aux->execution_complete) return false;
     if (s->file) { s->invalid = true; return false; }
-    if (ring->dynamic_bytes > ring->max_dynamic_bytes ||
-        sizeof(*s->file) > ring->max_dynamic_bytes - ring->dynamic_bytes) return false;
-    s->file = calloc(1, sizeof(*s->file));
-    if (!s->file) return false;
-    ring->dynamic_bytes += sizeof(*s->file);
+    if (!syscall_file_allocate(ring, s, 0)) return false;
     s->file->path_observed = true;
     if (!path || !size || size > DSE_SYSCALL_PATH_BYTES || path[size-1] ||
         memchr(path, 0, size-1) || (uint64_t)s->args[0]+size > (UINT64_C(1)<<32)) return false;
@@ -408,6 +438,33 @@ bool dse_aux_syscall_readlink_reply(InsnAux *aux, const uint8_t *bytes, size_t s
     return true;
 }
 
+bool dse_aux_executable_mmap_shape(const DseSyscallObservation *s) {
+    return s && s->number == 192 && s->returned && !s->invalid &&
+           s->args[0] == 0 && s->args[1] == DSE_PROC_EXE_PAGE_BYTES &&
+           s->args[2] == 1 && s->args[3] == 2 &&
+           s->args[4] >= 3 && s->args[4] < 64 && s->args[5] == 0 &&
+           s->result != 0 && s->result < UINT32_C(0xfffff001) &&
+           !(s->result & (DSE_PROC_EXE_PAGE_BYTES - 1U));
+}
+
+bool dse_aux_syscall_executable_mmap(DseAuxRing *ring, InsnAux *aux, uint64_t identity,
+                                    uint64_t open_seq, uint64_t open_boundary,
+                                    const uint8_t page[DSE_PROC_EXE_PAGE_BYTES]) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!ring || !dse_aux_executable_mmap_shape(s) || aux->execution_complete || s->file ||
+        !identity || !page || !open_seq || open_seq >= s->seq_id ||
+        !open_boundary || open_boundary >= s->boundary_id ||
+        !syscall_file_allocate(ring, s, DSE_PROC_EXE_PAGE_BYTES)) return false;
+    DseSyscallFileObservation *file = s->file;
+    file->source_observed = file->source_valid = file->content_valid = true;
+    file->source_identity = identity;
+    file->open_seq = open_seq;
+    file->open_boundary = open_boundary;
+    file->content_size = DSE_PROC_EXE_PAGE_BYTES;
+    memcpy(file->contents, page, file->content_size);
+    return true;
+}
+
 void dse_aux_syscall_seal_order(const DseAuxRing *ring, InsnAux *aux) {
     DseSyscallObservation *s = aux ? aux->syscall : NULL;
     if (s)
@@ -451,8 +508,8 @@ static const char *int80_register_issue(const TraceEntry *entry, const InsnAux *
         return "argument_mismatch";
     if (s->post_regs[DTA_REG_RAX] != s->result)
         return "return_mismatch";
-    if (number != 356 && number != 90 && number != 192 && number != 45 &&
-        number != 4 && number != 5 && number != 85 && s->result &&
+    if (number != 356 && number != 90 && number != 192 && number != 45 && number != 3 &&
+        number != 4 && number != 5 && number != 85 && number != 258 && s->result &&
         s->result < UINT32_C(0xfffff001))
         return "invalid_return_value";
     for (unsigned i = 1; i < 8; ++i)
@@ -461,6 +518,66 @@ static const char *int80_register_issue(const TraceEntry *entry, const InsnAux *
     if (aux->has_mem_read || aux->has_mem_write || aux->mem_read_total || aux->mem_write_total ||
         aux->mem_read_count || aux->mem_write_count || aux->mem_read_overflow || aux->mem_write_overflow)
         return "unexpected_memory_access";
+    return NULL;
+}
+
+const char *dse_aux_set_tid_address_issue(const TraceEntry *entry, const InsnAux *aux) {
+    const char *issue = int80_register_issue(entry, aux, 258, 1);
+    if (issue)
+        return issue;
+    const DseSyscallObservation *s = aux->syscall;
+    if (!s->boundary_id || !s->boundary_ordered)
+        return "syscall_order_unverified";
+    if (!s->result || s->result > INT32_MAX)
+        return "set_tid_address_result_unverified";
+    return NULL;
+}
+
+const char *dse_aux_sigprocmask_issue(const TraceEntry *entry, const InsnAux *aux) {
+    const char *issue = int80_register_issue(entry, aux, 175, 4);
+    if (issue)
+        return issue;
+    const DseSyscallObservation *s = aux->syscall;
+    if (s->args[0] != DSE_I386_SIG_UNBLOCK || !s->args[1] || s->args[2] ||
+        s->args[3] != sizeof(s->sigmask_set) ||
+        (uint64_t)s->args[1] + sizeof(s->sigmask_set) > (UINT64_C(1) << 32))
+        return "rt_sigprocmask_unsupported_arguments";
+    if (s->result)
+        return "rt_sigprocmask_not_successful";
+    if (!s->boundary_id || !s->boundary_ordered)
+        return "syscall_order_unverified";
+    const DseSigmaskSnapshot *before = &s->sigmask_before, *after = &s->sigmask_after;
+    if (!s->sigmask_set_valid || !before->observed || !after->observed)
+        return "rt_sigprocmask_observation_missing";
+    if (!before->no_pending || !after->no_pending)
+        return "rt_sigprocmask_signal_boundary_unverified";
+    const uint64_t unblockable = (UINT64_C(1) << (9U - 1U)) | (UINT64_C(1) << (19U - 1U));
+    if ((before->mask & unblockable) || after->mask != (before->mask & ~s->sigmask_set))
+        return "rt_sigprocmask_transition_mismatch";
+    return NULL;
+}
+
+const char *dse_aux_sigaction_issue(const TraceEntry *entry, const InsnAux *aux) {
+    const char *issue = int80_register_issue(entry, aux, 174, 4);
+    if (issue)
+        return issue;
+    const DseSyscallObservation *s = aux->syscall;
+    if (s->args[0] != DSE_I386_SIGINT || !s->args[1] || s->args[2] ||
+        s->args[3] != sizeof(s->sigmask_before.mask) ||
+        (uint64_t)s->args[1] + sizeof(s->sigaction_input.words) > (UINT64_C(1) << 32))
+        return "rt_sigaction_unsupported_arguments";
+    if (s->result)
+        return "rt_sigaction_not_successful";
+    if (!s->boundary_id || !s->boundary_ordered)
+        return "syscall_order_unverified";
+    if (!s->sigaction_input.observed || !s->sigaction_before.observed ||
+        !s->sigaction_after.observed || !s->sigmask_before.observed || !s->sigmask_after.observed)
+        return "rt_sigaction_observation_missing";
+    if (!s->sigmask_before.no_pending || !s->sigmask_after.no_pending ||
+        s->sigmask_before.mask != s->sigmask_after.mask)
+        return "rt_sigaction_signal_boundary_unverified";
+    if (memcmp(s->sigaction_input.words, s->sigaction_after.words, sizeof(s->sigaction_input.words)))
+        return "rt_sigaction_transition_mismatch";
     return NULL;
 }
 
@@ -526,6 +643,33 @@ const char *dse_aux_close_issue(const TraceEntry *entry, const InsnAux *aux) {
     return NULL;
 }
 
+const char *dse_aux_stdio_issue(const TraceEntry *entry, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s)
+        return "observation_missing";
+    bool reading = s->number == 3;
+    const char *issue = reading ? int80_register_issue(entry, aux, 3, 3)
+                                : dse_aux_close_issue(entry, aux);
+    if (issue)
+        return issue;
+    if (!s->boundary_id || !s->boundary_ordered)
+        return "syscall_order_unverified";
+    const DseStdioObservation *io = &s->stdio;
+    if (s->args[0] != (reading ? 0U : 1U) || !io->before_valid || !io->after_valid)
+        return "regular_stdio_transition_unverified";
+    if (reading) {
+        uint32_t requested = s->args[2];
+        if (!requested || requested > INT32_MAX || !s->args[1] ||
+            (uint64_t)s->args[1] + requested > (UINT64_C(1) << 32) ||
+            io->offset > io->file_size || io->length > sizeof(io->bytes) || io->length != s->result)
+            return "stdin_read_range_or_result_mismatch";
+        uint64_t remaining = io->file_size - io->offset;
+        if (io->length != (remaining < requested ? remaining : requested))
+            return "stdin_read_length_mismatch";
+    }
+    return NULL;
+}
+
 const char *dse_aux_memfd_issue(const TraceEntry *entry, const InsnAux *aux) {
     const char *issue = int80_register_issue(entry, aux, 356, 2);
     if (issue)
@@ -587,11 +731,13 @@ const char *dse_aux_ir_mmap_issue(const TraceEntry *entry,const InsnAux *aux,uin
         out[5]=(uint32_t)offset;
     }
     if(s->result>=UINT32_C(0xfffff001)) return "mmap_not_successful";
-    if(out[3]!=1 && out[3]!=2 && out[3]!=0x11 && out[3]!=0x12 && out[3]!=0x32)
+    if(out[3]!=1 && out[3]!=2 && out[3]!=0x11 && out[3]!=0x12 && out[3]!=0x22 && out[3]!=0x32)
         return "mmap_fixed_or_flags_unsupported";
     if((out[3]&0x10U) && (out[0]!=s->result || (out[0]&4095U)))
         return "mmap_fixed_address_mismatch";
-    if(out[3]==0x32 && (out[4]!=UINT32_MAX || out[5])) return "mmap_anonymous_contract";
+    if(out[3]==0x22 && (s->number!=192 || out[0])) return "mmap_anonymous_hint_or_abi_unsupported";
+    if((out[3]==0x22 || out[3]==0x32) && (out[4]!=UINT32_MAX || out[5]))
+        return "mmap_anonymous_contract";
     if((out[2]&~7U) || (out[2] && !(out[2]&1U))) return "mmap_rights_unsupported";
     if(!out[1] || (s->result&4095U) || (out[5]&4095U) ||
        (uint64_t)s->result+(((uint64_t)out[1]+4095U)&~UINT64_C(4095))>(UINT64_C(1)<<32))
@@ -631,6 +777,51 @@ const char *dse_aux_brk_issue(const TraceEntry *entry,const InsnAux *aux) {
        s->brk_after<s->brk_initial || s->result!=s->brk_after ||
        (s->args[0]<s->brk_initial && s->brk_after!=s->brk_before) ||
        (s->brk_after!=s->brk_before && s->brk_after!=s->args[0])) return "brk_transition_invalid";
+    return NULL;
+}
+
+const char *dse_aux_set_thread_area_issue(const TraceEntry *entry, const InsnAux *aux,
+                                         unsigned *slot) {
+    const char *issue = int80_register_issue(entry, aux, 243, 1);
+    if (issue)
+        return issue;
+    const DseSyscallObservation *s = aux->syscall;
+    if (s->result)
+        return "set_thread_area_not_successful";
+    if (!s->boundary_id || !s->boundary_ordered)
+        return "syscall_order_unverified";
+    const DseTlsSnapshot *before = &s->tls_before, *after = &s->tls_after;
+    const uint32_t *desc = before->user_desc;
+    uint32_t address = s->args[0], gdt = before->gdt_base;
+    if (!before->valid || !after->valid)
+        return "set_thread_area_observation_missing";
+    if (!gdt || (gdt & 4095U) || gdt != after->gdt_base ||
+        !address || (uint64_t)address + sizeof(before->user_desc) > (UINT64_C(1) << 32) ||
+        (address < (uint64_t)gdt + 4096U && gdt < (uint64_t)address + sizeof(before->user_desc)))
+        return "set_thread_area_range_unverified";
+    /* Successful allocation of a present, writable 32-bit data segment with
+     * a 4 GiB effective limit. Explicit replacement and clearing stay unknown. */
+    if (desc[0] != UINT32_MAX || !desc[1] || desc[2] != 0xfffffU || desc[3] != 0x51U)
+        return "set_thread_area_descriptor_unsupported";
+    unsigned index = 0;
+    while (index < DSE_TLS_SLOTS && (before->slot[index][0] || before->slot[index][1]))
+        ++index;
+    if (index == DSE_TLS_SLOTS || after->user_desc[0] != DSE_TLS_FIRST_SLOT + index ||
+        memcmp(desc + 1, after->user_desc + 1, 3 * sizeof(uint32_t)))
+        return "set_thread_area_copyout_mismatch";
+    uint32_t low = (desc[1] << 16) | 0xffffU;
+    uint32_t high = (desc[1] & 0xff000000U) | ((desc[1] >> 16) & 0xffU) | 0x00dff200U;
+    for (unsigned i = 0; i < DSE_TLS_SLOTS; ++i) {
+        uint32_t expected_low = i == index ? low : before->slot[i][0];
+        uint32_t expected_high = i == index ? high : before->slot[i][1];
+        if (after->slot[i][0] != expected_low || after->slot[i][1] != expected_high)
+            return "set_thread_area_gdt_mismatch";
+    }
+    for (unsigned i = 0; i < DSE_TLS_SEGMENTS; ++i)
+        if (after->base[i] != before->base[i] ||
+            after->selector[i] != before->selector[i])
+            return "set_thread_area_segment_changed";
+    *slot = DSE_TLS_FIRST_SLOT + index;
     return NULL;
 }
 

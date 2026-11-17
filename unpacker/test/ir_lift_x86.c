@@ -72,6 +72,11 @@ IrX86Frontend *ir_x86_frontend_create(IrModule *m, const IrX86Options *options) 
     if (f->options.tls32_ram)
         for (unsigned i = 0; i < IR_X86_TLS_COUNT; ++i)
             f->state.tls_base[i] = ir_state_add(m, ir_type_bv(32), IR_X86_TLS_KEY_BASE + i, false);
+    if (f->options.movq_xmm_memory || f->options.sse2_dwords)
+        for (unsigned i = 0; i < IR_X86_XMM_COUNT; ++i)
+            for (unsigned half = 0; half < 2; ++half)
+                f->state.xmm[i][half] = ir_state_add(m, ir_type_bv(64),
+                    IR_X86_XMM_KEY_BASE + 2U * i + half, false);
     if (ir_module_status(m) != IR_OK) {
         ir_x86_frontend_destroy(f);
         return NULL;
@@ -239,6 +244,71 @@ static bool ram_segment(const IrX86Frontend *f, unsigned segment) {
     return segment == X86_REG_INVALID || segment == X86_REG_DS || segment == X86_REG_ES ||
            segment == X86_REG_SS || segment == X86_REG_CS ||
            (f->options.tls32_ram && (segment == X86_REG_FS || segment == X86_REG_GS));
+}
+
+IrX86MovqForm ir_x86_movq_memory(const uint8_t *bytes, size_t size, unsigned *xmm) {
+    if (size < 4 || bytes[1] != 0x0f || (bytes[3] & 0xc0U) == 0xc0U)
+        return IR_X86_MOVQ_NONE;
+    IrX86MovqForm form = IR_X86_MOVQ_NONE;
+    if (bytes[0] == 0xf3 && bytes[2] == 0x7e)
+        form = IR_X86_MOVQ_LOAD;
+    else if (bytes[0] == 0x66 && bytes[2] == 0xd6)
+        form = IR_X86_MOVQ_STORE;
+    if (form != IR_X86_MOVQ_NONE)
+        *xmm = (bytes[3] >> 3) & 7U;
+    return form;
+}
+
+IrX86Sse2DwordForm ir_x86_sse2_dword_form(const uint8_t *bytes, size_t size, unsigned *dst) {
+    if (size < 4 || bytes[0] != 0x66 || bytes[1] != 0x0f)
+        return IR_X86_SSE2_DWORD_NONE;
+    if (bytes[2] == 0x6e || (bytes[2] == 0x62 && size == 4 && (bytes[3] & 0xc0U) == 0xc0U)) {
+        *dst = (bytes[3] >> 3) & 7U;
+        return bytes[2] == 0x6e ? IR_X86_SSE2_MOVD : IR_X86_SSE2_PUNPCKLDQ;
+    }
+    return IR_X86_SSE2_DWORD_NONE;
+}
+
+bool ir_x86_is_lock_or32(const InsnDesc *d) {
+    if (d->native_insn_id != X86_INS_OR || d->size < 3 || d->bytes[0] != 0xf0 ||
+        (d->bytes[2] & 0xc0U) == 0xc0U)
+        return false;
+    return d->bytes[1] == 0x09 ||
+           (d->size >= 4 && d->bytes[1] == 0x83 && (d->bytes[2] & 0x38U) == 0x08U);
+}
+
+static IrX86LiftStatus movq_preflight(const IrX86Frontend *f, const cs_insn *insn,
+                                      IrX86MovqForm form, unsigned xmm) {
+    const cs_x86 *x = &insn->detail->x86;
+    const cs_x86_op *reg = &x->operands[form == IR_X86_MOVQ_LOAD ? 0 : 1];
+    const cs_x86_op *mem = &x->operands[form == IR_X86_MOVQ_LOAD ? 1 : 0];
+    if (!f->options.movq_xmm_memory || insn->id != X86_INS_MOVQ || x->op_count != 2 ||
+        reg->type != X86_OP_REG || reg->reg != X86_REG_XMM0 + xmm ||
+        mem->size != 8 || !address_ok(x, mem))
+        return IR_X86_LIFT_UNSUPPORTED;
+    return f->options.flat32_ram && ram_segment(f, mem->mem.segment) ? IR_X86_LIFT_OK
+                                                                    : IR_X86_LIFT_MEMORY_MODEL;
+}
+
+static IrX86LiftStatus sse2_dword_preflight(const IrX86Frontend *f, const cs_insn *insn,
+                                            IrX86Sse2DwordForm form, unsigned dst) {
+    const cs_x86 *x = &insn->detail->x86;
+    if (!f->options.sse2_dwords || x->op_count != 2 ||
+        x->operands[0].type != X86_OP_REG || x->operands[0].reg != X86_REG_XMM0 + dst)
+        return IR_X86_LIFT_UNSUPPORTED;
+    const cs_x86_op *src = &x->operands[1];
+    if (form == IR_X86_SSE2_PUNPCKLDQ)
+        return insn->id == X86_INS_PUNPCKLDQ && src->type == X86_OP_REG &&
+               src->reg == X86_REG_XMM0 + (insn->bytes[3] & 7U)
+            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (insn->id != X86_INS_MOVD || src->size != 4)
+        return IR_X86_LIFT_UNSUPPORTED;
+    if (src->type == X86_OP_REG)
+        return register_ok(src) ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
+    if (!address_ok(x, src))
+        return IR_X86_LIFT_UNSUPPORTED;
+    return f->options.flat32_ram && ram_segment(f, src->mem.segment)
+        ? IR_X86_LIFT_OK : IR_X86_LIFT_MEMORY_MODEL;
 }
 
 static bool supported_prefixes(const InsnDesc *d) {
@@ -476,9 +546,10 @@ static IrX86LiftStatus preflight(const IrX86Frontend *f, const cs_insn *insn) {
             x->op_count == 2 && register_ok(&x->operands[0]) &&
             x->operands[0].size == 4 && x->operands[1].type == X86_OP_REG &&
             x->operands[1].reg == X86_REG_CL ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
-    if (insn->id == X86_INS_SHLD) {
-        bool cl = insn->size == 3 && insn->bytes[0] == 0x0f && insn->bytes[1] == 0xa5;
-        bool imm = insn->size == 4 && insn->bytes[0] == 0x0f && insn->bytes[1] == 0xa4;
+    if (insn->id == X86_INS_SHLD || insn->id == X86_INS_SHRD) {
+        bool left = insn->id == X86_INS_SHLD;
+        bool cl = insn->size == 3 && insn->bytes[0] == 0x0f && insn->bytes[1] == (left ? 0xa5 : 0xad);
+        bool imm = insn->size == 4 && insn->bytes[0] == 0x0f && insn->bytes[1] == (left ? 0xa4 : 0xac);
         return (cl || imm) && (insn->bytes[2] & 0xc0) == 0xc0 && x->op_count == 3 &&
             register_ok(&x->operands[0]) && register_ok(&x->operands[1]) &&
             x->operands[0].size == 4 && x->operands[1].size == 4 &&
@@ -486,13 +557,6 @@ static IrX86LiftStatus preflight(const IrX86Frontend *f, const cs_insn *insn) {
                 : x->operands[2].type == X86_OP_IMM)
             ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
     }
-    if (insn->id == X86_INS_SHRD)
-        return insn->size == 3 && insn->bytes[0] == 0x0f && insn->bytes[1] == 0xad &&
-            (insn->bytes[2] & 0xc0) == 0xc0 && x->op_count == 3 &&
-            register_ok(&x->operands[0]) && register_ok(&x->operands[1]) &&
-            x->operands[0].size == 4 && x->operands[1].size == 4 &&
-            x->operands[2].type == X86_OP_REG && x->operands[2].reg == X86_REG_CL
-            ? IR_X86_LIFT_OK : IR_X86_LIFT_UNSUPPORTED;
     if (insn->id == X86_INS_BT) {
         const cs_x86_op *base = &x->operands[0], *index = &x->operands[1];
         return x->op_count == 2 && register_ok(base) && base->size == 4 && x->prefix[2] != 0x66 &&
@@ -1113,16 +1177,21 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
         r.status = IR_X86_LIFT_IDENTITY;
         return r;
     }
-    /* REP strings use an explicit expansion API. Other prefix exceptions stay
-     * exact: ENDBR32 and F3 C3. No general prefix stripping. */
+    /* REP strings use an explicit expansion API. Other prefix exceptions
+     * match their opcode and operand form. */
     static const uint8_t endbr32[] = {0xf3, 0x0f, 0x1e, 0xfb};
     bool exact_endbr32 = insn->id == X86_INS_ENDBR32 && d->size == sizeof(endbr32) &&
                          !memcmp(d->bytes, endbr32, sizeof(endbr32));
     bool exact_rep_ret = insn->id == X86_INS_RET && d->size == 2 &&
                          d->bytes[0] == 0xf3 && d->bytes[1] == 0xc3;
     bool repeated = (string_move(insn->id) || string_store(insn->id)) && repeat_prefixes(d);
-    r.status =
-        (exact_endbr32 || exact_rep_ret || repeated || supported_prefixes(d))
+    unsigned xmm = 0;
+    IrX86MovqForm movq = ir_x86_movq_memory(d->bytes, d->size, &xmm);
+    IrX86Sse2DwordForm dword = ir_x86_sse2_dword_form(d->bytes, d->size, &xmm);
+    bool lock_or32 = f->options.lock_or32 && ir_x86_is_lock_or32(d);
+    r.status = movq != IR_X86_MOVQ_NONE ? movq_preflight(f, insn, movq, xmm)
+        : dword != IR_X86_SSE2_DWORD_NONE ? sse2_dword_preflight(f, insn, dword, xmm)
+        : (exact_endbr32 || exact_rep_ret || repeated || lock_or32 || supported_prefixes(d))
             ? preflight(f, insn) : IR_X86_LIFT_UNSUPPORTED;
     if (target_only && insn->id != X86_INS_JMP && insn->id != X86_INS_CALL &&
         insn->id != X86_INS_RET)
@@ -1150,7 +1219,29 @@ static IrX86LiftResult lift_instruction(IrX86Frontend *f, IrBlockId block, const
     int cc = condition_code(insn->id);
     int set_cc = set_condition_code(insn->id);
     int move_cc = move_condition_code(insn->id);
-    if (insn->id == X86_INS_LOOP) {
+    if (movq == IR_X86_MOVQ_LOAD) {
+        IrValueId address = linear_address(&l, x, &x->operands[1], &r);
+        IrValueId low = load_memory(&l, address, 8, &r);
+        write_state(&l, f->state.xmm[xmm][0], low);
+        write_state(&l, f->state.xmm[xmm][1], constant(&l, 64, 0));
+    } else if (movq == IR_X86_MOVQ_STORE) {
+        IrValueId address = linear_address(&l, x, &x->operands[0], &r);
+        IrValueId low = read_state(&l, f->state.xmm[xmm][0], ir_type_bv(64));
+        store_memory(&l, address, 8, low, &r);
+    } else if (dword == IR_X86_SSE2_MOVD) {
+        IrValueId value = read_operand(&l, x, &x->operands[1], &r);
+        write_state(&l, f->state.xmm[xmm][0], unary(&l, IR_OP_ZEXT, 64, value, 0));
+        write_state(&l, f->state.xmm[xmm][1], constant(&l, 64, 0));
+    } else if (dword == IR_X86_SSE2_PUNPCKLDQ) {
+        unsigned source = d->bytes[3] & 7U;
+        IrValueId dst_low = read_state(&l, f->state.xmm[xmm][0], ir_type_bv(64));
+        IrValueId src_low = read_state(&l, f->state.xmm[source][0], ir_type_bv(64));
+        for (unsigned half = 0; half < 2; ++half) {
+            IrValueId dst_lane = unary(&l, IR_OP_EXTRACT, 32, dst_low, 32 * half);
+            IrValueId src_lane = unary(&l, IR_OP_EXTRACT, 32, src_low, 32 * half);
+            write_state(&l, f->state.xmm[xmm][half], binary(&l, IR_OP_CONCAT, 64, src_lane, dst_lane));
+        }
+    } else if (insn->id == X86_INS_LOOP) {
         unsigned bits = x->addr_size * 8U, reg = bits == 16 ? X86_REG_CX : X86_REG_ECX;
         IrValueId count = binary(&l, IR_OP_SUB, bits, read_register(&l, reg), constant(&l, bits, 1));
         write_register(&l, reg, count);

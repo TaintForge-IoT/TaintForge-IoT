@@ -111,6 +111,27 @@ def validate_observation(report: dict[str, Any], expected_byte: int, pc: int,
     return validate_prefix(report, pc, occurrence, max_steps)
 
 
+def _validate_counted_loop_gap(trace, index, loop, pc, read_seq):
+    """Check the single omitted span against its retained i386 loop body."""
+    rows = trace[index:index + 5]
+    if len(rows) != 5 or any(not isinstance(row, dict) for row in rows):
+        raise ConcolicError("counted loop boundary incomplete")
+    init, add, dec, jnz, exit_insn = [row.get("instruction") for row in rows]
+    for instruction in (init, add, dec, jnz, exit_insn):
+        _instruction(instruction)
+    head = add["pc"]
+    iterations = loop["iterations"]
+    if (loop["head_seq"] != init["seq"] + 1 or loop["head_seq"] <= read_seq or
+            loop["resume_seq"] != add["seq"] or
+            add["seq"] - loop["head_seq"] != 3 * (iterations - 1) or
+            init["bytes"] != "b9" + iterations.to_bytes(4, "little").hex() or
+            init["pc"] + 5 != head or not re.fullmatch("83c[023567][0-9a-f]{2}", add["bytes"]) or
+            dec["pc"] != head + 3 or dec["bytes"] != "49" or
+            jnz["pc"] != head + 4 or jnz["bytes"] != "75fa" or rows[3].get("branch_outcome") != 2 or
+            exit_insn["pc"] != head + 6 or head <= pc < head + 6):
+        raise ConcolicError("counted loop gap does not match its observed boundary")
+
+
 def validate_prefix(report: dict[str, Any], pc: int, occurrence: int,
                     max_steps: int) -> list[dict[str, Any]]:
     """Validate the observed route independently of its external input adapter."""
@@ -123,13 +144,21 @@ def validate_prefix(report: dict[str, Any], pc: int, occurrence: int,
             type(report.get("taken")) is not bool or
             not re.fullmatch(r"[0-9a-f]{64}", str(report.get("fixed_inputs_sha256")))):
         raise ConcolicError("flags/branch evidence missing")
+    loop = report.get("counted_loop")
+    if "counted_loop" in report and (
+            report.get("schema") != 2 or report.get("relation") != "environment_file_read_identity" or
+            not isinstance(loop, dict) or set(loop) != {"head_seq", "resume_seq", "iterations"} or
+            not _integer(loop.get("head_seq")) or not _integer(loop.get("resume_seq")) or
+            not _integer(loop.get("iterations"), 8192) or loop["iterations"] < 2):
+        raise ConcolicError("invalid counted loop evidence")
     trace = report.get("trace")
-    if not isinstance(trace, list) or not 1 <= len(trace) <= max_steps:
+    if not isinstance(trace, list) or not trace or len(trace) + (loop is not None) > max_steps:
         raise ConcolicError("prefix missing or exceeds budget")
     successor = report.get("successor")
     _instruction(successor)
     seen = 0
     read_index = None
+    used_loop = False
     for index, row in enumerate(trace):
         if not isinstance(row, dict):
             raise ConcolicError("invalid prefix row")
@@ -141,9 +170,13 @@ def validate_prefix(report: dict[str, Any], pc: int, occurrence: int,
             raise ConcolicError("invalid prefix row")
         following = trace[index + 1].get("instruction") if index + 1 < len(trace) else successor
         _instruction(following)
-        if (not _integer(row.get("next_pc"), 0xffffffff) or row["next_pc"] != following["pc"] or
-                following["seq"] != instruction["seq"] + 1):
+        if not _integer(row.get("next_pc"), 0xffffffff) or row["next_pc"] != following["pc"]:
             raise ConcolicError("discontinuous prefix")
+        if following["seq"] != instruction["seq"] + 1:
+            if loop is None or used_loop:
+                raise ConcolicError("discontinuous prefix")
+            _validate_counted_loop_gap(trace, index, loop, pc, report["read_seq"])
+            used_loop = True
         if instruction["seq"] == report["read_seq"]:
             if instruction["bytes"] != "cd80" or read_index is not None:
                 raise ConcolicError("read identity mismatch")
@@ -151,6 +184,8 @@ def validate_prefix(report: dict[str, Any], pc: int, occurrence: int,
         if instruction["seq"] > report["read_seq"] and instruction["pc"] == pc:
             seen += 1
     last = trace[-1]
+    if loop is not None and not used_loop:
+        raise ConcolicError("counted loop evidence does not cover a prefix gap")
     if (read_index is None or read_index == len(trace) - 1 or seen != occurrence or
             last["instruction"]["pc"] != pc or
             last["instruction"]["seq"] != report.get("selected_seq") or
@@ -188,9 +223,13 @@ def verify_prefixes(baseline: dict[str, Any], candidate: dict[str, Any],
         raise ConcolicError("prediction evidence missing")
     if len(first) != len(second):
         raise ConcolicError("prefix length diverged")
+    first_seq = first[0]["instruction"]["seq"]
+    second_seq = second[0]["instruction"]["seq"]
     for index, (old, new) in enumerate(zip(first, second)):
         if _instruction(old["instruction"]) != _instruction(new["instruction"]):
             raise ConcolicError("prefix instruction identity diverged")
+        if old["instruction"]["seq"] - first_seq != new["instruction"]["seq"] - second_seq:
+            raise ConcolicError("prefix instruction ordinals diverged")
         if index + 1 < len(first) and (old["next_pc"], old["branch_outcome"]) != (
                 new["next_pc"], new["branch_outcome"]):
             raise ConcolicError("earlier control flow diverged")

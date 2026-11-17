@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -224,6 +225,50 @@ static bool ir_plugin_options(int argc, char **argv) {
             if (!strcmp(value, "on")) options.replay.observed_proc_exe = true;
             else if (!strcmp(value, "off")) options.replay.observed_proc_exe = false;
             else goto invalid;
+        } else if (IR_OPTION("ir-observed-proc-exe-boundary")) {
+            if (!strcmp(value, "on")) options.replay.observed_proc_exe_boundary = true;
+            else if (!strcmp(value, "off")) options.replay.observed_proc_exe_boundary = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-memfd-boundary")) {
+            if (!strcmp(value, "on")) options.replay.observed_memfd_boundary = true;
+            else if (!strcmp(value, "off")) options.replay.observed_memfd_boundary = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-set-thread-area")) {
+            if (!strcmp(value, "on")) options.replay.observed_set_thread_area = true;
+            else if (!strcmp(value, "off")) options.replay.observed_set_thread_area = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-mov-gs")) {
+            if (!strcmp(value, "on")) options.replay.observed_mov_gs = true;
+            else if (!strcmp(value, "off")) options.replay.observed_mov_gs = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-set-tid-address")) {
+            if (!strcmp(value, "on")) options.replay.observed_set_tid_address = true;
+            else if (!strcmp(value, "off")) options.replay.observed_set_tid_address = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-sigprocmask")) {
+            if (!strcmp(value, "on")) options.replay.observed_sigprocmask = true;
+            else if (!strcmp(value, "off")) options.replay.observed_sigprocmask = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-sigaction")) {
+            if (!strcmp(value, "on")) options.replay.observed_sigaction = true;
+            else if (!strcmp(value, "off")) options.replay.observed_sigaction = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-stdio")) {
+            if (!strcmp(value, "on")) options.replay.observed_stdio = true;
+            else if (!strcmp(value, "off")) options.replay.observed_stdio = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-xmm-movq")) {
+            if (!strcmp(value, "on")) options.replay.x86.movq_xmm_memory = true;
+            else if (!strcmp(value, "off")) options.replay.x86.movq_xmm_memory = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-sse2-dwords")) {
+            if (!strcmp(value, "on")) options.replay.x86.sse2_dwords = true;
+            else if (!strcmp(value, "off")) options.replay.x86.sse2_dwords = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-lock-or32")) {
+            if (!strcmp(value, "on")) options.replay.x86.lock_or32 = true;
+            else if (!strcmp(value, "off")) options.replay.x86.lock_or32 = false;
+            else goto invalid;
         } else if (IR_OPTION("ir-ssa")) {
             if (!strcmp(value, "on"))
                 options.trace_ssa = true;
@@ -314,6 +359,47 @@ static bool ir_plugin_options(int argc, char **argv) {
     if (options.replay.observed_proc_exe &&
         (!options.replay.observed_files || !options.replay.x86.flat32_ram)) {
         fprintf(stderr, "[IR] proc-exe requires ir-observed-files=on and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_proc_exe_boundary &&
+        (!g_phase1.enabled || !options.replay.observed_files || !options.replay.x86.flat32_ram ||
+         options.replay.observed_proc_exe)) {
+        fprintf(stderr, "[IR] proc-exe boundary requires Phase 1, flat memory and observed files\n");
+        return false;
+    }
+    if (options.replay.observed_memfd_boundary &&
+        (!g_phase1.enabled || !options.replay.observed_files || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] memfd boundary requires Phase 1, flat memory and observed files\n");
+        return false;
+    }
+    if ((options.replay.observed_set_thread_area || options.replay.observed_mov_gs) &&
+        (!g_phase1.enabled || !options.replay.x86.tls32_ram)) {
+        fprintf(stderr, "[IR] observed TLS operations require Phase 1 and ir-tls32=on\n");
+        return false;
+    }
+    if (options.replay.observed_set_tid_address && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] set_tid_address requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_sigprocmask && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] rt_sigprocmask requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_sigaction && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] rt_sigaction requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_stdio && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] observed stdio requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if ((options.replay.x86.movq_xmm_memory || options.replay.x86.sse2_dwords) &&
+        (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] SSE2 replay requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.x86.lock_or32 && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] LOCK OR requires Phase 1 and ir-flat-memory=on\n");
         return false;
     }
     if (!ir_runtime_init(&g_ir_runtime, &options))
@@ -467,6 +553,8 @@ typedef struct {
     page_t *store_pages[256];
 } StageMemfd;
 static StageMemfd g_stage_memfd_files[32];
+static DseMemfdBoundary g_memfd_boundary;
+static const uint8_t zero_memfd_page[DSE_MEMFD_BOUNDARY_PAGE_BYTES];
 static struct {
     bool active, supported;
     int64_t number;
@@ -530,8 +618,12 @@ static struct qemu_plugin_register *g_eflags_handle = NULL;
 static bool g_eflags_handle_valid;
 static struct qemu_plugin_register *g_es_state_handle;
 static struct qemu_plugin_register *g_brk_state_handle;
+static struct qemu_plugin_register *g_sigmask_handle;
+static struct qemu_plugin_register *g_sigaction_handle;
+static struct qemu_plugin_register *g_tls_gdt_handle;
 static bool g_es_state_handle_valid;
 static struct qemu_plugin_register *g_tls_handle[DSE_TLS_SEGMENTS][2];
+static struct qemu_plugin_register *g_xmm_handle[IR_X86_XMM_COUNT];
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
 static bool g_reg_read_error_reported[REG_COUNT];
@@ -940,6 +1032,8 @@ static struct {
     struct stat identity;
     uint8_t *bytes;
     uint32_t size;
+    uint64_t open_seq, open_boundary, descriptor_epoch;
+    uint32_t fd;
 } g_proc_executable;
 
 static bool proc_executable_same(const struct stat *a,const struct stat *b) {
@@ -953,18 +1047,21 @@ static void proc_executable_reset(void) {
     memset(&g_proc_executable,0,sizeof(g_proc_executable));
 }
 static void proc_executable_init(void) {
-    if (g_proc_executable.attempted || !g_ir_runtime.options.replay.observed_proc_exe ||
-        !g_main_image_path) return;
+    bool boundary = g_ir_runtime.options.replay.observed_proc_exe_boundary;
+    if (g_proc_executable.attempted ||
+        (!g_ir_runtime.options.replay.observed_proc_exe && !boundary) || !g_main_image_path) return;
     g_proc_executable.attempted=true;
     if (strlen(g_main_image_path)>=DSE_SYSCALL_PATH_BYTES) return;
     FILE *f=fopen(g_main_image_path,"rb");
     if (!f) return;
     struct stat before,after;
-    bool ok=fstat(fileno(f),&before)==0 && S_ISREG(before.st_mode) && before.st_size>=0 &&
-        (uint64_t)before.st_size<=DSE_EXECUTABLE_SNAPSHOT_BYTES;
-    size_t size=ok?(size_t)before.st_size:0;
+    bool ok=fstat(fileno(f),&before)==0 && S_ISREG(before.st_mode) && before.st_size>=0;
+    if (ok)
+        ok = boundary ? (uint64_t)before.st_size >= DSE_PROC_EXE_PAGE_BYTES :
+                        (uint64_t)before.st_size <= DSE_EXECUTABLE_SNAPSHOT_BYTES;
+    size_t size=ok?(boundary?DSE_PROC_EXE_PAGE_BYTES:(size_t)before.st_size):0;
     uint8_t *bytes=ok?g_try_malloc(size?size:1):NULL;
-    ok=ok && bytes && fread(bytes,1,size,f)==size && fgetc(f)==EOF && !ferror(f) &&
+    ok=ok && bytes && fread(bytes,1,size,f)==size && (boundary || fgetc(f)==EOF) && !ferror(f) &&
         fstat(fileno(f),&after)==0 && proc_executable_same(&before,&after);
     if (fclose(f)) ok=false;
     if (!ok) {g_free(bytes);return;}
@@ -2079,8 +2176,12 @@ static void dse_init_reg_handles(void) {
     g_eflags_handle_valid = false;
     g_es_state_handle = NULL;
     g_brk_state_handle = NULL;
+    g_sigmask_handle = NULL;
+    g_sigaction_handle = NULL;
+    g_tls_gdt_handle = NULL;
     g_es_state_handle_valid = false;
     memset(g_tls_handle, 0, sizeof(g_tls_handle));
+    memset(g_xmm_handle, 0, sizeof(g_xmm_handle));
     GArray *regs = qemu_plugin_get_registers();
     if (!regs) {
         fprintf(stderr, "[REG] failed to enumerate QEMU registers\n");
@@ -2101,6 +2202,15 @@ static void dse_init_reg_handles(void) {
         static const char *tls_names[DSE_TLS_SEGMENTS][2] = {{"fs_base", "fs"}, {"gs_base", "gs"}};
         if (descriptor->name && !strcmp(descriptor->name, "tf_brk_state_v1"))
             g_brk_state_handle = descriptor->handle;
+        if (descriptor->name && !strcmp(descriptor->name, "tf_i386_sigmask_v1"))
+            g_sigmask_handle = descriptor->handle;
+        if (descriptor->name && !strcmp(descriptor->name, "tf_i386_sigint_action_v1"))
+            g_sigaction_handle = descriptor->handle;
+        if (descriptor->name && !strcmp(descriptor->name, "tf_i386_tls_gdt_v1"))
+            g_tls_gdt_handle = descriptor->handle;
+        const char *name = descriptor->name;
+        if (name && g_str_has_prefix(name, "xmm") && name[3] >= '0' && name[3] <= '7' && !name[4])
+            g_xmm_handle[name[3] - '0'] = descriptor->handle;
         if (descriptor->name && !strcmp(descriptor->name, "tf_es_state_v1")) {
             g_es_state_handle = descriptor->handle;
             g_es_state_handle_valid = true;
@@ -2268,6 +2378,167 @@ static void dse_read_brk_state(InsnAux *aux, bool post) {
     uint32_t words[4];
     bool ok = dse_read_brk_words(words);
     dse_aux_syscall_brk_state(aux, words, ok, post);
+}
+
+static bool dse_read_register_words(struct qemu_plugin_register *handle,
+                                    uint32_t *words, unsigned count) {
+    if (!handle)
+        return false;
+    size_t size = count * sizeof(*words);
+    GByteArray *bytes = g_byte_array_sized_new(size);
+    bool valid = tf_qemu_read_register_exact(handle, bytes, size);
+    if (valid) {
+        memcpy(words, bytes->data, size);
+        for (unsigned i = 0; i < count; ++i)
+            words[i] = GUINT32_FROM_LE(words[i]);
+    }
+    g_byte_array_free(bytes, TRUE);
+    return valid;
+}
+
+static DseSigmaskSnapshot dse_read_sigmask(void) {
+    DseSigmaskSnapshot snapshot = {0};
+    uint32_t words[4];
+    if (dse_read_register_words(g_sigmask_handle, words, G_N_ELEMENTS(words)) &&
+        words[0] == DSE_SIGMASK_STATE_MAGIC && words[1] <= 1) {
+        snapshot.observed = true;
+        snapshot.no_pending = words[1] != 0;
+        snapshot.mask = (uint64_t)words[2] | (uint64_t)words[3] << 32;
+    }
+    return snapshot;
+}
+
+static void dse_read_sigprocmask(InsnAux *aux, bool post) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 175 || !g_ir_runtime.options.replay.observed_sigprocmask ||
+        s->args[0] != DSE_I386_SIG_UNBLOCK || !s->args[1] || s->args[2] ||
+        s->args[3] != sizeof(s->sigmask_set))
+        return;
+    if (post) {
+        if (s->returned && s->sigmask_before.observed)
+            s->sigmask_after = dse_read_sigmask();
+    } else {
+        uint64_t raw;
+        uint32_t address = s->args[1];
+        s->sigmask_before = dse_read_sigmask();
+        if ((uint64_t)address + sizeof(raw) <= (UINT64_C(1) << 32) &&
+            guest_read_bytes(address, (uint8_t *)&raw, sizeof(raw))) {
+            s->sigmask_set = GUINT64_FROM_LE(raw);
+            s->sigmask_set_valid = true;
+        }
+    }
+}
+
+static bool dse_read_guest_words(uint32_t address, uint32_t *words, unsigned count) {
+    uint8_t raw[DSE_TLS_SLOTS * 8U];
+    unsigned size = count * sizeof(*words);
+    if (size > sizeof(raw) || (uint64_t)address + size > (UINT64_C(1) << 32) ||
+        !guest_read_bytes(address, raw, size))
+        return false;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t word;
+        memcpy(&word, raw + i * sizeof(word), sizeof(word));
+        words[i] = GUINT32_FROM_LE(word);
+    }
+    return true;
+}
+
+static DseSigactionSnapshot dse_read_sigint_action(void) {
+    DseSigactionSnapshot snapshot = {0};
+    uint32_t words[8];
+    if (dse_read_register_words(g_sigaction_handle, words, G_N_ELEMENTS(words)) &&
+        words[0] == DSE_SIGACTION_STATE_MAGIC && words[1] == DSE_I386_SIGINT && words[7] == 0) {
+        memcpy(snapshot.words, &words[2], sizeof(snapshot.words));
+        snapshot.observed = true;
+    }
+    return snapshot;
+}
+
+static void dse_read_sigaction(InsnAux *aux, bool post) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 174 || !g_ir_runtime.options.replay.observed_sigaction ||
+        s->args[0] != DSE_I386_SIGINT || !s->args[1] || s->args[2] ||
+        s->args[3] != sizeof(s->sigmask_before.mask))
+        return;
+    if (post) {
+        if (s->returned && s->sigaction_before.observed) {
+            s->sigaction_after = dse_read_sigint_action();
+            s->sigmask_after = dse_read_sigmask();
+        }
+    } else {
+        s->sigaction_before = dse_read_sigint_action();
+        s->sigmask_before = dse_read_sigmask();
+        s->sigaction_input.observed = dse_read_guest_words(s->args[1], s->sigaction_input.words,
+                                                          DSE_SIGACTION_WORDS);
+    }
+}
+
+static uint32_t dse_read_tls_gdt_base(void) {
+    if (!g_tls_gdt_handle)
+        return 0;
+    uint32_t base = 0;
+    GByteArray *bytes = g_byte_array_new();
+    if (tf_qemu_read_register_exact(g_tls_gdt_handle, bytes, sizeof(base)))
+        memcpy(&base, bytes->data, sizeof(base));
+    g_byte_array_free(bytes, TRUE);
+    base = GUINT32_FROM_LE(base);
+    return (base & 4095U) ? 0 : base;
+}
+
+static void dse_read_tls_install(InsnAux *aux, bool post) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 243 || !g_ir_runtime.options.replay.observed_set_thread_area)
+        return;
+    DseTlsSnapshot *snapshot = post ? &s->tls_after : &s->tls_before;
+    uint32_t gdt = dse_read_tls_gdt_base();
+    snapshot->gdt_base = gdt;
+    if (!gdt || !dse_read_guest_words(s->args[0], snapshot->user_desc, 4))
+        return;
+    for (unsigned i = 0; i < DSE_TLS_SLOTS; ++i)
+        if (!dse_read_guest_words(gdt + (DSE_TLS_FIRST_SLOT + i) * 8U, snapshot->slot[i], 2))
+            return;
+    for (unsigned i = 0; i < DSE_TLS_SEGMENTS; ++i)
+        if (!dse_read_tls(i, &snapshot->base[i], &snapshot->selector[i]) ||
+            snapshot->selector[i] > UINT16_MAX)
+            return;
+    snapshot->valid = true;
+}
+
+static void dse_read_gs_load(InsnAux *aux, const TraceEntry *entry, bool post) {
+    if (!g_ir_enabled || !is_i386 || !g_ir_runtime.options.replay.observed_mov_gs || !entry)
+        return;
+    RegId source = dse_x86_mov_gs_source(entry);
+    if (source == REG_INVALID || !(aux->reg_value_valid_mask & (1U << source)))
+        return;
+    uint32_t offset = dse_x86_tls_gdt_offset((uint16_t)aux->reg_vals[source]);
+    if (!offset || (post && !aux->gs_load.before_valid))
+        return;
+    uint32_t gdt = dse_read_tls_gdt_base();
+    if (!gdt)
+        return;
+    if (post) {
+        aux->gs_load.after_valid = gdt == aux->gs_load.gdt_base &&
+            dse_read_guest_words(gdt + offset, aux->gs_load.after, 2);
+    } else {
+        aux->gs_load.gdt_base = gdt;
+        aux->gs_load.before_valid = dse_read_guest_words(gdt + offset, aux->gs_load.before, 2);
+    }
+}
+
+static void dse_read_xmm_after(InsnAux *aux) {
+    DseXmmObservation *observation = &aux->xmm_after;
+    unsigned xmm = observation->slot - 1U;
+    if (!aux->execution_complete || xmm >= IR_X86_XMM_COUNT || !g_xmm_handle[xmm])
+        return;
+    uint64_t words[2];
+    GByteArray *bytes = g_byte_array_sized_new(sizeof(words));
+    if (tf_qemu_read_register_exact(g_xmm_handle[xmm], bytes, sizeof(words))) {
+        memcpy(words, bytes->data, sizeof(words));
+        observation->low = GUINT64_FROM_LE(words[0]);
+        observation->high = GUINT64_FROM_LE(words[1]);
+        observation->valid = true;
+    }
+    g_byte_array_free(bytes, TRUE);
 }
 
 static uint32_t dse_read_register_snapshot(uint64_t values[REG_COUNT]) {
@@ -2914,6 +3185,46 @@ static bool stage_self_fd(int32_t fd) {
     return fd >= 3 && fd < 64 && g_stage_self_fd_epoch[fd] != 0;
 }
 
+/* Only operations that preserve this descriptor lifetime are admitted.
+ * Anything else revokes the certificate until another verified self-open. */
+static void proc_executable_syscall(int64_t number, uint32_t first) {
+    if (!g_proc_executable.open_seq) return;
+    switch (number) {
+    case 4: case 6: case 19: case 93:
+        if (first == g_proc_executable.fd) g_proc_executable.open_seq = 0;
+        break;
+    case 45: case 85: case 90: case 91: case 125: case 144: case 192: case 356:
+        break;
+    default:
+        g_proc_executable.open_seq = 0;
+        break;
+    }
+}
+
+static void proc_executable_track_open(const TraceEntry *entry, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (dse_aux_open_executable_issue(entry, aux) || !stage_self_fd((int32_t)s->result) ||
+        g_stage_self_fd_epoch[s->result] != g_stage_syscall_ordinal ||
+        !proc_executable_current()) return;
+    g_proc_executable.fd = s->result;
+    g_proc_executable.open_seq = s->seq_id;
+    g_proc_executable.open_boundary = s->boundary_id;
+    g_proc_executable.descriptor_epoch = g_stage_syscall_ordinal;
+}
+
+static void proc_executable_capture_mmap(InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (!g_proc_executable.open_seq || !dse_aux_executable_mmap_shape(s) ||
+        s->args[4] != g_proc_executable.fd || !stage_self_fd((int32_t)s->args[4]) ||
+        g_stage_self_fd_epoch[s->args[4]] != g_proc_executable.descriptor_epoch ||
+        g_proc_executable.size < DSE_PROC_EXE_PAGE_BYTES || !proc_executable_current()) return;
+    uint8_t page[DSE_PROC_EXE_PAGE_BYTES];
+    if (guest_read_bytes(s->result, page, sizeof(page)) &&
+        !memcmp(page, g_proc_executable.bytes, sizeof(page)))
+        (void)dse_aux_syscall_executable_mmap(g_aux, aux, g_main_image_object_id,
+            g_proc_executable.open_seq, g_proc_executable.open_boundary, page);
+}
+
 static void stage_bind_open_descriptor(int32_t fd, const char *path, uint32_t flags,
                                        uint64_t ordinal) {
     if (fd < 0 || fd >= 64)
@@ -2937,6 +3248,65 @@ static unsigned stage_memfd_file(int32_t fd) {
         return 0;
     unsigned file = g_stage_memfd_file[fd];
     return file && file < 32 && g_stage_memfd_files[file].valid ? file : 0;
+}
+
+/* The certificate is deliberately limited to a fresh file and the first
+ * three syscall boundaries: create, resize and the single shared view. */
+static void memfd_boundary_prepare(const TraceEntry *entry, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (!s || !s->boundary_ordered || s->boundary_id != g_stage_syscall_ordinal) return;
+    if (s->boundary_id == 1 && s->number == 356 &&
+        (s->args[1] == 16 || s->args[1] == 17) && !dse_aux_memfd_issue(entry, aux) &&
+        stage_memfd_file((int32_t)s->result) && g_stage_memfd_fd_epoch[s->result] == 1) {
+        g_memfd_boundary = (DseMemfdBoundary){
+            .create_seq = s->seq_id, .fd = s->result, .flags = s->args[1]};
+    } else if (g_memfd_boundary.create_seq && s->boundary_id == 2 && s->number == 93 &&
+               s->args[0] == g_memfd_boundary.fd && !s->result &&
+               s->args[1] && s->args[1] <= DSE_MEMFD_BOUNDARY_PAGE_BYTES &&
+               !dse_aux_ftruncate_issue(entry, aux)) {
+        g_memfd_boundary.resize_seq = s->seq_id;
+        g_memfd_boundary.size = s->args[1];
+    } else if (g_memfd_boundary.resize_seq && s->boundary_id == 3 &&
+               (s->number == 90 || s->number == 192)) {
+        uint32_t map[6];
+        if (dse_aux_ir_mmap_issue(entry, aux, map) || map[0] || map[1] != g_memfd_boundary.size ||
+            map[2] != 3 || map[3] != 1 || map[4] != g_memfd_boundary.fd || map[5] || !s->result) return;
+        g_memfd_boundary.mmap_seq = s->seq_id;
+        g_memfd_boundary.address = s->result;
+    }
+}
+
+static void memfd_boundary_before_write(InsnAux *aux) {
+    DseSyscallObservation *s = aux->syscall;
+    const DseMemfdBoundary *seed = &g_memfd_boundary;
+    if (!seed->mmap_seq || s->boundary_id != DSE_MEMFD_BOUNDARY_WRITE_ORDINAL ||
+        g_stage_syscall_ordinal != s->boundary_id || !s->write_valid ||
+        s->args[0] != seed->fd || s->args[2] != seed->size ||
+        page_size != DSE_MEMFD_BOUNDARY_PAGE_BYTES) return;
+    uint64_t end = (uint64_t)seed->address + DSE_MEMFD_BOUNDARY_PAGE_BYTES;
+    uint64_t source_end = (uint64_t)s->args[1] + seed->size;
+    if (source_end > (UINT64_C(1) << 32) || (s->args[1] < end && seed->address < source_end)) return;
+    unsigned file = stage_memfd_file((int32_t)seed->fd);
+    const page_t *page = pages ? g_hash_table_lookup(pages, (gpointer)(uintptr_t)seed->address) : NULL;
+    if (!file || !page || page->mapping_epoch != 3 || page->descriptor_epoch != 1 ||
+        page->backing_kind != file + 2 || !page->backing_shared || page->backing_offset ||
+        page->prot != 3 || page->write_count || g_stage_memfd_files[file].tail_dirty ||
+        g_stage_memfd_files[file].size != seed->size || g_stage_memfd_cursor[seed->fd]) return;
+    uint8_t observed[DSE_MEMFD_BOUNDARY_PAGE_BYTES];
+    if (!guest_read_bytes(seed->address, observed, sizeof(observed)) ||
+        memcmp(observed, zero_memfd_page, sizeof(observed))) return;
+    s->memfd_boundary = *seed;
+    s->memfd_boundary.write_seq = s->seq_id;
+}
+
+static void memfd_boundary_after_write(DseSyscallObservation *s) {
+    DseMemfdBoundary *seed = &s->memfd_boundary;
+    if (!seed->write_seq || s->invalid || !s->returned || s->result != seed->size ||
+        !s->write_values || s->write_size != seed->size) return;
+    uint8_t observed[DSE_MEMFD_BOUNDARY_PAGE_BYTES];
+    seed->verified = guest_read_bytes(seed->address, observed, sizeof(observed)) &&
+        !memcmp(observed, s->write_values, seed->size) &&
+        !memcmp(observed + seed->size, zero_memfd_page, sizeof(observed) - seed->size);
 }
 
 static bool stage_memfd_live_mapping(unsigned file) {
@@ -5484,6 +5854,7 @@ static void phase1_release_owned(void) {
         for (unsigned i = 0; i < 256; ++i)
             g_clear_pointer(&g_stage_memfd_files[file].store_pages[i], page_destroy);
     memset(g_stage_memfd_files, 0, sizeof(g_stage_memfd_files));
+    g_memfd_boundary = (DseMemfdBoundary){0};
 
     //fd
     g_clear_pointer(&pending_open_path, g_free);
@@ -5754,7 +6125,20 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         dse_aux_syscall_post_flags(previous_aux, current_eflags,
                                    current_eflags_valid && g_x86_flags_verified);
         dse_read_brk_state(previous_aux, true);
+        dse_read_tls_install(previous_aux, true);
+        dse_read_sigprocmask(previous_aux, true);
+        dse_read_sigaction(previous_aux, true);
+        if (previous_aux->gs_load.before_valid)
+            dse_read_gs_load(previous_aux, trace_find_seq(g_trace, previous_aux_seq_id, NULL), true);
+        if (previous_aux->xmm_after.slot)
+            dse_read_xmm_after(previous_aux);
         dse_aux_syscall_seal_order(g_aux, previous_aux);
+        if (g_ir_runtime.options.replay.observed_memfd_boundary && g_stage_syscall_ordinal <= 3 &&
+            previous_aux->syscall)
+            memfd_boundary_prepare(trace_find_seq(g_trace, previous_aux_seq_id, NULL), previous_aux);
+        if (g_ir_runtime.options.replay.observed_proc_exe_boundary && previous_aux->syscall &&
+            previous_aux->syscall->number == 5)
+            proc_executable_track_open(trace_find_seq(g_trace, previous_aux_seq_id, NULL), previous_aux);
         if (previous_aux->syscall && previous_aux->syscall->number == 45 &&
             !dse_aux_brk_issue(trace_find_seq(g_trace, previous_aux_seq_id, NULL), previous_aux)) {
             const DseSyscallObservation *brk = previous_aux->syscall;
@@ -5950,6 +6334,15 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 dse_aux_carry_x86_df(&aux, stored_entry, g_trace, previous_aux);
             if (g_ir_enabled && is_i386 && g_ir_runtime.options.replay.x86.tls32_ram)
                 dse_read_tls_snapshot(&aux);
+            dse_read_gs_load(&aux, stored_entry, false);
+            unsigned xmm;
+            const IrX86Options *x86 = &g_ir_runtime.options.replay.x86;
+            if (g_ir_enabled && is_i386 &&
+                ((x86->movq_xmm_memory &&
+                  ir_x86_movq_memory(stored_entry->instr_bytes, stored_entry->size, &xmm) == IR_X86_MOVQ_LOAD) ||
+                 (x86->sse2_dwords &&
+                  ir_x86_sse2_dword_form(stored_entry->instr_bytes, stored_entry->size, &xmm) != IR_X86_SSE2_DWORD_NONE)))
+                aux.xmm_after.slot = (uint8_t)(xmm + 1U);
             {
                 TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_AUX_RECORD);
                 for (int reg = 0; reg < REG_COUNT; reg++) {
@@ -6413,6 +6806,67 @@ static void apply_pending_fd_success(int64_t syscall_num, int64_t syscall_ret) {
     }
 }
 
+/* Linux-user forwards these descriptors to the host. Independently sample
+ * the input bytes without moving the file offset. The return callback must
+ * see the same file, the exact offset change and the same bytes in guest RAM. */
+static void stdio_observe_entry(DseSyscallObservation *s) {
+    bool reading = s->number == 3 && s->args[0] == STDIN_FILENO;
+    bool closing = s->number == 6 && s->args[0] == STDOUT_FILENO;
+    if (!reading && !closing)
+        return;
+    int saved_errno = errno;
+    int fd = (int)s->args[0];
+    struct stat st;
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0 && (flags & O_ACCMODE) == (reading ? O_RDONLY : O_WRONLY) &&
+        fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0) {
+        DseStdioObservation *io = &s->stdio;
+        io->device = (uint64_t)st.st_dev;
+        io->inode = (uint64_t)st.st_ino;
+        io->file_size = (uint64_t)st.st_size;
+        if (closing) {
+            io->before_valid = true;
+        } else {
+            off_t offset = lseek(fd, 0, SEEK_CUR);
+            uint32_t requested = s->args[2];
+            if (offset >= 0 && offset <= st.st_size && requested && requested <= INT32_MAX &&
+                s->args[1] && (uint64_t)s->args[1] + requested <= (UINT64_C(1) << 32)) {
+                uint64_t remaining = (uint64_t)(st.st_size - offset);
+                uint64_t length = remaining < requested ? remaining : requested;
+                if (length <= sizeof(io->bytes) &&
+                    (!length || pread(fd, io->bytes, length, offset) == (ssize_t)length)) {
+                    io->length = (uint32_t)length;
+                    io->offset = (uint64_t)offset;
+                    io->before_valid = true;
+                }
+            }
+        }
+    }
+    errno = saved_errno;
+}
+
+static void stdio_observe_return(DseSyscallObservation *s) {
+    DseStdioObservation *io = &s->stdio;
+    if (!io->before_valid || !s->returned || s->invalid)
+        return;
+    int saved_errno = errno;
+    int fd = (int)s->args[0];
+    if (s->number == 6) {
+        io->after_valid = s->result == 0 && fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+    } else if (s->result == io->length) {
+        struct stat st;
+        uint8_t reply[DSE_STDIO_MAX_BYTES];
+        off_t offset = lseek(fd, 0, SEEK_CUR);
+        io->after_valid = offset >= 0 && (uint64_t)offset == io->offset + io->length &&
+            fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+            (uint64_t)st.st_dev == io->device && (uint64_t)st.st_ino == io->inode &&
+            (uint64_t)st.st_size == io->file_size &&
+            (!io->length || (guest_read_bytes(s->args[1], reply, io->length) &&
+                             memcmp(io->bytes, reply, io->length) == 0));
+    }
+    errno = saved_errno;
+}
+
 static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1,
                               uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
                               uint64_t a7, uint64_t a8) {
@@ -6428,6 +6882,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         return;
     }
     ++g_stage_syscall_ordinal;
+    proc_executable_syscall(num, (uint32_t)a1);
     /* Read-only self-open and a tracked close do not modify guest code. A
      * narrow exact pathname check includes its NUL without over-reading. */
     bool safe_msync = stage_preserve_msync_owner(num, a1, a2, a3);
@@ -6495,6 +6950,14 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
                 state->syscall_seq_id = entry->seq_id;
                 if (num == 45)
                     dse_aux_syscall_brk_state(aux, state->brk_entry_words, state->brk_entry_valid, false);
+                if (num == 243)
+                    dse_read_tls_install(aux, false);
+                if (num == 175)
+                    dse_read_sigprocmask(aux, false);
+                if (num == 174)
+                    dse_read_sigaction(aux, false);
+                if (g_ir_runtime.options.replay.observed_stdio)
+                    stdio_observe_entry(aux->syscall);
                 if (num == 4) {
                     uint32_t size = (uint32_t)a3;
                     uint8_t *bytes = size && size <= DSE_SYSCALL_WRITE_BYTES ? g_try_malloc(size) : NULL;
@@ -6502,6 +6965,8 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
                         (uint64_t)(uint32_t)a2 + size <= (UINT64_C(1) << 32) &&
                         guest_read_bytes((uint32_t)a2, bytes, size));
                     (void)dse_aux_syscall_write(g_aux, aux, read ? bytes : NULL, size);
+                    if (g_ir_runtime.options.replay.observed_memfd_boundary)
+                        memfd_boundary_before_write(aux);
                     g_free(bytes);
                 }
                 if (num == 90) {
@@ -6511,7 +6976,9 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
                     (void)dse_aux_syscall_mmap_args(aux, read ? bytes : NULL,
                                                    read ? sizeof(bytes) : 0);
                 }
-                if ((num == 5 || num == 85) && g_ir_runtime.options.replay.observed_proc_exe) {
+                bool full_executable = g_ir_runtime.options.replay.observed_proc_exe;
+                if ((full_executable && (num == 5 || num == 85)) ||
+                    (num == 5 && g_ir_runtime.options.replay.observed_proc_exe_boundary)) {
                     uint8_t path[DSE_SYSCALL_PATH_BYTES];size_t size=0;
                     for (size_t i=0;i<sizeof(path);++i) {
                         uint64_t address=(uint64_t)(uint32_t)a1+i;
@@ -7022,6 +7489,12 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
             } else if (aux && aux->syscall) {
                 aux->syscall->invalid = true;
             }
+            if (aux && aux->syscall && g_ir_runtime.options.replay.observed_stdio)
+                stdio_observe_return(aux->syscall);
+            if (aux && num == 192 && g_ir_runtime.options.replay.observed_proc_exe_boundary)
+                proc_executable_capture_mmap(aux);
+            if (aux && aux->syscall && num == 4 && g_ir_runtime.options.replay.observed_memfd_boundary)
+                memfd_boundary_after_write(aux->syscall);
             if (aux && aux->syscall && aux->syscall->file && (num==5 || num==85)) {
                 if (!proc_executable_current()) aux->syscall->file->source_valid=false;
                 if (num==85) {
