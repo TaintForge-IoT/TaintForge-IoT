@@ -122,6 +122,7 @@ class SynthesisLoopTests(unittest.TestCase):
             "scripts/generate_report.py",
             "scripts/start_network_emulator.py",
             "scripts/start_transparent_logger.py",
+            "scripts/run_network_guard.py",
         ):
             path = self.project / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -319,7 +320,7 @@ class SynthesisLoopTests(unittest.TestCase):
             runner_factory=FakeRunnerFactory(),
         )
         loop.run()
-        for name in ("start_network_emulator.py", "start_transparent_logger.py"):
+        for name in ("start_network_emulator.py", "start_transparent_logger.py", "run_network_guard.py"):
             with self.subTest(script=name):
                 script = self.project / "scripts" / name
                 original = script.read_bytes()

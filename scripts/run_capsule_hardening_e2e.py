@@ -17,7 +17,7 @@ def launch_case(qemu, plugin, entry, out, extra=()):
     p.write_json(goal,{'schema_version':1,'goal_id':'m4-complete','description':'Benign guest output',
         'mode':'all','rules':[{'id':'stdout','type':'text_contains','source':'stdout',
                              'needle':entry['expected_stdout'] or 'M3_INPUT_OK\n','min_count':1}]})
-    options=unified_parser().parse_args(['run','--retire-phase1','--capsule-hardening',
+    options=unified_parser().parse_args(['run','--retire-phase1','--analysis-policy','research','--capsule-hardening',
         '--binary',entry['path'],'--qemu',str(qemu),'--plugin',str(plugin),'--out',str(out),
         '--target-spec',str(goal),'--max-iterations','1',*extra])
     launch=prepare(options)

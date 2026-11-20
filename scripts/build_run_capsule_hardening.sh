@@ -39,6 +39,12 @@ tf_m4_plugin="$tf_m4_build/libtaintforge_ir.so"
 export TF_QEMU_INCLUDE="$PWD/experiments/execution_capsule_probe/vendor"
 export TF_OBSERVER_QEMU="$tf_m4_qemu"
 bash unpacker/test/build_group7_4c1_plugin.sh unpacker/test "$tf_m4_plugin" 2>&1 | tee "$tf_m4_out/validation/build.log"
+python3 -m scripts.check_phase1_m4_build --plugin "$tf_m4_plugin" \
+    --out "$tf_m4_out/validation/phase1-m4-build.json" 2>&1 | tee "$tf_m4_out/validation/phase1-m4-build.log"
+python3 -m unittest -v tests.test_phase1_m4_build 2>&1 | tee "$tf_m4_out/validation/phase1-m4-build-tests.log"
+bash unpacker/mvp/run_backend_tests.sh "$PWD" "$tf_m4_out/validation" 2>&1 | tee "$tf_m4_out/validation/phase1-native.log"
+python3 -m scripts.validate_phase1_runtime --qemu "$tf_m4_qemu" --plugin "$tf_m4_plugin" \
+    --analysis-memory-mib 512 --out "$tf_m4_out/phase1-runtime" 2>&1 | tee "$tf_m4_out/validation/phase1-runtime.log"
 python3 -m scripts.run_input_retirement_tests --out "$tf_m4_out/validation/tests.json" 2>&1 | tee "$tf_m4_out/validation/tests.log"
 python3 -m scripts.run_capsule_hardening_tests --out "$tf_m4_out/validation/m4-tests.json" 2>&1 | tee "$tf_m4_out/validation/m4-tests.log"
 python3 -m scripts.probe_linux_user_fd --qemu "$tf_m4_qemu" --out "$tf_m4_out/fd-probe"

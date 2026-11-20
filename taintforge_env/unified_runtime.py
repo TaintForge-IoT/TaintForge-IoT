@@ -100,12 +100,16 @@ def check_runtime_inputs(project_root: Path, *, qemu: str | Path | None = None,
             "qemu_plugin_load": "not_tested"}
 
 
-def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: dict | None = None) -> dict:
+def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: dict | None = None,
+                 network_observer: Path | None = None, flags_receipt: Path | None = None) -> dict:
     """Copy a glibc host-QEMU/plugin DT_NEEDED closure without running the guest."""
     _, Phase1Runtime, _ = phase1_api()
     qemu, plugin = qemu.resolve(strict=True), plugin.resolve(strict=True)
     runtime = Phase1Runtime.load(plugin)
-    runtime.validate_qemu(qemu)
+    qemu_identity = runtime.validate_qemu(qemu)
+    if flags_receipt is not None:
+        from .capsule_strict import read_receipt
+        receipt_data = read_receipt(flags_receipt, qemu_identity['sha256'])
     host_arch = canonical_arch(platform.machine())
     if host_arch not in {"x86_64", "i386"}:
         raise UnifiedRuntimeError("the initial unified runner supports x86 Linux glibc hosts")
@@ -117,6 +121,12 @@ def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: 
         raise UnifiedRuntimeError("the initial host runtime bundle requires the glibc ELF loader")
     resolver = DependencyResolver(Path("/"), host_arch)
     roots = [(qemu, str(qemu)), (plugin, str(plugin))]
+    observer_metadata = None
+    if network_observer is not None:
+        from .network_observer import validate_observer
+        network_observer = network_observer.resolve(strict=True)
+        observer_metadata = validate_observer(network_observer)
+        roots.append((network_observer, str(network_observer)))
     capsule_plugin = Path(capsule_probe["plugin"]).resolve(strict=True) if capsule_probe else None
     lifecycle_plugin = (Path(capsule_probe["lifecycle_plugin"]).resolve(strict=True)
                         if capsule_probe and "lifecycle_plugin" in capsule_probe else None)
@@ -137,6 +147,8 @@ def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: 
             relative = "bin/qemu-i386"
         elif source == plugin:
             relative = f"plugin/{plugin.name}"
+        elif source == network_observer:
+            relative = f"network/{network_observer.name}"
         elif source == capsule_plugin:
             relative = ("capsule/libretirement_observer.so" if
                         capsule_probe.get("profile") == "input-static-i386-retirement-m3"
@@ -157,6 +169,14 @@ def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: 
                 "target_arch": "i386", "qemu": "bin/qemu-i386", "loader": "bin/loader",
                 "plugin": f"plugin/{plugin.name}", "build_id": runtime.build_id,
                 "plugin_api": runtime.plugin_api, "files": sorted(inventory.values(), key=lambda item: item["path"])}
+    if network_observer is not None:
+        metadata_path = Path(str(network_observer) + ".observer.json")
+        relative = f"network/{metadata_path.name}"
+        copied = copy_file(metadata_path, destination / relative)
+        inventory[relative] = {"path": relative, "sha256": copied, "size": metadata_path.stat().st_size}
+        manifest["network_observer"] = {"plugin": f"network/{network_observer.name}", "manifest": relative,
+            "build_id": observer_metadata["build_id"], "plugin_api": observer_metadata["plugin_api"]}
+        manifest["files"] = sorted(inventory.values(), key=lambda item: item["path"])
     if capsule_probe is not None:
         from .execution_capsule import bundle_profile
         profile = bundle_profile(capsule_probe)
@@ -166,6 +186,13 @@ def build_bundle(destination: Path, *, qemu: Path, plugin: Path, capsule_probe: 
             inventory[profile["fixture"]] = {"path": profile["fixture"], "sha256": digest, "size": fixture.stat().st_size}
         manifest["capsule"] = profile
         manifest["files"] = sorted(inventory.values(), key=lambda item: item["path"])
+    if flags_receipt is not None:
+        from .capsule_strict import RECEIPT
+        receipt_hash = hashlib.sha256(receipt_data).hexdigest()
+        copy_file(Path(flags_receipt), destination/RECEIPT, expected=receipt_hash)
+        manifest['flags_receipt'] = RECEIPT
+        inventory[RECEIPT] = {'path': RECEIPT, 'sha256': receipt_hash, 'size': len(receipt_data)}
+        manifest['files'] = sorted(inventory.values(), key=lambda item: item['path'])
     manifest["bundle_sha256"] = canonical_hash(manifest)
     write_json(destination / "bundle.json", manifest)
     return verify_bundle(destination, manifest["bundle_sha256"])
@@ -214,6 +241,11 @@ def verify_bundle(directory: Path, expected: str | None = None) -> dict:
     for role in ("qemu", "loader", "plugin"):
         if manifest.get(role) not in names:
             raise UnifiedRuntimeError(f"analyzer bundle lacks {role}")
+    if 'flags_receipt' in manifest:
+        from .capsule_strict import RECEIPT, digest, read_receipt
+        if manifest['flags_receipt'] != RECEIPT or RECEIPT not in names:
+            raise UnifiedRuntimeError('Invalid bound EFLAGS receipt path')
+        read_receipt(directory/RECEIPT, digest(directory/manifest['qemu']))
     _, Phase1Runtime, _ = phase1_api()
     runtime = Phase1Runtime.load(directory / manifest["plugin"])
     if runtime.build_id != manifest.get("build_id") or runtime.plugin_api != manifest.get("plugin_api"):
@@ -221,6 +253,16 @@ def verify_bundle(directory: Path, expected: str | None = None) -> dict:
     if "capsule" in manifest:
         from .execution_capsule import verify_profile
         verify_profile(manifest)
+    if "network_observer" in manifest:
+        from .network_observer import validate_observer
+        observer = manifest["network_observer"]
+        if (not isinstance(observer, dict) or observer.get("plugin") not in names
+                or observer.get("manifest") != str(observer.get("plugin")) + ".observer.json"
+                or observer.get("manifest") not in names):
+            raise UnifiedRuntimeError("invalid bound network observer inventory")
+        metadata = validate_observer(directory / observer["plugin"])
+        if metadata["build_id"] != observer.get("build_id") or metadata["plugin_api"] != observer.get("plugin_api"):
+            raise UnifiedRuntimeError("network observer build identity mismatch")
     return manifest
 
 
@@ -239,8 +281,10 @@ def prepare_attempt(context, temporary: Path) -> dict:
     options = json.loads(context.template_runtime_path.read_text())["phase1"].get("options", [])
     if not isinstance(options, list) or not all(isinstance(option, str) for option in options):
         raise UnifiedRuntimeError("phase1 options must be a list of strings")
+    receipt = destination/manifest['flags_receipt'] if 'flags_receipt' in manifest else None
     analysis = Phase1Run(runtime, context.session.session_id, context.attempt_contract.attempt_id,
-                         "phase1-" + context.attempt_contract.attempt_id, temporary / "logs" / "phase1")
+                         "phase1-" + context.attempt_contract.attempt_id, temporary / "logs" / "phase1",
+                         require_flags=receipt is not None, flags_receipt=receipt)
     argument = analysis.plugin_argument(extra=tuple(options))
     parts = argument.split(",")
     parts[0] = GUEST_TOOL_DIR + "/" + manifest["plugin"]
@@ -249,6 +293,8 @@ def prepare_attempt(context, temporary: Path) -> dict:
         key, sep, path = value.partition("=")
         if key in {"tf-events", "tf-manifest", "tf-dump", "tf-report", "tf-ir-report"}:
             parts[index] = key + sep + str(context.run_dir / Path(path).relative_to(temporary))
+        elif key == 'x86-flags-receipt':
+            parts[index] = key+'='+GUEST_TOOL_DIR+'/'+manifest['flags_receipt']
     binding = {"schema_version": 1, "session_id": analysis.session_id, "attempt_id": analysis.attempt_id,
                "analysis_instance_id": analysis.analysis_instance_id,
                "attempt_contract_sha256": context.attempt_contract.contract_sha256,
@@ -256,6 +302,16 @@ def prepare_attempt(context, temporary: Path) -> dict:
                "plugin_argument": ",".join(parts), "output_directory": str(context.run_dir / "logs" / "phase1"),
                "control_channel_protection": "unverified", "process_checkpoint": False,
                "execution_model": "original_elf_one_qemu_process_per_attempt"}
+    if "network_observer" in manifest:
+        from .network_observer import plugin_argument
+        (temporary / "logs/network_endpoints").mkdir(mode=0o700)
+        directory = context.run_dir / "logs/network_endpoints"
+        binding["network_observer"] = {
+            "build_id": manifest["network_observer"]["build_id"],
+            "output_directory": str(directory), "events": str(directory / "events.jsonl"),
+            "plugin_argument": plugin_argument(GUEST_TOOL_DIR + "/" + manifest["network_observer"]["plugin"],
+                directory / "events.jsonl", analysis.session_id, analysis.attempt_id),
+        }
     write_json(temporary / "config" / "phase1_binding.json", binding)
     if "capsule" in manifest:
         from .execution_capsule import prepare_binding
@@ -390,11 +446,19 @@ mount -o remount,bind,ro {quote(str(tool_mount))}
     for path in reversed(created):
         cleanup += f"rmdir {quote(str(path))} >/dev/null 2>&1 || true\n"
     cleanup += f"umount -l {quote(str(tool_mount))} >/dev/null 2>&1 || true\nrmdir {quote(str(tool_mount))} >/dev/null 2>&1 || true"
+    observer_argument = ""
+    if "network_observer" in binding:
+        from .network_observer import mount_fragments
+        observer_setup, observer_cleanup = mount_fragments(root,
+            Path(binding["network_observer"]["output_directory"]), created)
+        setup += observer_setup
+        cleanup = observer_cleanup + "\n" + cleanup
+        observer_argument = " -plugin " + quote(binding["network_observer"]["plugin_argument"])
     execution = f"""timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \\
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \\
     chroot "$ROOTFS" {GUEST_TOOL_DIR}/bin/loader --inhibit-cache \\
     --library-path {GUEST_TOOL_DIR}/lib "$QEMU_GUEST" -L / -strace \\
-    -plugin {quote(binding['plugin_argument'])} {guest_env} "$GUEST_BINARY" \\
+    -plugin {quote(binding['plugin_argument'])}{observer_argument} {guest_env} "$GUEST_BINARY" \\
     2> >(tee "$QEMU_TRACE" >&2)"""
     if (temporary / "config/capsule_binding.json").is_file():
         from .execution_capsule import sandbox_fragments as capsule_fragments

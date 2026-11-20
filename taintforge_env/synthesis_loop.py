@@ -72,11 +72,14 @@ class SynthesisLoopConfig:
     max_steps: int = 1
     adopt_existing_session: bool = False
     initialize_only: bool = False
+    network_repair_policy_path: Path | None = None
 
     def __post_init__(self) -> None:
         self.session_dir = Path(self.session_dir).resolve(strict=False)
         self.template_run_dir = Path(self.template_run_dir).resolve(strict=False)
         self.project_root = Path(self.project_root).resolve(strict=False)
+        if self.network_repair_policy_path is not None:
+            self.network_repair_policy_path = Path(self.network_repair_policy_path).absolute()
         if self.snapshot_store is not None:
             self.snapshot_store = Path(self.snapshot_store).resolve(strict=False)
         if self.seed_rootfs is not None:
@@ -509,6 +512,11 @@ class EnvironmentSynthesisLoop:
             binding.get("analysis_stack_sha256"),
             "analysis stack",
         )
+        from .network_repair import bound_policy, NetworkRepairError
+        try:
+            authorization = bound_policy(session)
+        except (NetworkRepairError, OSError) as exc:
+            raise SynthesisLoopError(str(exc)) from exc
 
         target_spec_path = binding.get("target_spec_path")
         if target_spec_path is not None:
@@ -537,6 +545,7 @@ class EnvironmentSynthesisLoop:
                         / "network_policy.json"
                     ),
                     replay_store=ReplayStore(replay_store_path),
+                    allow_empty=authorization is not None,
                 )
             except (
                 NetworkReplayError,
@@ -679,6 +688,23 @@ class EnvironmentSynthesisLoop:
         replay_store_path = self._effective_replay_store_path()
         replay_store_sha256: str | None = None
         replay_store_entries: int | None = None
+        authorization = None
+        authorization_path = self.config.network_repair_policy_path
+        if authorization_path is None and self.binding_path.is_file():
+            previous = _load_json_object(self.binding_path, "synthesis loop manifest")
+            if previous.get("network_repair_policy_path"):
+                authorization_path = Path(previous["network_repair_policy_path"])
+        if authorization_path is not None:
+            from .network_repair import NetworkRepairPolicy, NetworkRepairError
+            try:
+                authorization = NetworkRepairPolicy.load(authorization_path)
+                if authorization.mode != self.config.network_mode:
+                    raise NetworkRepairError("network repair policy mode must match the execution mode")
+                authorization.verify_store()
+                if authorization.mode == "replay" and authorization.store_path != replay_store_path:
+                    raise NetworkRepairError("network repair policy must authorize the selected replay store")
+            except (NetworkRepairError, OSError) as exc:
+                raise SynthesisLoopError(str(exc)) from exc
         if self.config.network_mode == "replay":
             if replay_store_path is None:
                 raise SynthesisLoopError(
@@ -692,6 +718,7 @@ class EnvironmentSynthesisLoop:
                         / "network_policy.json"
                     ),
                     replay_store=ReplayStore(replay_store_path),
+                    allow_empty=authorization is not None,
                 )
             except (
                 NetworkReplayError,
@@ -745,6 +772,8 @@ class EnvironmentSynthesisLoop:
             "replay_store_sha256": replay_store_sha256,
             "replay_store_entries": replay_store_entries,
             "allow_internet": False,
+            "network_repair_policy_path": str(authorization.path) if authorization else None,
+            "network_repair_policy_sha256": authorization.sha256 if authorization else None,
             "qemu_required_supported": True,
         }
 
@@ -824,6 +853,8 @@ class EnvironmentSynthesisLoop:
             "replay": ("scripts/start_network_replay.py",),
             "record": ("scripts/start_network_record.py",),
         }[self.config.network_mode]
+        if self.config.network_mode != "none":
+            network_scripts = (*network_scripts, "scripts/run_network_guard.py")
         for relative in (*self.REQUIRED_PROJECT_SCRIPTS, *network_scripts):
             path = self.config.project_root / relative
             _validate_regular_file(path, f"analysis script {relative}")
@@ -938,6 +969,8 @@ class EnvironmentSynthesisLoop:
             "timeout_seconds",
             "network_mode",
             "network_self_test",
+            "network_repair_policy_path",
+            "network_repair_policy_sha256",
             "replay_store_path",
             "replay_store_sha256",
             "replay_store_entries",

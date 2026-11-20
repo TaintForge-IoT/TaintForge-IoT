@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "no_core.h"
 
 #define MAP_SIZE 65536U
 #define TF_MAX_INPUT (1024U * 1024U)
@@ -46,7 +47,7 @@ static int pipe_write(int fd, const void *buffer, size_t size)
     return 0;
 }
 
-static int execute(int fd, const char *filename, unsigned char *map)
+static int execute(int fd, const char *filename, unsigned char *map, int *guest_signal)
 {
     int input = open(filename, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     struct stat st;
@@ -63,11 +64,13 @@ static int execute(int fd, const char *filename, unsigned char *map)
     free(bytes);
     uint32_t header[4];
     if (failed || transfer(fd, header, sizeof(header), 0) ||
-        ntohl(header[0]) != 0x54464131 || ntohl(header[1]) != 0 ||
-        ntohl(header[2]) != 0 || ntohl(header[3]) != MAP_SIZE ||
+        ntohl(header[0]) != 0x54464131 || ntohl(header[1]) > 2 ||
+        (ntohl(header[1]) == 1 ? (ntohl(header[2]) < 1 || ntohl(header[2]) >= NSIG) : ntohl(header[2]) != 0) ||
+        ntohl(header[3]) != MAP_SIZE ||
         transfer(fd, map, MAP_SIZE, 0)) { close(fd); return INFRA_FAILURE; }
     close(fd);
-    return 0;
+    *guest_signal = (int)ntohl(header[2]);
+    return (int)ntohl(header[1]);
 }
 
 static int send_connection(int control, int connection)
@@ -105,8 +108,7 @@ int main(int argc, char **argv)
         info.shm_segsz < MAP_SIZE) return 2;
     unsigned char *map = shmat((int)number, NULL, 0);
     if (map == (void *)-1) return 2;
-    struct rlimit no_core = {0, 0};
-    if (setrlimit(RLIMIT_CORE, &no_core)) return 2;
+    if (tf_afl_disable_core_dumps()) return 2;
     uint32_t hello = 0;
     if (pipe_write(199, &hello, sizeof(hello))) {
         shmdt(map); return 2;
@@ -116,13 +118,35 @@ int main(int argc, char **argv)
         if (transfer(198, &command, sizeof(command), 0)) break;
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return 2;
+        int witness[2];
+        if (pipe2(witness, O_CLOEXEC)) { close(pair[0]); close(pair[1]); return 2; }
         pid_t child = fork();
-        if (child < 0) { close(pair[0]); close(pair[1]); return 2; }
+        if (child < 0) { close(pair[0]); close(pair[1]); close(witness[0]); close(witness[1]); return 2; }
         if (!child) {
             close(198); close(199); close(control); close(pair[1]);
-            _exit(execute(pair[0], argv[2], map));
+            close(witness[0]);
+            int guest_signal = 0;
+            int kind = execute(pair[0], argv[2], map, &guest_signal);
+            uint32_t attestation[2] = {(uint32_t)kind, (uint32_t)guest_signal};
+            if (pipe_write(witness[1], attestation, sizeof(attestation))) _exit(INFRA_FAILURE);
+            close(witness[1]);
+            if (kind == 1) {
+                struct sigaction action = { .sa_handler = SIG_DFL };
+                sigset_t signals;
+                sigemptyset(&action.sa_mask);
+                sigemptyset(&signals);
+                sigaddset(&signals, guest_signal);
+                if (sigaction(guest_signal, &action, NULL) && guest_signal != SIGKILL) _exit(INFRA_FAILURE);
+                if (sigprocmask(SIG_UNBLOCK, &signals, NULL)) _exit(INFRA_FAILURE);
+                kill(getpid(), guest_signal);
+                _exit(INFRA_FAILURE);
+            }
+            /* AFL marks hangs using its own deadline. The native child is
+             * already reaped; only this cheap relay waits for AFL's SIGKILL. */
+            if (kind == 2) for (;;) pause();
+            _exit(kind);
         }
-        close(pair[0]);
+        close(pair[0]); close(witness[1]);
         int sent = send_connection(control, pair[1]);
         close(pair[1]);
         if (sent) { kill(child, SIGKILL); waitpid(child, NULL, 0); return INFRA_FAILURE; }
@@ -130,7 +154,17 @@ int main(int argc, char **argv)
         if (pipe_write(199, &pid, sizeof(pid))) { kill(child, SIGKILL); waitpid(child, NULL, 0); break; }
         int status;
         while (waitpid(child, &status, 0) < 0) if (errno != EINTR) return 2;
-        if (WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) == INFRA_FAILURE)) {
+        uint32_t attestation[2] = {INFRA_FAILURE, 0};
+        ssize_t attested;
+        do { attested = read(witness[0], attestation, sizeof(attestation)); } while (attested < 0 && errno == EINTR);
+        close(witness[0]);
+        int target_signal = WIFSIGNALED(status) && attested == sizeof(attestation) &&
+            attestation[0] == 1 && attestation[1] == (uint32_t)WTERMSIG(status);
+        int target_timeout = WIFSIGNALED(status) && attested == sizeof(attestation) &&
+            attestation[0] == 2 && attestation[1] == 0 && WTERMSIG(status) == SIGKILL;
+        if ((!WIFEXITED(status) && !WIFSIGNALED(status)) ||
+            (WIFEXITED(status) && (WEXITSTATUS(status) != 0 || attestation[0] != 0)) ||
+            (WIFSIGNALED(status) && !target_signal && !target_timeout)) {
             fprintf(stderr, "TaintForge executor failed; refusing a fake target crash\n");
             shmdt(map); return INFRA_FAILURE;
         }

@@ -184,7 +184,12 @@ def main() -> None:
     parser.add_argument("--plugin", required=True, type=Path)
     parser.add_argument("--qemu", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--analysis-memory-mib", type=int)
     args = parser.parse_args()
+    analysis_bytes = None
+    if args.analysis_memory_mib is not None:
+        from taintforge_env.capsule_hardening import policy
+        analysis_bytes = policy(analysis_mib=args.analysis_memory_mib)['analysis_bytes']
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[1]
@@ -214,6 +219,8 @@ def main() -> None:
     def run(name, *, extra=(), binary=None, flags=False, live=False, terminate=False, ir=True):
         attempt = Phase1Run(runtime, "phase1-validation", name, name, output / name.replace("attempt", "run"), flags)
         argument = attempt.plugin_argument(ir=ir, extra=extra)
+        if analysis_bytes is not None:
+            argument += ',m4-memory-bytes=' + str(analysis_bytes)
         with (attempt.directory / "guest_stdout.log").open("wb") as stdout, (attempt.directory / "analyzer_stderr.log").open("wb") as stderr:
             proc = subprocess.Popen([str(qemu), "-plugin", argument, str(binary or binaries["layers"])], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
             try:
@@ -242,6 +249,13 @@ def main() -> None:
     for attempt, code in runs:
         assert code == 0
         evidence = attempt.verify()
+        if analysis_bytes is not None:
+            ledger = read_json(attempt.paths['report'])['resource_inventory']
+            assert ledger['schema'] == 1 and ledger['scope'] == 'explicit_project_allocations'
+            assert ledger['limit_bytes'] == analysis_bytes and ledger['allocations'] > 0
+            assert ledger['peak_bytes'] + ledger['ledger_reserved_bytes'] <= analysis_bytes
+            assert ledger['external_allocations_tracked'] is False
+            evidence['native_resource_inventory'] = ledger
         assert evidence["runtime_observed"] and evidence["capture_status"] == "success"
         observed = [e for e in attempt.events() if e["event_type"] == "oep_candidate_observed"]
         assert len(observed) == 2
@@ -346,7 +360,9 @@ def main() -> None:
         manifest_path.write_bytes(original_manifest)
     results.append({"test": "region extent checked independently of artifact digest", "status": "PASS"})
     assert digest(qemu) == qemu_identity["sha256"]
-    (output / "results.json").write_text(json.dumps({"qemu": qemu_identity, "runtime_build": runtime.build_id, "tests": results}, indent=2) + "\n")
+    (output / "results.json").write_text(json.dumps({"qemu": qemu_identity, "runtime_build": runtime.build_id,
+        "scope": "benign_local_native_runtime", "native_analysis_memory_bytes": analysis_bytes,
+        "systemd_hardening_verified": False, "tests": results}, indent=2) + "\n")
     for item in results: print(f"PASS: {item['test']}")
 
 

@@ -40,7 +40,7 @@ class ControlledNetworkCleanupHotfixTests(unittest.TestCase):
         logs.mkdir()
         policy = config / "policy.json"
         policy.write_text("{}\n", encoding="utf-8")
-        return ControlledNetworkBackend(
+        backend = ControlledNetworkBackend(
             ControlledNetworkConfig(
                 project_root=project,
                 run_dir=run_dir,
@@ -50,6 +50,8 @@ class ControlledNetworkCleanupHotfixTests(unittest.TestCase):
             ),
             executor=executor,
         )
+        backend._topology_owned = {"veth": True, "namespace": True}
+        return backend
 
     @staticmethod
     def plan():

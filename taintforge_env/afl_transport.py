@@ -13,9 +13,12 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 from . import afl_file as f
 from experiments.execution_capsule_probe import controller as p
+from . import afl_storage as storage
+from .afl_stop import AdmissionStopped, StopRequest, validate_timeout
 
 
 def recv_exact(connection, size):
@@ -52,16 +55,26 @@ def stop_case(process, case):
 class AttemptServer:
     def __init__(self, root, *, command=None, deadline=120):
         self.root = Path(root)
+        manifest = f.read_json(self.root/'campaign.json') if (self.root/'campaign.json').is_file() else {}
+        value = storage.verify_manifest(manifest)
+        self.storage = storage.Budget(self.root, value, allow_privileged='warm' in manifest) if value is not None else None
         self.channel, self.peer = socket.socketpair()
         self.channel.settimeout(.1)
         self.command = command or [sys.executable, '-m', 'scripts.run_afl_file', 'attempt',
                                    '--out', str(self.root)]
         self.deadline = deadline
         self.stop = threading.Event()
+        self.graceful_stop = threading.Event()
+        self.active_attempt = threading.Event()
         self.ready = threading.Event()
         self.errors = []
         self.executed = 0
         self.completed = 0
+        self.admission_closed = threading.Event()
+        self.execution_incomplete = threading.Event()
+        self.budget_reason = None
+        from .afl_metrics import Metrics
+        self.metrics = Metrics(self.root)
         self.thread = threading.Thread(target=self.serve, name='tf-afl-attempts', daemon=True)
 
     def start(self):
@@ -70,9 +83,11 @@ class AttemptServer:
 
     def close(self):
         self.stop.set()
-        self.thread.join(45)
+        if self.thread.ident is not None:
+            self.thread.join(45)
         self.peer.close()
         p.require(not self.thread.is_alive(), 'Attempt worker did not stop')
+        self.channel.close()
 
     @property
     def control_fd(self):
@@ -89,6 +104,21 @@ class AttemptServer:
         finally:
             controller.close()
         return child
+
+    def stop_admission(self, record):
+        if self.storage is not None:
+            record = self.storage.stop(record)
+        if self.budget_reason is None:
+            self.budget_reason = dict(record)
+        self.admission_closed.set()
+
+    def admit_case(self, index):
+        if self.graceful_stop.is_set():
+            raise AdmissionStopped()
+        if self.admission_closed.is_set():
+            raise storage.ResourceLimit('admission_closed')
+        if self.storage is not None:
+            self.storage.admit(index, stop=self.stop)
 
     def serve(self):
         try:
@@ -107,13 +137,32 @@ class AttemptServer:
                     for fd in descriptors: os.close(fd)
                     raise RuntimeError('Invalid attempt descriptor transfer')
                 with socket.socket(fileno=descriptors[0]) as connection:
+                    self.active_attempt.set()
                     try: self.execute(connection)
+                    except AdmissionStopped:
+                        self.active_attempt.clear()
+                        self.stop.wait()
+                    except storage.ResourceLimit as exc:
+                        self.stop_admission(exc.record)
+                        if self.executed != self.completed:
+                            self.execution_incomplete.set()
+                        self.stop.wait()
                     except (BrokenPipeError, ConnectionError): pass
                     except Exception as exc:
                         self.errors.append(str(exc))
+                        limited = storage.from_oserror(exc)
+                        if limited is not None:
+                            self.stop_admission(limited.record)
+                        try:
+                            with (self.root/'executor-error.log').open('a') as log:
+                                log.write(traceback.format_exc())
+                        except OSError:
+                            pass
                         self.stop.set()
                         try: connection.sendall(struct.pack('!4I', 0x54464131, 3, 0, 0))
                         except OSError: pass
+                    finally:
+                        self.active_attempt.clear()
         except Exception as exc:
             self.errors.append(str(exc)); self.ready.set()
         finally:
@@ -125,6 +174,7 @@ class AttemptServer:
         manifest = f.read_json(self.root/'campaign.json')
         p.require(1 <= size <= manifest['max_input'], 'AFL input exceeds the campaign limit')
         data = recv_exact(connection, size)
+        self.admit_case(self.executed)
         case = self.root/'cases'/f'{self.executed:08d}'
         case.mkdir(exist_ok=False)
         self.executed += 1
@@ -134,7 +184,7 @@ class AttemptServer:
         with (case/'worker.log').open('wb') as output:
             process = subprocess.Popen([*self.command, '--case', str(case)], cwd=f.PROJECT,
                 env=environment, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                start_new_session=True, close_fds=True)
+                process_group=0, close_fds=True)
             started = time.monotonic()
             terminal = {'status': 'failed'}
             cleanup_done = False
@@ -175,20 +225,36 @@ class AttemptServer:
                     raise
                 finally:
                     f.atomic_json(case/'transport.json', terminal)
+                    if self.storage is not None:
+                        self.storage.complete(case)
 
 
-def run_campaign(root, *, afl_bin=None, seconds=300, executions=None):
+def run_campaign(root, *, afl_bin=None, seconds=300, executions=None, max_artifact_mib=None,
+                 max_log_mib=None, max_rootfs_mib=None, max_case_mib=None,
+                 reserve_mib=None, min_free_mib=None, max_preparation_mib=None, session_check=None, stop_timeout=120):
     import fcntl
     root = Path(root).resolve(strict=True)
     manifest = f.verify_campaign(root)
     p.require(type(seconds) is int and 1 <= seconds <= 604800, 'Invalid campaign time')
+    p.require(session_check is None or callable(session_check), 'Invalid live-session checker')
+    validate_timeout(stop_timeout)
+    if max_artifact_mib is not None:
+        p.require(type(max_artifact_mib) is int and 16 <= max_artifact_mib <= 1048576, 'Invalid artifact budget')
     if executions is not None:
         p.require(type(executions) is int and executions >= 1, 'Invalid execution budget')
     binary = str(Path(afl_bin).resolve()/'afl-fuzz') if afl_bin else __import__('shutil').which('afl-fuzz')
-    p.require(binary and os.access(binary, os.X_OK), 'afl-fuzz is not installed')
+    p.require(binary and Path(binary).is_file() and os.access(binary, os.X_OK), 'afl-fuzz is not installed')
+    p.sha(Path(binary))  # Fail on unreadable AFL before expensive preparation.
     p.require(manifest['status'] == 'prepared', 'A new prepared campaign is required')
     with (root/'.campaign.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        manifest = f.verify_campaign(root)
+        p.require(manifest['status'] == 'prepared', 'A new prepared campaign is required')
+        value = storage.limits(manifest, artifact_bytes=max_artifact_mib, log_bytes=max_log_mib,
+            rootfs_bytes=max_rootfs_mib, case_bytes=max_case_mib,
+            reserve_bytes=reserve_mib, min_free_bytes=min_free_mib, preparation_bytes=max_preparation_mib)
+        storage.bind(manifest, value)
+        f.atomic_json(root/'campaign.json', manifest)
         server_class = AttemptServer
         if 'warm' in manifest:
             from .afl_warm import WarmAttemptServer
@@ -196,65 +262,154 @@ def run_campaign(root, *, afl_bin=None, seconds=300, executions=None):
             server_class = WarmAttemptServer
         attempt_deadline = manifest['warm']['timeout_ms']/1000+30 if 'warm' in manifest else manifest['launch']['timeout_seconds']+60
         server = server_class(root, deadline=attempt_deadline)
+        signals = []
+        shutdown = StopRequest(server, stop_timeout)
+        process = None
+        budget_stop = False
+        budget_stop_started = None
+        handlers = {}
+        def stopped(number, frame):
+            signals.append(number)
+            shutdown.request(number)
+        bootstrap_started = False
+        bootstrap_succeeded = False
         bootstrap_signals = []
         def bootstrap_stop(number, frame):
             bootstrap_signals.append(number)
             server.stop.set()
             raise InterruptedError('Campaign interrupted during preparation')
-        bootstrap_handlers = {number: signal.signal(number, bootstrap_stop)
-                              for number in (signal.SIGINT, signal.SIGTERM)}
+        bootstrap_handlers = {}
         try:
+            for number in (signal.SIGINT, signal.SIGTERM):
+                bootstrap_handlers[number] = signal.signal(number, bootstrap_stop)
             manifest['status'] = 'preparing'
             f.atomic_json(root/'campaign.json', manifest)
+            server.storage.open()
+            bootstrap_started = True
             server.start()
+            server.storage.start_monitor()
+            if session_check is not None:
+                manifest['session_checks'] = {'before_afl': session_check(server, 'before_afl')}
+                f.atomic_json(root/'campaign.json', manifest)
+            # Install the running handlers before leaving the bootstrap cleanup scope.
+            for number in bootstrap_handlers:
+                signal.signal(number, stopped)
+            handlers.update(bootstrap_handlers)
+            bootstrap_succeeded = True
         except BaseException as exc:
             manifest.update(status='interrupted' if bootstrap_signals else 'failed', error=str(exc))
-            try: server.close()
-            finally: f.atomic_json(root/'campaign.json', manifest)
+            limited = exc if isinstance(exc, storage.ResourceLimit) else storage.from_oserror(exc)
+            if limited is not None:
+                server.stop_admission(limited.record)
+                manifest.update(status='incomplete' if bootstrap_started else 'resource_limited',
+                                stop_reason='storage_limit', storage_stop=server.budget_reason,
+                                evidence_complete=False)
+            try:
+                server.storage.release_reserve()
+                server.close()
+            except BaseException as cleanup:
+                manifest.update(status='failed', cleanup_error=str(cleanup))
+                raise
+            finally:
+                manifest['storage_result'] = server.storage.report()
+                f.atomic_json(root/'campaign.json', manifest)
+            if limited is not None:
+                return manifest
             raise
         finally:
-            for number, handler in bootstrap_handlers.items(): signal.signal(number, handler)
-        command = [binary, '-i', str(root/'seeds'), '-o', str(root/'afl'),
-            '-V', str(seconds), '-t', str(int((attempt_deadline+5)*1000)),
-            '-m', '256', '-g', '1', '-G', str(manifest['max_input']), '-p', 'explore', '-s', '42']
-        if executions is not None: command += ['-E', str(executions)]
-        command += ['--', manifest['build']['bridge'], str(server.control_fd), '@@']
-        env = {k: os.environ[k] for k in ('PATH', 'LD_LIBRARY_PATH') if k in os.environ}
-        env.update(AFL_NO_UI='1', AFL_NO_AFFINITY='1', AFL_SKIP_CPUFREQ='1',
-                   AFL_FAST_CAL='1', AFL_MAP_SIZE=str(f.MAP_SIZE))
-        if os.environ.get('AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES') == '1':
-            env['AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES'] = '1'
-        signals = []
-        process = None
-        def stopped(number, frame):
-            signals.append(number)
-            server.stop.set()
-            if process is not None:
-                try: os.killpg(process.pid, number)
-                except ProcessLookupError: pass
-        handlers = {s: signal.signal(s, stopped) for s in (signal.SIGINT, signal.SIGTERM)}
-        manifest.update(status='running', command=command, afl_sha256=p.sha(Path(binary)))
-        f.atomic_json(root/'campaign.json', manifest)
+            if not bootstrap_succeeded:
+                for number, handler in bootstrap_handlers.items(): signal.signal(number, handler)
         try:
+            command = [binary, '-i', str(root/'seeds'), '-o', str(root/'afl'),
+                '-V', str(seconds), '-t', str(int((attempt_deadline+5)*1000)),
+                '-m', '256', '-g', '1', '-G', str(manifest['max_input']), '-p', 'explore', '-s', '42']
+            if executions is not None: command += ['-E', str(executions)]
+            command += ['--', manifest['build']['bridge'], str(server.control_fd), '@@']
+            env = {k: os.environ[k] for k in ('PATH', 'LD_LIBRARY_PATH') if k in os.environ}
+            env.update(AFL_NO_UI='1', AFL_NO_AFFINITY='1', AFL_SKIP_CPUFREQ='1',
+                       AFL_FAST_CAL='1', AFL_MAP_SIZE=str(f.MAP_SIZE))
+            if os.environ.get('AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES') == '1':
+                env['AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES'] = '1'
+            server.metrics.started = time.monotonic()
+            manifest['artifact_budget_mib'] = value['artifact_bytes']//storage.MIB
+            manifest.update(status='running', command=command, afl_sha256=p.sha(Path(binary)),
+                            afl_started_ns=time.monotonic_ns())
+            f.atomic_json(root/'campaign.json', manifest)
             with (root/'afl.log').open('wb') as log:
                 process = subprocess.Popen(command, cwd=f.PROJECT, env=env, stdin=subprocess.DEVNULL,
                     stdout=log, stderr=log, start_new_session=True, pass_fds=(server.control_fd,))
-                try: code = process.wait(timeout=seconds+manifest['launch']['timeout_seconds']+90)
+                try:
+                    deadline = time.monotonic()+seconds+manifest['launch']['timeout_seconds']+90
+                    while True:
+                        try:
+                            code = process.wait(timeout=.25)
+                            break
+                        except subprocess.TimeoutExpired:
+                            shutdown.poll(process)
+                            if time.monotonic() > deadline:
+                                raise
+                            metrics = server.metrics.publish(executed=server.executed, completed=server.completed)
+                            try:
+                                server.storage.check()
+                            except storage.ResourceLimit as exc:
+                                server.stop_admission(exc.record)
+                            if server.admission_closed.is_set():
+                                if budget_stop_started is None:
+                                    budget_stop_started = time.monotonic()
+                                budget_stop = True
+                                manifest.update(stop_reason='storage_limit', storage_stop=server.budget_reason)
+                                server.storage.release_reserve()
+                                drained = server.executed == server.completed
+                                if drained or server.execution_incomplete.is_set() or server.errors or time.monotonic()-budget_stop_started > attempt_deadline+5:
+                                    try: os.killpg(process.pid, signal.SIGINT)
+                                    except ProcessLookupError: pass
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL); process.wait(); raise
+            manifest['afl_finished_ns'] = time.monotonic_ns()
+            manifest['afl_exit'] = code
+            shutdown.finish_wait(process)
+            if session_check is not None and code == 0 and not server.admission_closed.is_set() and not signals:
+                manifest['session_checks']['after_afl'] = session_check(server, 'after_afl')
+            server.storage.release_reserve()
             server.close()
+            shutdown.finish_wait(process)
+            server.storage.stop_monitor()
+            try:
+                server.storage.check(force=True)
+            except storage.ResourceLimit as exc:
+                server.stop_admission(exc.record)
+            p.require(signals or server.completed == server.executed, 'Campaign left undelivered children')
             if 'warm' in manifest:
                 manifest['phase1_runs'] = 1
                 manifest['checkpoint'] = f.read_json(root/'warm-ready.json')
-            manifest.update(status='interrupted' if signals else 'completed' if code == 0 and not server.errors else 'failed',
+                if 'phase2' in manifest['warm']:
+                    manifest['phase2'] = f.read_json(root/'phase2-progress.json')
+                    p.require(manifest['phase2']['status'] == 'passed' and
+                              manifest['phase2']['completed'] == server.executed,
+                              'Per-child Phase 2 did not finish all executions')
+            if server.storage.reason is not None:
+                budget_stop = True
+                manifest.update(stop_reason='storage_limit', storage_stop=server.storage.reason)
+            complete = (server.completed == server.executed and not server.errors and not server.storage.pending
+                        and not shutdown.forced and not shutdown.timed_out)
+            manifest.update(status='interrupted' if signals else
+                            'resource_limited' if budget_stop and complete and code in (0, -signal.SIGINT, 130) else
+                            'completed' if code == 0 and not server.errors else 'failed',
+                            evidence_complete=complete,
                             afl_exit=code, cases=server.executed, executor_errors=server.errors)
             p.require(manifest['status'] != 'failed', 'AFL campaign failed; inspect afl.log and case worker.log')
             return manifest
         except BaseException as exc:
-            manifest.update(status='failed', error=str(exc))
+            manifest.update(status='interrupted' if signals else 'failed', error=str(exc), evidence_complete=False)
+            limited = exc if isinstance(exc, storage.ResourceLimit) else storage.from_oserror(exc)
+            if limited is not None:
+                server.stop_admission(limited.record)
+                manifest.update(stop_reason='storage_limit', storage_stop=server.budget_reason,
+                                evidence_complete=False)
             raise
         finally:
             try:
+                server.storage.release_reserve()
                 if process is not None and process.poll() is None:
                     try: os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError: pass
@@ -264,8 +419,28 @@ def run_campaign(root, *, afl_bin=None, seconds=300, executions=None):
                 manifest.update(status='failed', cleanup_error=str(exc))
                 raise
             finally:
-                for number, handler in handlers.items(): signal.signal(number, handler)
                 manifest['cases'] = server.executed
                 manifest['completed_cases'] = server.completed
                 manifest['executor_errors'] = server.errors
-                f.atomic_json(root/'campaign.json', manifest)
+                try:
+                    manifest['metrics'] = server.metrics.publish(executed=server.executed, completed=server.completed, final=True)
+                    manifest['storage_result'] = server.storage.report()
+                    if server.storage.reason is not None:
+                        manifest.update(stop_reason='storage_limit', storage_stop=server.storage.reason)
+                    manifest['artifact_budget_exceeded'] = manifest['storage_result']['usage']['artifact_bytes'] >= value['artifact_bytes']
+                except Exception as exc:
+                    manifest.update(status='failed', metrics_error=str(exc))
+                try:
+                    if (root/'phase2-progress.json').is_file():
+                        manifest['phase2'] = f.read_json(root/'phase2-progress.json')
+                    shutdown.save(root, manifest)
+                    if 'phase2' in manifest.get('warm', {}):
+                        from .afl_phase2 import campaign_report
+                        f.atomic_json(root/'pipeline-report.json', campaign_report(root, manifest))
+                except Exception as exc:
+                    manifest.update(status='failed', report_error=str(exc))
+                finally:
+                    try:
+                        f.atomic_json(root/'campaign.json', manifest)
+                    finally:
+                        for number, handler in handlers.items(): signal.signal(number, handler)

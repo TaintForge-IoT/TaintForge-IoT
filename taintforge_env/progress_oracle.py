@@ -8,6 +8,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterable
 
+from .network_events import normalize_network_event
+
 
 class ProgressOracleError(RuntimeError):
     """Raised when iteration artifacts are incomplete or inconsistent."""
@@ -316,6 +318,10 @@ class ProgressOracle:
         new_guest = len(current_guest - previous_guest)
         removed_guest = len(previous_guest - current_guest)
         new_targets = len(current_targets - previous_targets)
+        new_responses = len(_network_responses(current.normalized_network_events)
+                            - _network_responses(previous.normalized_network_events))
+        removed_responses = len(_network_responses(previous.normalized_network_events)
+                                - _network_responses(current.normalized_network_events))
         likely_delta = (
             current.metrics.likely_unmet_total
             - previous.metrics.likely_unmet_total
@@ -329,6 +335,8 @@ class ProgressOracle:
             positive_reasons.append(f"observed {new_guest} new normalized guest events")
         if new_targets > 0:
             positive_reasons.append(f"observed {new_targets} new network targets")
+        if new_responses > 0:
+            positive_reasons.append(f"observed {new_responses} new sent network responses")
         if likely_delta < 0:
             positive_reasons.append(
                 f"likely unmet requirements decreased by {-likely_delta}"
@@ -338,6 +346,8 @@ class ProgressOracle:
 
         if current.metrics.fatal_signals > previous.metrics.fatal_signals:
             negative_reasons.append("fatal signal count increased")
+        if removed_responses > 0 and new_responses == 0:
+            negative_reasons.append(f"{removed_responses} previously sent network responses disappeared")
         if likely_delta > 0:
             negative_reasons.append(
                 f"likely unmet requirements increased by {likely_delta}"
@@ -444,6 +454,7 @@ def _normalize_guest_events(path: Path | None) -> Iterable[dict[str, Any]]:
                     "path": event.get("path") if isinstance(event.get("path"), str) else None,
                     "remote_ip": event.get("remote_ip") if isinstance(event.get("remote_ip"), str) else None,
                     "remote_port": event.get("remote_port") if isinstance(event.get("remote_port"), int) else None,
+                    "transport": event.get("transport") if event.get("transport") in ("tcp", "udp") else None,
                 }
             )
         elif event_type in {"signal", "process_exit"}:
@@ -461,35 +472,7 @@ def _normalize_guest_events(path: Path | None) -> Iterable[dict[str, Any]]:
 def _normalize_network_events(path: Path | None) -> Iterable[dict[str, Any]]:
     if path is None:
         return ()
-    result: list[dict[str, Any]] = []
-    for event in _read_jsonl(path):
-        result.append(
-            {
-                "event": str(event.get("event") or "unknown"),
-                "listener_type": (
-                    event.get("listener_type")
-                    if isinstance(event.get("listener_type"), str)
-                    else None
-                ),
-                "original_remote_ip": (
-                    event.get("original_remote_ip")
-                    if isinstance(event.get("original_remote_ip"), str)
-                    else None
-                ),
-                "original_remote_port": (
-                    event.get("original_remote_port")
-                    if isinstance(event.get("original_remote_port"), int)
-                    else None
-                ),
-                "udp_role": (
-                    event.get("udp_role")
-                    if isinstance(event.get("udp_role"), str)
-                    else None
-                ),
-                "response_observed": event.get("event") == "tcp_response",
-            }
-        )
-    return result
+    return [normalize_network_event(event) for event in _read_jsonl(path)]
 
 
 def _build_metrics(
@@ -526,12 +509,24 @@ def _build_metrics(
     )
 
 
-def _network_targets(events: Iterable[dict[str, Any]]) -> set[tuple[Any, Any]]:
+def _network_targets(events: Iterable[dict[str, Any]]) -> set[tuple[Any, ...]]:
     return {
-        (item.get("original_remote_ip"), item.get("original_remote_port"))
+        (item.get("transport"), item.get("original_remote_ip"), item.get("original_remote_port"))
         for item in events
         if item.get("original_remote_ip") is not None
         and item.get("original_remote_port") is not None
+    }
+
+
+def _network_responses(events: Iterable[dict[str, Any]]) -> set[tuple[Any, ...]]:
+    return {
+        (item.get("transport"), item.get("original_remote_ip"), item.get("original_remote_port"),
+         item.get("protocol_hint"), item.get("request_sha256"), item.get("response_sha256"))
+        for item in events
+        if item.get("response_observed") is True and not item.get("failure")
+        and item.get("replay_status") != "miss"
+        and item.get("response_origin") not in {"synthetic_error", "synthetic_miss"}
+        and item.get("original_remote_ip") is not None and item.get("original_remote_port") is not None
     }
 
 

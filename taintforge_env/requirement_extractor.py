@@ -7,6 +7,8 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable
 
 from .observations import ObservationBundle
+from .network_events import network_flow_key, normalize_network_event
+from .network_endpoints import OUTBOUND
 from .requirements import (
     BlockingAssessment,
     RequirementEvidence,
@@ -191,21 +193,25 @@ class RequirementExtractor:
                     return_value=return_value,
                 )
 
-            if syscall == "connect" and errno in NETWORK_FAILURE_ERRNOS:
+            if syscall in OUTBOUND and errno in NETWORK_FAILURE_ERRNOS:
                 remote_ip = self._optional_string(event.get("remote_ip"))
                 remote_port = self._optional_int(event.get("remote_port"))
-                if remote_ip is not None and remote_port is not None:
+                transport = event.get("transport")
+                transport = transport if transport in ("tcp", "udp") else "unknown"
+                complete = remote_ip is not None and remote_port is not None and 1 <= remote_port <= 65535
+                if complete and transport != "unknown":
                     self._add(
                         kind=RequirementKind.NETWORK,
-                        resource=f"tcp://{remote_ip}:{remote_port}",
-                        operation="connect",
+                        resource=f"{transport}://{remote_ip}:{remote_port}",
+                        operation="connect" if syscall == "connect" else "datagram_exchange" if transport == "udp" else "send",
                         status=RequirementStatus.UNMET,
                         blocking=self._blocking_after(events, index),
                         confidence=1.0,
                         repairable=True,
                         errno=errno,
                         evidence=self._syscall_evidence(event, index),
-                        details={"transport": "tcp"},
+                        details={"transport": transport, "endpoint_resolution": "observed",
+                                 "endpoint_source": str(event.get("endpoint_source") or "observed")},
                     )
                 else:
                     # QEMU may print only a sockaddr pointer. Keep the failure
@@ -213,7 +219,7 @@ class RequirementExtractor:
                     # is also used with datagram and Unix-domain sockets.
                     details = {
                         "endpoint_resolution": "unresolved",
-                        "transport": "unknown",
+                        "transport": transport,
                         "missing_endpoint_fields": ",".join(
                             key for key, value in (("remote_ip", remote_ip), ("remote_port", remote_port))
                             if value is None
@@ -222,7 +228,8 @@ class RequirementExtractor:
                     for key, value in (("remote_ip", remote_ip), ("remote_port", remote_port)):
                         if value is not None:
                             details[key] = str(value)
-                    for key in ("pid", "source_file", "line_number"):
+                    for key in ("pid", "source_file", "line_number", "socket_fd", "endpoint_source",
+                                "endpoint_reason", "endpoint_observer_status", "endpoint_observation_seq"):
                         value = self._optional_string(event.get(key))
                         if value is not None:
                             details[key] = value
@@ -230,8 +237,8 @@ class RequirementExtractor:
                         kind=RequirementKind.NETWORK,
                         # This identifies an observation, not a network address.
                         # Do not merge unknown destinations across calls/PIDs.
-                        resource=f"unresolved-connect-event-{index}",
-                        operation="connect",
+                        resource=f"unresolved-{syscall}-event-{index}",
+                        operation=syscall,
                         status=RequirementStatus.UNMET,
                         blocking=self._blocking_after(events, index),
                         confidence=1.0,
@@ -405,84 +412,67 @@ class RequirementExtractor:
         self,
         events: Iterable[dict[str, Any]],
     ) -> None:
-        response_connections: set[tuple[str, str, str, int]] = set()
-        for event in events:
-            if event.get("event") != "tcp_response":
+        raw = list(events)
+        normalized = [normalize_network_event(event) for event in raw]
+        anchors = {
+            "tcp_connection_open", "tcp_connection_error", "broker_session_started", "broker_session_finished",
+            "udp_datagram", "udp_record", "dns_record", "dns_emulated",
+            "replay_hit", "replay_miss", "dns_replay_hit", "dns_replay_miss",
+            "network_response_sent", "network_response_failed",
+        }
+        flows: dict[tuple, list[int]] = defaultdict(list)
+        anchored: set[tuple] = set()
+        for index, event in enumerate(raw):
+            key = network_flow_key(event) or ("unscoped", index)
+            flows[key].append(index)
+            if normalized[index]["event"] in anchors:
+                anchored.add(key)
+
+        endpoints: dict[tuple, list[list[int]]] = defaultdict(list)
+        for key, indices in flows.items():
+            if key not in anchored:
                 continue
-            connection_key = self._network_connection_key(event)
-            if connection_key is not None:
-                response_connections.add(connection_key)
+            first = normalized[indices[0]]
+            transport, ip, port = first["transport"], first["original_remote_ip"], first["original_remote_port"]
+            if transport in {"tcp", "udp"} and ip is not None and port is not None:
+                endpoints[(transport, ip, port)].append(indices)
 
-        for index, event in enumerate(events):
-            event_type = str(event.get("event") or "")
-            ip = self._optional_string(event.get("original_remote_ip"))
-            port = self._optional_int(event.get("original_remote_port"))
-            listener_type = self._optional_string(event.get("listener_type"))
-
-            if event_type == "tcp_connection_open" and ip is not None and port is not None:
-                connection_key = self._network_connection_key(event)
-                has_response = (
-                    connection_key is not None
-                    and connection_key in response_connections
-                )
+        for (transport, ip, port), groups in endpoints.items():
+            indices = sorted(index for group in groups for index in group)
+            facts = [normalized[index] for index in indices]
+            failed = any(item["failure"] for item in facts)
+            all_answered = all(any(normalized[index]["response_observed"] for index in group) for group in groups)
+            status = (RequirementStatus.UNMET if failed else RequirementStatus.PROVIDED
+                      if all_answered else RequirementStatus.UNKNOWN)
+            details = {
+                "transport": transport,
+                "listener_type": ",".join(sorted({item["listener_type"] or "unknown" for item in facts})),
+                "response_prepared": str(any(item["response_prepared"] for item in facts)).lower(),
+                "response_observed": str(any(item["response_observed"] for item in facts)).lower(),
+                "failure_observed": str(failed).lower(),
+                "semantic_satisfaction": "unknown",
+            }
+            if transport == "udp":
+                details["role"] = ",".join(sorted({str(raw[index].get("udp_role") or
+                    raw[index].get("service_role") or "udp") for index in indices}))
+            replay = {item["replay_status"] for item in facts}
+            if replay & {"hit", "miss"}:
+                details["replay_status"] = "miss" if "miss" in replay else "hit"
+            if any(item["protocol_hint"] == "dns" for item in facts):
+                details["protocol_hint"] = "dns"
+            # Keep decisive evidence when a chatty connection exceeds the cap.
+            evidence_indices = sorted(indices, key=lambda index: (
+                not normalized[index]["failure"], not normalized[index]["response_observed"], index))
+            for index in evidence_indices:
                 self._add(
                     kind=RequirementKind.NETWORK,
-                    resource=f"tcp://{ip}:{port}",
-                    operation="connect",
-                    status=(
-                        RequirementStatus.PROVIDED
-                        if has_response
-                        else RequirementStatus.UNKNOWN
-                    ),
-                    blocking=BlockingAssessment.UNKNOWN,
-                    confidence=1.0,
-                    repairable=True,
-                    errno=None,
-                    evidence=RequirementEvidence(
-                        source="network",
-                        summary=(
-                            f"TCP connection intercepted by {listener_type or 'unknown'}"
-                        ),
-                        raw=None,
-                        event_index=index,
-                    ),
-                    details={
-                        "transport": "tcp",
-                        "listener_type": listener_type or "unknown",
-                        "response_observed": str(has_response).lower(),
-                        "semantic_satisfaction": "unknown",
-                    },
-                )
-                continue
-
-            if event_type == "udp_datagram" and ip is not None and port is not None:
-                role = self._optional_string(event.get("udp_role")) or "udp"
-                response_sent = bool(event.get("dns_response_sent", False))
-                self._add(
-                    kind=RequirementKind.NETWORK,
-                    resource=f"udp://{ip}:{port}",
-                    operation="datagram_exchange",
-                    status=(
-                        RequirementStatus.PROVIDED
-                        if response_sent
-                        else RequirementStatus.UNKNOWN
-                    ),
-                    blocking=BlockingAssessment.UNKNOWN,
-                    confidence=1.0,
-                    repairable=True,
-                    errno=None,
-                    evidence=RequirementEvidence(
-                        source="network",
-                        summary=f"UDP datagram intercepted as role={role}",
-                        raw=None,
-                        event_index=index,
-                    ),
-                    details={
-                        "transport": "udp",
-                        "role": role,
-                        "response_observed": str(response_sent).lower(),
-                        "semantic_satisfaction": "unknown",
-                    },
+                    resource=f"{transport}://{ip}:{port}",
+                    operation="connect" if transport == "tcp" else "datagram_exchange",
+                    status=status, blocking=BlockingAssessment.UNKNOWN,
+                    confidence=1.0, repairable=True, errno=None,
+                    evidence=RequirementEvidence(source="network", summary=normalized[index]["event"],
+                                                 raw=None, event_index=index),
+                    details=details,
                 )
 
     def _extract_loader_requirements(self, stderr_lines: Iterable[str]) -> None:
@@ -703,24 +693,6 @@ class RequirementExtractor:
             evidence=tuple(value.evidence),
             details=tuple(sorted(value.details.items())),
         )
-
-    @classmethod
-    def _network_connection_key(
-        cls,
-        event: dict[str, Any],
-    ) -> tuple[str, str, str, int] | None:
-        connection_id = event.get("connection_id")
-        listener_type = cls._optional_string(event.get("listener_type"))
-        remote_ip = cls._optional_string(event.get("original_remote_ip"))
-        remote_port = cls._optional_int(event.get("original_remote_port"))
-        if (
-            connection_id is None
-            or listener_type is None
-            or remote_ip is None
-            or remote_port is None
-        ):
-            return None
-        return listener_type, str(connection_id), remote_ip, remote_port
 
     @staticmethod
     def _syscall_evidence(

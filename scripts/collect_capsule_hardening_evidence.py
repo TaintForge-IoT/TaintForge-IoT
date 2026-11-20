@@ -7,6 +7,7 @@ from experiments.execution_capsule_probe import controller as p
 from taintforge_env.phase1_runtime import read_json
 
 EXTRA_PATTERNS = (
+    'phase1-runtime/**/*',
     'extra/*.json', 'extra/inputs/*', 'extra/*/*.json', 'extra/*/*/*.json',
     'extra/**/session/*.json', 'extra/**/session/*.jsonl',
     'extra/**/session/attempts/**/*.json', 'extra/**/session/manifests/**/*.json',

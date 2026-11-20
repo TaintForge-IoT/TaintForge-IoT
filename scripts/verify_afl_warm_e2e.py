@@ -19,7 +19,7 @@ def verify(out, *, qemu, plugin, afl_bin, seconds=30, executions=32):
         seeds = out/'seeds'; seeds.mkdir(); (seeds/'A').write_bytes(b'A')
         campaign = out/'campaign'
         afl_warm.prepare_campaign(campaign, binary=binary, qemu=qemu, plugin=plugin,
-            guest_path='/etc/afl-input', seeds=seeds, bootstrap_seconds=120,
+            guest_path='/etc/afl-input', seeds=seeds, analysis_policy='research', bootstrap_seconds=120,
             campaign_seconds=seconds+30, timeout_ms=3000, max_rss_mib=512,
             memory_mib=1024, analysis_mib=512)
         result = run_campaign(campaign, afl_bin=afl_bin, seconds=seconds, executions=executions)

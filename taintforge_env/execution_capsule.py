@@ -387,6 +387,8 @@ def supervise(binding, ipc):
         if permit_worker is not None:
             phase1_argument += "," + ",".join(phase1_retirement.plugin_options(binding, IPC_GUEST, permit_worker.pid))
         plugins = [phase1_argument, argument]
+        if "network_observer" in phase1:
+            plugins.append(phase1["network_observer"]["plugin_argument"])
         if case == "capsule-first":
             plugins.reverse()
         if owner_gate is not None:

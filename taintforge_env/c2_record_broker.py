@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from .network_runtime import network_open, network_write, network_json
+from .network_runtime_transport import start_server as runtime_start_server, open_connection as runtime_open_connection
+
 import asyncio
 import hashlib
-import json
 import os
 import secrets
 import time
@@ -36,9 +38,12 @@ class DirectionState:
     total: int = 0
     chunks: int = 0
     digest: hashlib._Hash | None = None
+    sent_total: int = 0
+    sent_digest: hashlib._Hash | None = None
 
     def __post_init__(self) -> None:
         self.digest = hashlib.sha256()
+        self.sent_digest = hashlib.sha256()
 
 
 class C2RecordBroker:
@@ -78,7 +83,7 @@ class C2RecordBroker:
         self.capture_root.mkdir(parents=True, exist_ok=True)
         os.chmod(self.capture_root, 0o700)
 
-        self.server = await asyncio.start_server(
+        self.server = await runtime_start_server(
             self._accept_client,
             self.bind_ip,
             self.listen_port,
@@ -221,7 +226,7 @@ class C2RecordBroker:
         upstream_writer: asyncio.StreamWriter | None = None
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
+                runtime_open_connection(
                     self.policy.target.upstream_ip,
                     self.policy.target.upstream_port,
                 ),
@@ -405,6 +410,9 @@ class C2RecordBroker:
                 self.event_path,
                 {
                     "event": "broker_session_finished",
+                    "network_event_version": 1,
+                    "transport": "tcp",
+                    "protocol_hint": self.protocol_hint,
                     "listener_type": "brokered_record",
                     "session_id": session_id,
                     "original_remote_ip": self.policy.target.original_ip,
@@ -412,6 +420,14 @@ class C2RecordBroker:
                     "close_reason": close_reason,
                     "client_bytes": client_state.total,
                     "server_bytes": server_state.total,
+                    "response_prepared": server_state.total > 0,
+                    "response_sent": server_state.sent_total > 0,
+                    "response_size": server_state.sent_total,
+                    "response_sha256": server_state.sent_digest.hexdigest() if server_state.sent_total else None,
+                    "request_sha256": client_state.digest.hexdigest(),
+                    "response_origin": "upstream",
+                    "status": "completed" if close_reason in {"upstream_closed", "client_closed", "completed"} else "failed",
+                    "error": error_text,
                 },
             )
 
@@ -451,7 +467,7 @@ class C2RecordBroker:
             self._append_bytes(state.aggregate_path, data)
             chunk_name = f"{state.chunks:06d}_{state.direction}.bin"
             chunk_path = chunks_dir / chunk_name
-            chunk_path.write_bytes(data)
+            network_write(chunk_path, data)
             os.chmod(chunk_path, 0o600)
 
             append_jsonl_event(
@@ -473,6 +489,8 @@ class C2RecordBroker:
 
             destination.write(data)
             await destination.drain()
+            state.sent_total += len(data)
+            state.sent_digest.update(data)
 
     async def _monitor_timeouts(
         self,
@@ -491,22 +509,9 @@ class C2RecordBroker:
     @staticmethod
     def _append_bytes(path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(
-            path,
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-            0o600,
-        )
-        try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
+        with network_open(path, "ab") as output:
+            output.write(data)
 
     @staticmethod
     def _atomic_json(path: Path, value: dict) -> None:
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(
-            json.dumps(value, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        os.chmod(temp, 0o600)
-        os.replace(temp, path)
+        network_json(path, value)

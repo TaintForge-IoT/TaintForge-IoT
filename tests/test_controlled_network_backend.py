@@ -37,6 +37,11 @@ class FakeExecutor:
     ) -> FakeResult:
         cmd = [str(value) for value in command]
         self.commands.append(cmd)
+        if cmd[:5] == ["ip", "-j", "-4", "route", "get"]:
+            interface = next(item[5] for item in self.commands
+                             if item[:5] == ["sudo", "-n", "ip", "link", "add"])
+            return FakeResult(stdout=json.dumps([
+                {"dst": cmd[5], "from": cmd[7], "dev": interface}]))
         if stdout_path is not None:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             stdout_path.write_text('{"results": []}\n', encoding="utf-8")

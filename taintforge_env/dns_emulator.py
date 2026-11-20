@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import ipaddress
-import json
 from pathlib import Path
 import struct
 
 from .dns_protocol import canonical_query, error_response, question
 from .message_transport import MessageServer
+from .network_events import prepared_reply
 
 
 class DNSStaticService:
@@ -19,6 +19,7 @@ class DNSStaticService:
         if not isinstance(service.dns_records, dict):
             raise ValueError("synthetic DNS requires explicit dns_records")
         self.records = {}
+        self.counter = 0
         for name, values in service.dns_records.items():
             if not isinstance(name, str) or not isinstance(values, list) or len(values) > 64:
                 raise ValueError("invalid synthetic DNS records")
@@ -28,6 +29,7 @@ class DNSStaticService:
         return await MessageServer(self.handle).start(self.service.bind_ip, self.service.bind_port, self.service.service_type)
 
     async def handle(self, query, peer):
+        self.counter += 1
         canonical_query(query)
         q = question(query)
         values = self.records.get(q.name.lower())
@@ -45,6 +47,6 @@ class DNSStaticService:
             "listener_type": "dns_emulated", "response_origin": "synthetic", "dns_query": q.name,
             "dns_qtype": q.qtype, "dns_response_prepared": True, "transport": self.service.service_type,
             "original_remote_ip": self.service.remote_ip, "original_remote_port": self.service.remote_port}
-        with (self.log_dir / "network_events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, sort_keys=True) + "\n")
-        return response
+        event.update(exchange_id=self.counter, peer_host=peer[0], peer_port=peer[1],
+                     bind_ip=self.service.bind_ip, bind_port=self.service.bind_port)
+        return prepared_reply(self.log_dir / "network_events.jsonl", event, query, response, dns=True)

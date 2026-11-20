@@ -144,11 +144,14 @@ def verify_map(binding):
 
 def atomic_json(path, value):
     path = Path(path)
+    import json
+    from .afl_storage import check_project_write
+    data = (json.dumps(value, indent=2, sort_keys=True)+'\n').encode()
+    check_project_write(path, len(data))
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
     try:
-        import json
-        with os.fdopen(fd, 'w') as f:
-            json.dump(value, f, indent=2, sort_keys=True); f.write('\n')
+        with os.fdopen(fd, 'wb') as output:
+            output.write(data)
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -165,10 +168,13 @@ def build(directory):
               source / 'bridge.c', '-o', bridge)
     return {'bridge': str(bridge), 'observer': observer,
             'source_sha256': {str(x.relative_to(PROJECT)): p.sha(x) for x in
-                              (source/'bridge.c', source/'coverage.h')}}
+                              (source/'bridge.c', source/'coverage.h', source/'no_core.h')}}
 
 
-def prepare_campaign(out, *, binary, qemu, plugin, guest_path, seeds, max_input=4096, pipeline_options=()):
+def prepare_campaign(out, *, binary, qemu, plugin, guest_path, seeds, max_input=4096,
+                     analysis_policy='strict', pipeline_options=()):
+    from .analysis_quality import policy
+    policy(analysis_policy)
     from scripts.run_unified_pipeline import parser, prepare
     p.require(type(max_input) is int and 1 <= max_input <= 1024**2, 'Invalid maximum input length')
     seed_dir = Path(seeds).resolve(strict=True)
@@ -185,7 +191,7 @@ def prepare_campaign(out, *, binary, qemu, plugin, guest_path, seeds, max_input=
               'A new campaign directory outside seeds is required')
     out = out.resolve()
     out.mkdir(parents=True)
-    options = parser().parse_args(['run', '--retire-phase1', '--capsule-hardening',
+    options = parser().parse_args(['run', '--retire-phase1', '--analysis-policy', analysis_policy, '--capsule-hardening',
         '--binary', str(Path(binary).resolve()), '--qemu', str(Path(qemu).resolve()),
         '--plugin', str(Path(plugin).resolve()), '--out', str(out/'baseline'),
         '--capsule-hold-ms', '20', '--max-iterations', '1', *pipeline_options])
@@ -212,9 +218,11 @@ def prepare_campaign(out, *, binary, qemu, plugin, guest_path, seeds, max_input=
         'snapshot_store': str(store.store_dir), 'build': built, 'cases': 0,
         'protected_control_channel': False, 'hostile_sample_ready': False,
         'assets': {str(path): p.sha(path) for path in
-            [Path(built['bridge']), Path(launch['binary_path']), template/'config/runtime.json']},
+            [Path(built['bridge']), Path(launch['binary_path']), template/'config/runtime.json', *sorted(seed_dir.iterdir())]},
         'source_sha256': {str(path.relative_to(PROJECT)): p.sha(path) for path in
-            [PROJECT/'taintforge_env/afl_file.py', PROJECT/'taintforge_env/afl_transport.py',
+            [PROJECT/'taintforge_env/afl_file.py', PROJECT/'taintforge_env/afl_transport.py', PROJECT/'taintforge_env/afl_storage.py',
+             PROJECT/'taintforge_env/afl_continue.py',
+             PROJECT/'taintforge_env/afl_stop.py',
              PROJECT/'taintforge_env/input_retirement.py', PROJECT/'experiments/retirement_observer/observer.c',
              PROJECT/'experiments/afl_file/coverage.h', PROJECT/'experiments/afl_file/bridge.c',
              PROJECT/'experiments/retirement_observer/controller.py', PROJECT/'scripts/run_afl_file.py']}}
@@ -225,6 +233,8 @@ def prepare_campaign(out, *, binary, qemu, plugin, guest_path, seeds, max_input=
 def verify_campaign(root):
     root = Path(root).resolve(strict=True)
     value = read_json(root/'campaign.json')
+    from .afl_storage import verify_manifest
+    verify_manifest(value)
     p.require(value['schema'] == 1 and value['profile'] == PROFILE and
               Path(value['project_root']) == PROJECT, 'Campaign belongs to another source tree/profile')
     for name, sha in value['assets'].items(): p.require(p.sha(Path(name)) == sha, 'Campaign asset changed: '+name)

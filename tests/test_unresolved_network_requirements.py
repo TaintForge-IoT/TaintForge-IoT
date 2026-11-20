@@ -106,7 +106,7 @@ class UnresolvedNetworkRequirementTests(unittest.TestCase):
     def test_known_endpoint_keeps_existing_plan_and_does_not_absorb_unknown(self):
         events = (
             self.event(),
-            self.event(remote_ip="192.0.2.10", remote_port=443),
+            self.event(remote_ip="192.0.2.10", remote_port=443, transport="tcp"),
         )
         report = self.extract(*events)
         self.assertEqual(len(report.requirements), 2)

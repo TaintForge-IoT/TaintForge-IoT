@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <qemu-plugin.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
@@ -20,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 #include "../afl_file/coverage.h"
+#include "control_guard.h"
+#include "../afl_file/no_core.h"
 
 _Static_assert(QEMU_PLUGIN_VERSION == 6, "pinned API 6 required");
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -44,10 +47,13 @@ static bool warm_mode, warm_detached, warm_child;
 extern int qemu_plugin_tf_warm_configure(const char *, const char *, uint64_t, int,
                                         void (*)(void), void (*)(void)) __attribute__((weak));
 extern void qemu_plugin_tf_warm_arm(void) __attribute__((weak));
+extern unsigned int qemu_plugin_tf_warm_abi3(void) __attribute__((weak));
+extern int qemu_plugin_tf_warm_set_input_gate(void (*gate)(void)) __attribute__((weak));
 
 static void warm_prepare(void);
 static void warm_child_start(void)
 {
+    if (tf_afl_disable_core_dumps()) _exit(126);
     warm_child = true;
     close(channel);
     channel = -1;
@@ -142,6 +148,29 @@ static void *control_host(void *unused)
     return NULL;
 }
 
+/* Called by the backend before syscall callbacks, with no plugin/QEMU lock
+ * held. Queued uninstall work has completed at the CPU-loop boundary. The
+ * controller can inspect maps while this thread waits for its HOLD request. */
+static void warm_input_gate(void)
+{
+    pthread_mutex_lock(&lock);
+    if (!stamped || (state != RUNNING && state != REQUEST2))
+        abort_run(126, "input_opened_before_retirement");
+    uint64_t deadline = now_ms() + pause_ms;
+    if (deadline > total_deadline) deadline = total_deadline;
+    while (state == RUNNING) {
+        if (now_ms() >= deadline) abort_run(124, "input_gate_timeout");
+        struct timespec until = {.tv_sec=(time_t)(deadline/1000),
+                                 .tv_nsec=(long)(deadline%1000)*1000000};
+        int rc = pthread_cond_timedwait(&changed, &lock, &until);
+        if (rc && rc != ETIMEDOUT) abort_run(126, "input_gate_condition_wait");
+    }
+    if (now_ms() >= deadline) abort_run(124, "input_gate_timeout");
+    if (state != REQUEST2 || !atomic_load(&hold_requested))
+        abort_run(126, "input_gate_state");
+    pthread_mutex_unlock(&lock);
+}
+
 static void format_snapshot(char *line, size_t size, unsigned point, unsigned sample,
                             uint64_t seq, uint64_t pc)
 {
@@ -166,13 +195,15 @@ static void format_snapshot(char *line, size_t size, unsigned point, unsigned sa
         }
     }
     g_byte_array_free(bytes, true);
+    char guard[320];
+    cg_snapshot(guard, sizeof(guard));
     int n = snprintf(line, size, "{\"event\":\"snapshot\",\"protocol\":3,\"host_pid\":%ld,"
         "\"point\":%u,\"sample\":%u,\"seq\":%llu,\"pc\":%llu,\"monotonic_ms\":%llu,"
         "\"pc_source\":\"qemu_plugin_insn_vaddr\",\"qemu_eip\":%u,"
-        "\"regs\":[%u,%u,%u,%u,%u,%u,%u,%u],\"stack_readable\":%s,\"stack_hex\":\"%s\"}\n",
+        "\"regs\":[%u,%u,%u,%u,%u,%u,%u,%u],\"stack_readable\":%s,\"stack_hex\":\"%s\"%s}\n",
         (long)getpid(), point, sample, (unsigned long long)seq, (unsigned long long)pc,
         (unsigned long long)now_ms(), regs[PC], regs[0],regs[1],regs[2],regs[3],regs[4],regs[5],regs[6],regs[7],
-        stack_ok ? "true" : "false", stack);
+        stack_ok ? "true" : "false", stack, guard);
     if (n < 0 || (size_t)n >= size) abort_run(126, "snapshot_size");
 }
 
@@ -256,6 +287,7 @@ static void syscall_guard(qemu_plugin_id_t id, unsigned vcpu, int64_t num,
 {
     (void)id; (void)vcpu; (void)a1; (void)a2; (void)a3; (void)a4;
     (void)a5; (void)a6; (void)a7; (void)a8;
+    cg_before(vcpu, num, a1, a2, a3, a4, a5);
     /* No inherited guest IPC/timers in the file-only checkpoint profile. */
     if (warm_mode && !warm_detached &&
         (num == 27 || num == 104 || num == 102 || num == 42 || num == 331 ||
@@ -267,6 +299,12 @@ static void syscall_guard(qemu_plugin_id_t id, unsigned vcpu, int64_t num,
     /* i386 fork, execve, clone, vfork, execveat, clone3. Remains after retire. */
     if (num == 2 || num == 11 || num == 120 || num == 190 || num == 358 || num == 435)
         abort_run(126, "unsupported_process_transition");
+}
+
+static void syscall_return(qemu_plugin_id_t id, unsigned vcpu, int64_t num, int64_t ret)
+{
+    cg_after(num, ret);
+    if (tf_afl_record) tf_afl_sysret(id, vcpu, num, ret);
 }
 
 static void warm_prepare(void)
@@ -284,16 +322,21 @@ static void warm_prepare(void)
 static void observer_exit(qemu_plugin_id_t id, void *unused)
 {
     (void)id; (void)unused;
-    if (warm_child) { tf_afl_finish(); return; }
+    if (warm_child) {
+        if (tf_afl_disable_core_dumps()) abort_run(126, "warm_core_policy");
+        tf_afl_finish();
+        return;
+    }
     pthread_mutex_lock(&lock);
     bool complete = state == FINAL_RUN;
     atomic_store(&finished, true);
     pthread_mutex_unlock(&lock);
     if (!warm_detached) pthread_join(host_thread, NULL);
     tf_afl_finish();
-    char line[192];
-    snprintf(line, sizeof(line), "{\"event\":\"%s\",\"protocol\":3,\"host_pid\":%ld,\"seq\":%llu}\n",
-             complete ? "done" : "early_exit", (long)getpid(), (unsigned long long)atomic_load(&sequence));
+    char line[512], guard[320];
+    cg_snapshot(guard, sizeof(guard));
+    snprintf(line, sizeof(line), "{\"event\":\"%s\",\"protocol\":3,\"host_pid\":%ld,\"seq\":%llu%s}\n",
+             complete ? "done" : "early_exit", (long)getpid(), (unsigned long long)atomic_load(&sequence), guard);
     send_frame(line);
     close(channel);
     if (!complete) abort_run(123, "exit_before_observation");
@@ -308,14 +351,22 @@ static bool number(const char *s, uint64_t *value)
     *value=n; return true;
 }
 
+static int install_error(const char *reason)
+{
+    fprintf(stderr, "OBSERVER_INSTALL_ERROR reason=%s\n", reason);
+    return -1;
+}
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc, char **argv)
 {
     if (info->system_emulation || strcmp(info->target_name,"i386") ||
-        info->version.cur != 6 || info->version.min > 6 || argc < 4 || argc > 9) return -1;
+        info->version.cur != 6 || info->version.min > 6 || argc < 4 || argc > 10)
+        return install_error("target_api_or_option_count");
     const char *path=NULL;
     const char *coverage=NULL, *afl_input=NULL, *warm_endpoint=NULL;
     uint64_t warm_rss=2048;
     uint64_t controller=0, controller_uid=getuid();
+    const char *guard_path=NULL;
     unsigned seen=0;
     const char *keys[]={"pause-ms=","total-ms=","controller="};
     uint64_t *values[]={&pause_ms,&total_ms,&controller};
@@ -327,43 +378,57 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         else if (!strncmp(argv[i],"afl-input=",10)) { afl_input=argv[i]+10; bit=64; }
         else if (!strncmp(argv[i],"afl-warm=",9)) { warm_endpoint=argv[i]+9; bit=128; }
         else if (!strncmp(argv[i],"afl-warm-rss=",13) && number(argv[i]+13,&warm_rss)) bit=256;
+        else if (!strncmp(argv[i],"control-guard=",14)) { guard_path=argv[i]+14; bit=512; }
         else for (unsigned k=0;k<3;++k) {
             size_t n=strlen(keys[k]);
             if (!strncmp(argv[i],keys[k],n) && number(argv[i]+n,values[k])) {bit=1U<<k;break;}
         }
-        if (!bit || (seen&bit)) return -1;
+        if (!bit || (seen&bit)) return install_error("invalid_or_duplicate_option");
         seen|=bit;
     }
     struct sockaddr_un addr={.sun_family=AF_UNIX};
-    unsigned required = 15U | (seen & 16U) | ((coverage || afl_input) ? 96U : 0U) | (warm_endpoint ? 384U : 0U);
+    unsigned required = 15U | (seen & (16U | 512U)) | ((coverage || afl_input) ? 96U : 0U) | (warm_endpoint ? 384U : 0U);
     if (seen!=required || controller_uid>INT_MAX || !path || !*path || strlen(path)>=sizeof(addr.sun_path) ||
         pause_ms<100 || pause_ms>60000 || total_ms<100 || total_ms>86400000 ||
-        !controller || controller>INT_MAX) return -1;
-    if (tf_afl_open_map(coverage, afl_input)) return -1;
+        !controller || controller>INT_MAX) return install_error("invalid_option_set");
+    if (warm_endpoint && (!coverage || !warm_rss ||
+                         !qemu_plugin_tf_warm_configure || !qemu_plugin_tf_warm_arm))
+        return install_error("warm_backend_requirements");
+    if (warm_endpoint && (!qemu_plugin_tf_warm_abi3 ||
+                         qemu_plugin_tf_warm_abi3() != 3 ||
+                         !qemu_plugin_tf_warm_set_input_gate))
+        return install_error("warm_backend_gate_abi3_required");
+    if (guard_path && coverage && !warm_endpoint) return install_error("guard_requires_warm_afl");
+    if (guard_path && cg_enable(guard_path)) return install_error("control_guard_initialization");
+    if (tf_afl_open_map(coverage, afl_input)) return install_error("afl_coverage_map");
     total_deadline=now_ms()+total_ms;
     channel=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK,0);
-    if (channel<0) return -1;
+    if (channel<0) return install_error("controller_socket");
     strcpy(addr.sun_path,path);
     struct ucred peer;
     socklen_t len=sizeof(peer);
     if (connect(channel,(struct sockaddr *)&addr,sizeof(addr)) ||
         getsockopt(channel,SOL_SOCKET,SO_PEERCRED,&peer,&len) ||
-        len!=sizeof(peer) || peer.uid!=(uid_t)controller_uid || peer.pid!=(pid_t)controller) {close(channel);return -1;}
+        len!=sizeof(peer) || peer.uid!=(uid_t)controller_uid || peer.pid!=(pid_t)controller) {
+        close(channel);return install_error("controller_connection_or_identity");
+    }
     pthread_condattr_t attr;
     if (pthread_condattr_init(&attr) || pthread_condattr_setclock(&attr,CLOCK_MONOTONIC) ||
-        pthread_cond_init(&changed,&attr)) {close(channel);return -1;}
+        pthread_cond_init(&changed,&attr)) {close(channel);return install_error("condition_initialization");}
     pthread_condattr_destroy(&attr);
-    if (pthread_create(&host_thread,NULL,control_host,NULL)) {close(channel);return -1;}
     if (warm_endpoint) {
-        if (!coverage || !warm_rss || !qemu_plugin_tf_warm_configure || !qemu_plugin_tf_warm_arm ||
-            qemu_plugin_tf_warm_configure(afl_input, warm_endpoint, warm_rss, channel,
-                                         warm_prepare, warm_child_start)) return -1;
+        if (qemu_plugin_tf_warm_configure(afl_input, warm_endpoint, warm_rss, channel,
+                                        warm_prepare, warm_child_start) ||
+            qemu_plugin_tf_warm_set_input_gate(warm_input_gate)) {
+            close(channel);return install_error("warm_backend_configuration");
+        }
         warm_mode = true;
     }
+    if (pthread_create(&host_thread,NULL,control_host,NULL)) {close(channel);return install_error("controller_thread");}
     qemu_plugin_register_vcpu_init_cb(id,init_vcpu);
     qemu_plugin_register_vcpu_tb_trans_cb(id,translate);
     qemu_plugin_register_vcpu_syscall_cb(id,syscall_guard);
-    if (tf_afl_record) qemu_plugin_register_vcpu_syscall_ret_cb(id,tf_afl_sysret);
+    if (tf_afl_record || cg_enabled) qemu_plugin_register_vcpu_syscall_ret_cb(id,syscall_return);
     qemu_plugin_register_atexit_cb(id,observer_exit,NULL);
     return 0;
 }

@@ -42,7 +42,7 @@ class WarmQemuBuildTests(unittest.TestCase):
 
     def legacy_install(self):
         path = self.root / 'linux-user/syscall.c'
-        path.write_bytes(installer.warm_syscall(path.read_bytes()))
+        path.write_bytes(installer.warm_syscall(path.read_bytes(), gate=False))
         path = self.root / 'include/plugins/qemu-plugin.h'
         path.write_bytes(path.read_bytes() + installer.DECLARATIONS)
         (self.root / 'linux-user/tf-warm.h').write_bytes((installer.HERE / 'tf-warm.h').read_bytes())
@@ -61,6 +61,47 @@ class WarmQemuBuildTests(unittest.TestCase):
         self.assertEqual(installer.install(self.root)[0], 'installed')
         header = (self.root / 'include/plugins/qemu-plugin.h').read_bytes()
         self.assertLess(header.index(b'qemu_plugin_tf_warm_arm'), header.index(b'} /* extern "C" */'))
+        self.assertEqual(installer.install(self.root), ('already installed', None))
+
+    def test_legacy_flags_and_abi2_upgrade_to_the_same_fresh_install(self):
+        expected = self.snapshot()
+        for path, _, desired in installer.changes(self.root):
+            expected[str(path.relative_to(self.root))] = desired
+        self.legacy_install()
+        (self.root/'linux-user/tf-warm.h').write_bytes((installer.HERE/'tf-warm-v2.h').read_bytes())
+        for name, replacements in installer.LEGACY_EFLAGS_REPLACEMENTS.items():
+            value = self.baselines[name]
+            for before, after in replacements:
+                value = value.replace(before, after, 1)
+            (self.root/name).write_bytes(value)
+        self.assertEqual(installer.install(self.root)[0], 'installed')
+        self.assertEqual(self.snapshot(), expected)
+        self.assertEqual(installer.install(self.root), ('already installed', None))
+
+    def test_actual_abi1_backend_is_upgraded_with_a_backup(self):
+        self.legacy_install()
+        backend=self.root/'linux-user/tf-warm.h'
+        legacy=(installer.HERE/'tf-warm-v1.h').read_bytes()
+        backend.write_bytes(legacy)
+        status,backup=installer.install(self.root)
+        self.assertEqual(status,'installed')
+        self.assertEqual((backup/'linux-user/tf-warm.h').read_bytes(),legacy)
+        self.assertEqual(backend.read_bytes(),(installer.HERE/'tf-warm.h').read_bytes())
+
+    def test_abi2_upgrade_places_gate_before_any_syscall_callback(self):
+        self.legacy_install()
+        backend = self.root/'linux-user/tf-warm.h'
+        legacy = (installer.HERE/'tf-warm-v2.h').read_bytes()
+        backend.write_bytes(legacy)
+        status, backup = installer.install(self.root)
+        self.assertEqual(status, 'installed')
+        self.assertEqual((backup/'linux-user/tf-warm.h').read_bytes(), legacy)
+        syscall = (self.root/'linux-user/syscall.c').read_bytes()
+        hook = syscall.index(installer.PRE_HOOK)
+        self.assertLess(hook, syscall.index(b'    record_syscall_start(cpu, num, arg1,', hook))
+        self.assertEqual(syscall.count(installer.PRE_HOOK), 1)
+        header = (self.root/'include/plugins/qemu-plugin.h').read_bytes()
+        self.assertIn(installer.V3_DECLARATIONS, header)
         self.assertEqual(installer.install(self.root), ('already installed', None))
 
     def test_manual_patch_matches_the_installer(self):
@@ -84,6 +125,14 @@ class WarmQemuBuildTests(unittest.TestCase):
         (self.root / 'linux-user/tf-warm.h').write_bytes(b'local backend\n')
         before = self.snapshot()
         with self.assertRaisesRegex(ValueError, 'backend differs'):
+            installer.install(self.root)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_modified_cpu_loop_is_refused_before_any_write(self):
+        path = self.root/'linux-user/i386/cpu_loop.c'
+        path.write_bytes(path.read_bytes()+b'\n/* changed CPU event ordering */\n')
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'source differs'):
             installer.install(self.root)
         self.assertEqual(self.snapshot(), before)
 
@@ -121,6 +170,8 @@ class WarmQemuBuildTests(unittest.TestCase):
 void (*warm_arm)(void) = qemu_plugin_tf_warm_arm;
 int (*warm_configure)(const char *, const char *, uint64_t, int,
                       void (*)(void), void (*)(void)) = qemu_plugin_tf_warm_configure;
+unsigned int (*warm_abi3)(void) = qemu_plugin_tf_warm_abi3;
+int (*warm_input_gate)(void (*)(void)) = qemu_plugin_tf_warm_set_input_gate;
 '''
         flags = shlex.split(subprocess.check_output(
             ['pkg-config', '--cflags', 'glib-2.0'], text=True))
@@ -131,6 +182,8 @@ int (*warm_configure)(const char *, const char *, uint64_t, int,
         names = {line.split()[-1] for line in subprocess.check_output(['nm', '-u', str(obj)], text=True).splitlines()}
         self.assertIn('qemu_plugin_tf_warm_arm', names)
         self.assertIn('qemu_plugin_tf_warm_configure', names)
+        self.assertIn('qemu_plugin_tf_warm_abi3', names)
+        self.assertIn('qemu_plugin_tf_warm_set_input_gate', names)
 
     def test_header_can_be_included_twice_in_c(self):
         self.compile_header('cc', 'c', 'c11')

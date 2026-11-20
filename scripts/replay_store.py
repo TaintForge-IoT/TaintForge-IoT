@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--store", required=True)
 
+    session_parser = subparsers.add_parser("session-add", help="Add an ordered, bounded TCP session contract")
+    session_parser.add_argument("--store", required=True)
+    session_parser.add_argument("--spec", type=Path, required=True)
+    sessions_parser = subparsers.add_parser("session-list")
+    sessions_parser.add_argument("--store", required=True)
+
     return parser
 
 
@@ -70,6 +76,18 @@ def main() -> None:
     store = ReplayStore(args.store)
 
     try:
+        if args.command == "session-add":
+            from taintforge_env.network_repair import read_object
+            specification, _ = read_object(args.spec, 16 * 1024 * 1024)
+            session = store.add_session(specification)
+            print(json.dumps({"session_id": session.session_id, **session.to_dict()}, indent=2))
+            return
+
+        if args.command == "session-list":
+            print(json.dumps([{"session_id": session.session_id, **session.to_dict()}
+                              for session in store.load_sessions()], indent=2))
+            return
+
         if args.command == "init":
             store.initialize()
             print(f"Replay store initialized: {store.root}")
@@ -159,7 +177,7 @@ def main() -> None:
     except ReplayEntryExistsError as exc:
         print(f"Replay entry already exists: {exc}")
         raise SystemExit(3)
-    except (ReplayStoreError, OSError) as exc:
+    except (ReplayStoreError, OSError, ValueError) as exc:
         print(f"Replay store error: {exc}")
         raise SystemExit(1)
 

@@ -97,6 +97,7 @@ class RequirementExtractorTests(unittest.TestCase):
         )
         event["remote_ip"] = "185.62.190.0"
         event["remote_port"] = 48101
+        event["transport"] = "tcp"
         bundle = self.bundle(syscall_events=(event,))
 
         requirement = self.only_requirement(self.extractor.extract(bundle))

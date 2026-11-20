@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from .network_runtime import payload_scope, network_open
+from .network_runtime_transport import start_server as runtime_start_server
+
 import asyncio
-import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .event_logger import append_jsonl_event
 from .network_policy import NetworkPolicy, NetworkServicePolicy
 from .dns_emulator import DNSStaticService
 
@@ -24,7 +28,7 @@ class TCPFakeService:
         self.events_log_path = self.log_dir / "network_events.jsonl"
 
     async def start(self) -> asyncio.AbstractServer:
-        server = await asyncio.start_server(
+        server = await runtime_start_server(
             self.handle_client,
             host=self.service.bind_ip,
             port=self.service.bind_port,
@@ -62,9 +66,9 @@ class TCPFakeService:
         print(f"[+] conn={conn_id} from {peer}")
 
         if self.is_catch_all:
-            log_name = f"catchall_tcp_{self.service.bind_port}_conn_{conn_id}.bin"
+            log_name = f"catchall_tcp_{self.service.bind_port}{payload_scope(self.service)}_conn_{conn_id}.bin"
         else:
-            log_name = f"tcp_{self.service.bind_port}_conn_{conn_id}.bin"
+            log_name = f"tcp_{self.service.bind_port}{payload_scope(self.service)}_conn_{conn_id}.bin"
 
         log_path = self.log_dir / log_name
 
@@ -86,7 +90,7 @@ class TCPFakeService:
         )
 
         try:
-            with log_path.open("ab") as log_file:
+            with network_open(log_path, "ab") as log_file:
                 while True:
                     data = await reader.read(4096)
 
@@ -122,6 +126,8 @@ class TCPFakeService:
                     self.write_event(
                         event={
                             "event": "tcp_data",
+                            "transport": "tcp",
+                            "request_sha256": hashlib.sha256(data).hexdigest(),
                             "connection_id": conn_id,
                             "listener_type": self.listener_type(),
                             "service_role": self.service.role,
@@ -152,6 +158,13 @@ class TCPFakeService:
                         self.write_event(
                             event={
                                 "event": "tcp_response",
+                                "network_event_version": 1,
+                                "transport": "tcp",
+                                "request_sha256": hashlib.sha256(data).hexdigest(),
+                                "response_sha256": hashlib.sha256(response).hexdigest(),
+                                "response_prepared": True,
+                                "response_sent": True,
+                                "response_origin": "synthetic",
                                 "connection_id": conn_id,
                                 "listener_type": self.listener_type(),
                                 "service_role": self.service.role,
@@ -247,8 +260,7 @@ class TCPFakeService:
             **event,
         }
 
-        with self.events_log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event_with_time, ensure_ascii=False) + "\n")
+        append_jsonl_event(self.events_log_path, event_with_time)
 
     @staticmethod
     def parse_peer(peer) -> tuple[str | None, int | None]:

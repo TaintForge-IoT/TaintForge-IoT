@@ -106,7 +106,8 @@ def verify(root, *, expected_sha256=None):
     retirement.validate_settings(binding["settings"]["phase1_retirement"])
     checked = verify_attempt(binding, result)
     probe.require(result["status"] == checked["status"], "Saved supervisor outcome differs from verified evidence")
-    return {"status": "verified", "schema_version": SCHEMA, "scope": SCOPE,
+    quality = {'analysis_quality': checked['analysis_quality']} if 'analysis_quality' in checked else {}
+    return {**quality, "status": "verified", "schema_version": SCHEMA, "scope": SCOPE,
             "manifest_sha256": digest, "reference_digest_checked": expected_sha256 is not None,
             "authenticity": "not_asserted", "attempt_outcome": checked["status"],
             "identity": manifest["identity"], "phase1_retirement": checked["phase1_retirement"]}
@@ -138,7 +139,9 @@ def pack(run_dir, destination):
         sources["logs/capsule/" + name] = run / "logs/capsule" / name
     if 'hardening' in binding.get('settings', {}):
         for name in ('execution-context-1.json', 'execution-context-2.json', 'm4-setup.json'):
-            sources['logs/capsule/' + name] = run / 'logs/capsule' / name
+            path = run / 'logs/capsule' / name
+            if path.exists():
+                sources['logs/capsule/' + name] = path
     if "input_retirement" not in binding:
         sources["logs/capsule/capsule-fd.txt"] = run / "logs/capsule/capsule-fd.txt"
     else:
@@ -148,6 +151,12 @@ def pack(run_dir, destination):
         sources["config/observer-contract.json"] = run / "config/observer-contract.json"
     for name in ("runtime_stdout.log", "qemu_strace.log"):
         sources["logs/" + name] = run / "logs" / name
+    if phase.get('network_observer') is not None:
+        endpoint = run / 'logs/network_endpoints'
+        probe.require(Path(phase['network_observer']['output_directory']) == endpoint
+                      and endpoint.is_dir() and not endpoint.is_symlink(), 'Invalid endpoint evidence directory')
+        for path in endpoint.iterdir():
+            sources['logs/network_endpoints/' + path.name] = path
     for path in analyzer.paths.values():
         if path.exists():
             sources["phase1/" + path.name] = path

@@ -9,12 +9,12 @@ from taintforge_env import afl_file as f
 HERE = Path(__file__).resolve().parent
 
 
-def guest(directory, *, loops=20000000, constant=False):
+def guest(directory, *, loops=20000000, constant=False, faults=False):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=False)
     obj, binary = directory/'guest.o', directory/'guest-i386'
     p.command('as', '--32', '--defsym', 'WORK_LOOPS='+str(loops), '--defsym',
-              'CONSTANT_PATH='+str(int(constant)), HERE/'guest.S', '-o', obj)
+              'CONSTANT_PATH='+str(int(constant)), '--defsym', 'FAULT_FIXTURE='+str(int(faults)), HERE/'guest.S', '-o', obj)
     p.command('ld', '-m', 'elf_i386', '-z', 'noexecstack', '--build-id=none', obj, '-o', binary)
     p.command('strip', '--strip-all', binary)
     inspect_input(binary)
@@ -32,3 +32,11 @@ def components(directory):
     built.update(probe=str(probe), guest=str(guest(directory/'fixture', loops=1000)),
                  constant_guest=str(guest(directory/'constant', loops=1000, constant=True)))
     return built
+
+
+def fault_mutator(directory):
+    directory = Path(directory).resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    library = directory/'mutator.so'
+    p.command('cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror', HERE/'fault_mutator.c', '-o', library)
+    return library

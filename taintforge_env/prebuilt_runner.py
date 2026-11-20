@@ -146,6 +146,8 @@ class PreparedRunContext:
     replay_store_path: Path | None = None
     replay_store_sha256: str | None = None
     replay_store_entries: int | None = None
+    network_repair_policy: Any = None
+    effective_network_policy: Any = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -277,6 +279,19 @@ class PrebuiltRootfsRunner:
         elif not template_network_policy_path.is_file():
             template_network_policy_path = None
 
+        from .network_repair import bound_policy, effective_policy, NetworkRepairError
+        try:
+            authorization = bound_policy(self.config.session_dir)
+            effective_network = None
+            if authorization is not None:
+                if authorization.mode != self.config.network_mode or template_network_policy_path is None:
+                    raise NetworkRepairError("network repair authorization differs from the selected backend")
+                from .environment_manifest import EnvironmentManifestStore
+                semantic = EnvironmentManifestStore(session.environment_manifest_store).load(iteration.environment_manifest_version)
+                effective_network = effective_policy(load_network_policy(template_network_policy_path), semantic, authorization)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise PrebuiltRunnerError(f"invalid network repair binding: {exc}") from exc
+
         try:
             guest_binary = resolve_runtime_guest_binary(runtime)
             host_binary = resolve_runtime_host_binary(runtime,self.config.binary_path,self.config.project_root)
@@ -303,11 +318,15 @@ class PrebuiltRootfsRunner:
             replay_store_path = self.config.replay_store_path
             replay_store_sha256 = str(replay_validation["store_sha256"])
             replay_store_entries = int(replay_validation["entries"])
+            if authorization is not None and (replay_store_sha256 != authorization.store_sha256
+                    or replay_store_path.resolve() != authorization.store_path):
+                raise PrebuiltRunnerError("selected replay store differs from the network repair authorization")
             if (self.config.replay_store_expected_sha256 is not None and replay_store_sha256 != self.config.replay_store_expected_sha256):
                 raise PrebuiltRunnerError(f"replay store changed after the execution contract was bound: expected {self.config.replay_store_expected_sha256}, got {replay_store_sha256}")
             assert template_network_policy_path is not None
             try:
-                validate_replay_policy(policy=load_network_policy(template_network_policy_path),replay_store=ReplayStore(replay_store_path))
+                validate_replay_policy(policy=effective_network or load_network_policy(template_network_policy_path),
+                    replay_store=ReplayStore(replay_store_path), allow_empty=authorization is not None)
             except (NetworkReplayError,OSError,TypeError,ValueError,json.JSONDecodeError) as exc:
                 raise PrebuiltRunnerError(f"invalid deterministic replay preflight: {exc}") from exc
 
@@ -340,7 +359,8 @@ class PrebuiltRootfsRunner:
             if target_spec.goal_id != attempt_contract.goal_id:
                 raise PrebuiltRunnerError("target-state goal does not match the prepared attempt contract")
 
-        return PreparedRunContext(session=session,iteration=iteration,iteration_dir=iteration_dir,execution_rootfs=execution_rootfs,environment_tree_sha256=actual_digest,template_run_dir=template_run_dir,template_runtime_path=template_runtime_path,template_network_policy_path=template_network_policy_path,host_binary=host_binary,guest_binary=guest_binary,run_dir=run_dir,claim_path=claim_path,execution_plan=execution_plan,attempt_contract=attempt_contract,target_spec=target_spec,replay_store_path=replay_store_path,replay_store_sha256=replay_store_sha256,replay_store_entries=replay_store_entries)
+        return PreparedRunContext(session=session,iteration=iteration,iteration_dir=iteration_dir,execution_rootfs=execution_rootfs,environment_tree_sha256=actual_digest,template_run_dir=template_run_dir,template_runtime_path=template_runtime_path,template_network_policy_path=template_network_policy_path,host_binary=host_binary,guest_binary=guest_binary,run_dir=run_dir,claim_path=claim_path,execution_plan=execution_plan,attempt_contract=attempt_contract,target_spec=target_spec,replay_store_path=replay_store_path,replay_store_sha256=replay_store_sha256,replay_store_entries=replay_store_entries,
+            network_repair_policy=authorization, effective_network_policy=effective_network)
 
     def run_and_complete(self) -> PrebuiltRunnerResult:
         self.guest_execution_observed = False
@@ -372,6 +392,15 @@ class PrebuiltRootfsRunner:
             self._update_claim(context,claim,RunnerStage.POSTPROCESSING,malware_started=True,guest_exit_code=guest_exit_code)
             if network_backend is not None:
                 finalization.run("network_cleanup", lambda: network_backend.cleanup(finalize_logs=True))
+                status_path = context.run_dir / "logs/network_runtime_status.json"
+                if status_path.is_file():
+                    def check_network_runtime():
+                        status = _load_json_object(status_path, "network runtime status")
+                        if status.get("attempt_id") != context.attempt_contract.attempt_id:
+                            raise PrebuiltRunnerError("network runtime belongs to another attempt")
+                        if status.get("termination_reason") or status.get("cleanup_status") != "cleaned":
+                            raise PrebuiltRunnerError("network runtime stopped: " + str(status.get("termination_reason") or status.get("cleanup_status")))
+                    finalization.run("network_runtime", check_network_runtime)
             else:
                 finalization.update("network_cleanup", "not_applicable")
             finalization.run("filesystem", lambda: self._capture_observation(context, "after"))
@@ -384,6 +413,12 @@ class PrebuiltRootfsRunner:
                 phase1_transitions = finalization.run("phase1", lambda: finish_attempt(context, guest_exit_code)) or ()
             else:
                 finalization.update("phase1", "not_applicable")
+            capsule_binding_path = context.run_dir / 'config/capsule_binding.json'
+            if capsule_binding_path.is_file():
+                binding = _load_json_object(capsule_binding_path, 'capsule binding')
+                if 'network' in binding:
+                    from .network_capsule import finalize_integration
+                    finalization.run('network_capsule', lambda: finalize_integration(binding))
             self._postprocess(context, finalization)
             target_evaluation = self._evaluate_target_state(context)
             self._validate_final_artifacts(context)
@@ -420,17 +455,31 @@ class PrebuiltRootfsRunner:
             )
 
         except Exception as exc:
+            network_cleanup_confirmed = network_backend is None
             if network_backend is not None:
                 try:
                     network_backend.cleanup(finalize_logs=False)
+                    network_cleanup_confirmed = True
+                    status_path = context.run_dir / "logs/network_runtime_status.json"
+                    if status_path.is_file():
+                        status = _load_json_object(status_path, "network runtime cleanup status")
+                        network_cleanup_confirmed = (status.get("cleanup_status") == "cleaned"
+                            and status.get("attempt_id") == context.attempt_contract.attempt_id)
                 except Exception:
-                    pass
+                    network_cleanup_confirmed = False
             marker = context.run_dir / "logs" / "malware_started"
             malware_started = marker.is_file()
             self.guest_execution_observed = malware_started
             retry_safe = False
-            if not malware_started:
+            if not malware_started and network_cleanup_confirmed:
                 retry_safe = self._rootfs_still_matches_snapshot(context)
+                service_path = context.run_dir / 'logs/capsule/service.json'
+                if service_path.is_file():
+                    try:
+                        service = _load_json_object(service_path, 'capsule service cleanup status')
+                        retry_safe = retry_safe and service.get('tree_empty') is True and service.get('attempt_id') == context.attempt_contract.attempt_id
+                    except (OSError, ValueError, RuntimeError):
+                        retry_safe = False
             try:
                 self._update_claim(context,claim,RunnerStage.FAILED,malware_started=malware_started,guest_exit_code=guest_exit_code,error=f"{type(exc).__name__}: {exc}",retry_safe=retry_safe,network_mode=self.config.network_mode)
             except Exception:
@@ -472,6 +521,16 @@ class PrebuiltRootfsRunner:
                     raise PrebuiltRunnerError("cannot reset an attempt after malware started")
                 if claim.get("retry_safe") is not True:
                     raise PrebuiltRunnerError("execution claim is not marked retry-safe")
+                network_status = iteration_dir / "run/logs/network_runtime_status.json"
+                if network_status.is_file():
+                    status = _load_json_object(network_status, "network runtime cleanup status")
+                    if status.get("cleanup_status") != "cleaned" or status.get("attempt_id") != record.attempt_id:
+                        raise PrebuiltRunnerError("network cleanup is unconfirmed; cannot reset this attempt")
+                service_path = iteration_dir / 'run/logs/capsule/service.json'
+                if service_path.is_file():
+                    service = _load_json_object(service_path, 'capsule service cleanup status')
+                    if service.get('tree_empty') is not True or service.get('attempt_id') != record.attempt_id:
+                        raise PrebuiltRunnerError('capsule cleanup is unconfirmed; cannot reset this attempt')
 
                 rootfs = iteration_dir / "execution" / "rootfs"
                 try:
@@ -514,6 +573,15 @@ class PrebuiltRootfsRunner:
                 shutil.copy2(source, config_dir / filename)
 
             runtime = _load_json_object(context.template_runtime_path,"template runtime")
+            authorization = context.network_repair_policy
+            if authorization is not None:
+                from .network_repair import NetworkRepairPolicy
+                verified = NetworkRepairPolicy.load(authorization.path, authorization.sha256)
+                verified.verify_store()
+                shutil.copyfile(verified.path, config_dir / "network_repair_policy.json")
+                NetworkRepairPolicy.load(config_dir / "network_repair_policy.json", authorization.sha256)
+                _atomic_write_json(config_dir / "network_policy.json", context.effective_network_policy.to_dict())
+                runtime["network_repair_policy_sha256"] = authorization.sha256
             runtime["rootfs"] = str(context.execution_rootfs)
             runtime["host_binary"] = str(context.host_binary)
             runtime["host_binary_path"] = str(context.host_binary)
@@ -768,6 +836,11 @@ exit "$status"
             ]
         binding_path = context.run_dir / "config/capsule_binding.json"
         binding = json.loads(binding_path.read_text()) if binding_path.is_file() else None
+        if binding is not None and 'network' in binding:
+            from .network_capsule import bind_runtime
+            if network_backend is None:
+                raise PrebuiltRunnerError('network capsule requires a controlled network backend')
+            command = bind_runtime(binding, command, network_backend)
         if binding is not None and "resources" in binding["settings"]:
             from .capsule_resources import execute
             result = execute(binding, command, self.executor, cwd=self.config.project_root, check=False,
@@ -776,6 +849,18 @@ exit "$status"
             result = self.executor.run(command,cwd=self.config.project_root,check=False,stdout_path=stdout_path,stderr_path=stderr_path)
         exit_path = context.run_dir / "logs" / "guest_exit_code"
         if not exit_path.is_file():
+            guard_path = context.run_dir / "config/network_guard_result.json"
+            if network_backend is not None and guard_path.is_file():
+                guard = _load_json_object(guard_path, "network guest guard result")
+                observed = guard.get("command_exit_code")
+                normalized = observed if type(observed) is int and observed >= 0 else 128 - observed if type(observed) is int else None
+                if (guard.get("attempt_id") == context.attempt_contract.attempt_id
+                        and guard.get("guest_process_stopped") is True
+                        and isinstance(guard.get("termination_reason"), str)
+                        and guard["termination_reason"].startswith("network_")
+                        and normalized == result.returncode):
+                    self._normalize_output_ownership(context, [context.run_dir / "logs"])
+                    return normalized
             try:
                 with stderr_path.open("rb") as stream:
                     stream.seek(0, os.SEEK_END)
@@ -854,6 +939,12 @@ exit "$status"
             "trace_backend": context.execution_plan.trace_backend.value,
             "target_arch": context.execution_plan.target.arch,
         }
+        guard_path = context.run_dir / "config/network_guard_result.json"
+        if guard_path.is_file():
+            guard = _load_json_object(guard_path, "network guest guard result")
+            execution["network_termination_reason"] = guard.get("termination_reason")
+            execution["exit_code_source"] = ("sandbox_wrapper" if
+                (context.run_dir / "logs/guest_exit_code").is_file() else "network_guard_command")
         _atomic_write_json(context.run_dir / "config" / "prebuilt_execution.json",execution)
 
     def _parse_logs(self, context: PreparedRunContext) -> None:
@@ -868,6 +959,19 @@ exit "$status"
                 "--target-arch",
                 context.execution_plan.target.arch,
             ]
+            binding_path = context.run_dir / "config/phase1_binding.json"
+            if binding_path.is_file():
+                binding = _load_json_object(binding_path, "Phase 1 binding")
+                if "network_observer" in binding:
+                    observer = binding["network_observer"]
+                    if (binding.get("session_id") != context.session.session_id
+                            or binding.get("attempt_id") != context.attempt_contract.attempt_id):
+                        raise PrebuiltRunnerError("network observer belongs to another session or attempt")
+                    expected = context.run_dir / "logs/network_endpoints/events.jsonl"
+                    if observer.get("events") != str(expected):
+                        raise PrebuiltRunnerError("network observer output differs from the bound run")
+                    parse_command.extend(["--endpoint-events", str(expected),
+                        "--endpoint-session", binding["session_id"], "--endpoint-attempt", binding["attempt_id"]])
         else:
             parse_command = [
                 sys.executable,
@@ -884,6 +988,18 @@ exit "$status"
         )
 
     def _plan_repairs(self, context: PreparedRunContext) -> None:
+        status_path = context.run_dir / "logs/network_runtime_status.json"
+        if status_path.is_file():
+            status = _load_json_object(status_path, "network runtime status")
+            if status.get("termination_reason") or status.get("cleanup_status") != "cleaned":
+                raise PrebuiltRunnerError("automatic repair is unavailable after network runtime termination")
+        options = []
+        if getattr(context, "network_repair_policy", None) is not None:
+            from .network_repair import NetworkRepairPolicy
+            NetworkRepairPolicy.load(context.run_dir / "config/network_repair_policy.json",
+                                     context.network_repair_policy.sha256)
+            options = ["--network-repair-policy", str(context.run_dir / "config/network_repair_policy.json"),
+                       "--network-policy", str(context.run_dir / "config/network_policy.json")]
         self.executor.run(
             [
                 sys.executable,
@@ -892,7 +1008,7 @@ exit "$status"
                 str(context.run_dir / "config" / "runtime_requirements.json"),
                 "--out",
                 str(context.run_dir / "config" / "repair_plan.json"),
-            ], cwd=self.config.project_root,check=True)
+            ] + options, cwd=self.config.project_root,check=True)
 
     def _generate_report(self, context: PreparedRunContext) -> None:
         self.executor.run(
@@ -914,6 +1030,9 @@ exit "$status"
         else:
             finalization.update("repair_plan", "skipped", reason="requirements are unavailable")
         finalization.finish()
+        if finalization.errors and getattr(context, "target_spec", None) is not None:
+            finalization.run("target_state", lambda: self._evaluate_target_state(context))
+            finalization.finish()
         try:
             self._generate_report(context)
         except Exception as exc:
@@ -989,7 +1108,9 @@ exit "$status"
             responder_mode=(self.config.network_mode if self.config.network_mode in {"replay", "record"} else "emulated"),
             replay_store_path=(
                 context.run_dir / "config" / "replay_store" if context.replay_store_path is not None else None),
-            replay_store_expected_sha256=context.replay_store_sha256
+            replay_store_expected_sha256=context.replay_store_sha256,
+            allow_empty_replay=getattr(context, "network_repair_policy", None) is not None,
+            attempt_id=context.attempt_contract.attempt_id,
             )
         return self.network_backend_factory(backend_config, self.executor)
 

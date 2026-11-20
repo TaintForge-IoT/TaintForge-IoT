@@ -9,6 +9,7 @@ from typing import Any
 
 from .log_io import iter_log_lines, read_log_preview
 from .attempt_finalization import write_json
+from .network_events import normalize_network_event
 
 
 def _first_artifact(*paths: Path) -> Path:
@@ -110,6 +111,9 @@ class RunReportGenerator:
                     "endpoint_parsed": endpoint_parsed, "result": event.get("result"),
                     "errno": event.get("errno"), "raw": event.get("raw"),
                     "source_file": event.get("source_file"), "line_number": event.get("line_number"),
+                    "transport": event.get("transport"), "socket_fd": event.get("socket_fd"),
+                    "endpoint_source": event.get("endpoint_source"), "endpoint_reason": event.get("endpoint_reason"),
+                    "endpoint_observer_status": event.get("endpoint_observer_status"),
                 })
         attempt_details = {
             "network_targets": sorted(network_targets),
@@ -131,6 +135,7 @@ class RunReportGenerator:
                 "host_wrapper_paths": syscall_summary.get("host_wrapper_paths", []),
                 "all_paths": syscall_summary.get("all_paths", []),
                 **attempt_details,
+                "network_endpoint_observer": syscall_summary.get("network_endpoint_observer", {"status": "not_configured"}),
                 "high_risk_count": syscall_summary.get("high_risk_count", 0),
                 "high_risk_events": syscall_summary.get("high_risk_events", []),
             }
@@ -306,11 +311,14 @@ class RunReportGenerator:
         runtime: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         runtime = runtime or {}
+        runtime_status = self.load_json_optional(self.logs_dir / "network_runtime_status.json")
         mode, mode_source = _network_setting(runtime, network_policy, "network_mode", "mode")
         allow_internet, internet_source = _network_setting(
             runtime, network_policy, "allow_internet", "allow_internet")
         services = network_policy.get("services", [])
         catch_all = network_policy.get("catch_all", {})
+        normalized_network = [normalize_network_event(event) for event in network_events]
+        delivery_events = {"network_response_sent", "network_response_failed"}
 
         events_by_type = Counter(
             str(event.get("event", "unknown"))
@@ -334,12 +342,13 @@ class RunReportGenerator:
 
         udp_events = [
             event for event in network_events
-            if event.get("listener_type") == "udp_transparent" or event.get("transport") == "udp"
+            if (event.get("listener_type") == "udp_transparent" or event.get("transport") == "udp")
+            and event.get("event") not in delivery_events
         ]
 
         dns_events = [
-            event for event in network_events
-            if event.get("udp_role") == "dns" or str(event.get("event", "")).startswith("dns_")
+            event for event, normalized in zip(network_events, normalized_network)
+            if normalized["protocol_hint"] == "dns" and event.get("event") not in delivery_events
         ]
 
         http_events = [
@@ -379,15 +388,42 @@ class RunReportGenerator:
 
         dns_responses_sent = sum(
             1
-            for event in dns_events
-            if event.get("dns_response_sent") is True
+            for event in normalized_network
+            if event["protocol_hint"] == "dns" and event["response_observed"]
         )
+
+        session_events = [event for event in network_events
+                          if event.get("listener_type") == "deterministic_session"]
+        transcript = [event for event in session_events if event.get("event") in {
+            "session_start", "replay_hit", "replay_miss", "session_abort", "session_complete", "session_rejected"}]
+        transcript_fields = ("event", "replay_session_id", "connection_id", "step_index", "exchange_id",
+                             "request_sha256", "response_sha256", "response_sent", "reason", "completed_steps")
 
         return {
             "mode": mode,
+            "runtime": runtime_status or None,
+            "capsule_integration": self.load_json_optional(self.config_dir / 'network_capsule_result.json') or None,
+            "termination_reason": runtime_status.get("termination_reason"),
+            "cleanup_status": runtime_status.get("cleanup_status"),
+            "evidence_complete": runtime_status.get("evidence_complete"),
             "mode_source": mode_source,
             "allow_internet": allow_internet,
             "allow_internet_source": internet_source,
+            "repair_policy_sha256": runtime.get("network_repair_policy_sha256"),
+            "authorized_repair_services": [service for service in services
+                if isinstance(service, dict) and service.get("role") in {"net3_replay", "net3_dns_records", "net4_session"}],
+            "session_replay": {
+                "configured": [service for service in services
+                               if isinstance(service, dict) and service.get("replay_session_id") is not None],
+                "started": sum(event.get("event") == "session_start" for event in session_events),
+                "completed": sum(event.get("event") == "session_complete" for event in session_events),
+                "aborted": sum(event.get("event") == "session_abort" for event in session_events),
+                "rejection_events": sum(event.get("event") == "session_rejected" for event in session_events),
+                "transcript": [{key: event[key] for key in transcript_fields if key in event}
+                               for event in transcript[:1024]],
+                "transcript_truncated": len(transcript) > 1024,
+                "semantic_satisfaction": "unknown",
+            },
             "events_available": self.network_events_path.is_file(),
             "services_count": len(services),
             "services": services,
@@ -402,7 +438,12 @@ class RunReportGenerator:
             "dns_events_total": len(dns_events),
             "dns_queries": dns_queries,
             "dns_responses_sent": dns_responses_sent,
-            "dns_responses_prepared": sum(e.get("dns_response_prepared") is True for e in dns_events),
+            "dns_responses_prepared": sum(normalize_network_event(e)["response_prepared"] for e in dns_events),
+            "responses_sent": sum(e["response_observed"] for e in normalized_network),
+            "response_send_failures": events_by_type["network_response_failed"],
+            "replay_hits": events_by_type["replay_hit"] + events_by_type["dns_replay_hit"],
+            "replay_misses": events_by_type["replay_miss"] + events_by_type["dns_replay_miss"],
+            "semantic_satisfaction": "unknown",
             "known_tcp_targets": self.unique_targets(known_tcp_events),
             "unknown_tcp_targets": self.unique_targets(unknown_tcp_events),
             "udp_targets": self.unique_targets(udp_events),
@@ -630,12 +671,28 @@ class RunReportGenerator:
         lines.append("- Mode and internet access above describe the saved configuration.")
         lines.append(f"- Network service log available: `{network.get('events_available')}`")
         lines.append(f"- Known services: `{network.get('services_count')}`")
+        if network.get("repair_policy_sha256"):
+            lines.append(f"- Offline repair policy SHA-256: `{network['repair_policy_sha256']}`")
+            lines.append(f"- Services configured by offline repairs: `{len(network['authorized_repair_services'])}`")
+            lines.append("- Applied service configuration requires runtime and application-goal validation.")
         lines.append(f"- Total events: `{network.get('events_total')}`")
+        if network.get("runtime"):
+            lines.append(f"- Network runtime termination: `{network.get('termination_reason') or 'normal'}`")
+            lines.append(f"- Network cleanup: `{network.get('cleanup_status')}`")
+            lines.append(f"- Complete network evidence: `{network.get('evidence_complete')}`")
+        sessions = network.get("session_replay", {})
+        if sessions.get("configured") or sessions.get("started"):
+            lines.append(f"- Ordered replay sessions completed/aborted: `{sessions.get('completed', 0)}/{sessions.get('aborted', 0)}`")
+            lines.append("- Session completion records the configured wire dialogue; the target goal is evaluated separately.")
         lines.append(f"- Known TCP events: `{network.get('known_tcp_events')}`")
         lines.append(f"- Unknown TCP events: `{network.get('unknown_tcp_events')}`")
         lines.append(f"- UDP datagrams: `{network.get('udp_datagrams')}`")
         lines.append(f"- DNS datagrams: `{network.get('dns_datagrams')}`")
         lines.append(f"- DNS responses sent: `{network.get('dns_responses_sent')}`")
+        lines.append(f"- Response send events: `{network.get('responses_sent')}`")
+        lines.append(f"- Response send failures: `{network.get('response_send_failures')}`")
+        lines.append(f"- Replay hits / misses: `{network.get('replay_hits')}` / `{network.get('replay_misses')}`")
+        lines.append("- A send event confirms transport submission; protocol success requires the target oracle.")
         lines.append(f"- DNS queries: `{network.get('dns_queries')}`")
         lines.append("")
 
@@ -670,6 +727,8 @@ class RunReportGenerator:
         lines.append("")
         lines.append(f"- Recorded connect/send attempts: `{syscalls.get('network_attempts_count', 0)}`")
         lines.append(f"- Attempts with an undecoded endpoint: `{syscalls.get('network_attempts_without_endpoint_count', 0)}`")
+        endpoint_status = syscalls.get("network_endpoint_observer", {})
+        lines.append(f"- Endpoint observer: `{endpoint_status.get('status', 'not_configured')}`")
         lines.append("")
         if network_attempts:
             lines.append("| Syscall | Target | Result |")

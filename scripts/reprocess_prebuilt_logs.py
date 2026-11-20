@@ -86,8 +86,18 @@ def reprocess(run_dir: Path, out: Path) -> dict:
                     "timeout_classification": "wrapper_exit_code_124",
                 })
 
+        endpoint_options = {}
+        binding_path = source / "config/phase1_binding.json"
+        if binding_path.is_file() and not binding_path.is_symlink():
+            binding = json.loads(binding_path.read_text())
+            if isinstance(binding, dict) and "network_observer" in binding:
+                expected = source / "logs/network_endpoints/events.jsonl"
+                if binding["network_observer"].get("events") != str(expected):
+                    raise ValueError("network endpoint sidecar does not match its original run")
+                endpoint_options = {"endpoint_events": expected, "session_id": binding["session_id"],
+                                    "attempt_id": binding["attempt_id"]}
         summary = parse_qemu_strace(raw_trace, output / "logs/syscall_events.jsonl",
-                                   target_arch=runtime["arch"])
+                                   target_arch=runtime["arch"], **endpoint_options)
         bundle = load_observation_bundle(output)
         requirements = RequirementExtractor().extract(bundle)
         requirements_path = output / "config/runtime_requirements.json"

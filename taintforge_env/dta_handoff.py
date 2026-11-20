@@ -35,6 +35,38 @@ def _equal(left, right, message):
     _require(canonical_hash(left) == canonical_hash(right), message)
 
 
+def _select_recapture_sites(sites, known, max_sites):
+    """Deterministically select bounded, auditable DSE hints from full DTA evidence.
+
+    Preserve the old order when there is no overflow. On overflow, prefer one
+    representative per (PC, outcome, code generation, dependency offsets),
+    prioritizing unknown opposite outcomes and prefixes DSE can process.
+    Every selected item retains its original source case and event identity.
+    """
+    _limit(max_sites, 4096, 'handoff sites')
+    if len(sites) <= max_sites:
+        return sites
+    seen, distinct, remaining = set(), [], []
+    for index, (_case, group) in enumerate(sites):
+        key = (group['pc'], group['outcome'], group['source_block_generation'],
+               tuple(group['offsets']))
+        if key in seen:
+            remaining.append(index)
+        else:
+            seen.add(key)
+            distinct.append(index)
+
+    def priority(index):
+        group = sites[index][1]
+        opposite = 'not-taken' if group['outcome'] == 'taken' else 'taken'
+        return ((group['pc'], opposite) in known, group['seq'] > 1024, index)
+
+    chosen = sorted(distinct, key=priority)[:max_sites]
+    if len(chosen) < max_sites:
+        chosen.extend(remaining[:max_sites - len(chosen)])
+    return [sites[index] for index in sorted(chosen)]
+
+
 def export_handoff(*, analysis, out, max_sites=256):
     """Read original Stage 2 paths, recheck receipts, publish only after auditing."""
     _limit(max_sites, 4096, 'handoff sites')
@@ -268,28 +300,32 @@ def export_handoff(*, analysis, out, max_sites=256):
 
     requests = []
     by_case = {case['case']: case for case in audited}
-    for accepted_row in accepted:
-        case = by_case[accepted_row['case']]
-        for group in case['groups']:
-            _require(len(requests) < max_sites, 'DTA handoff site budget exceeded')
-            opposite = 'not-taken' if group['outcome'] == 'taken' else 'taken'
-            request = {'schema': 1, 'kind': 'DTA_SITE_RECAPTURE_REQUEST',
-                'status': 'NEEDS_FRESH_IR_AND_FLAGS', 'dse_eligible': False, 'solver_executed': False,
-                'source_case': case['case'], 'source_receipt_sha256': case['receipt_sha256'],
-                'trace_sha256': case['trace_sha256'], 'input_sha256': case['sha256'],
-                'target_sha256': target_identity['sha256'], 'snapshot': report['snapshot'],
-                'runtime_bundle_sha256': bundle['bundle_sha256'], 'input_path': input_path, 'argv': argv,
-                'observed_site': group,
-                'diagnostic_occurrence_semantics': 'all_logged_conditional_events_at_PC_per_vCPU',
-                'exact_instruction_generation': None, 'instruction_bytes': None, 'ir_origin': None,
-                'executable_selector': None, 'flags_verified_in_source_run': case['phase']['flags_verified'],
-                'desired_outcome': opposite, 'opposite_observed_elsewhere': (group['pc'], opposite) in known,
-                'required_checks': ['fresh_exact_instruction_and_IR_origin', 'post_read_occurrence_mapping',
-                    'verified_x86_flag_contract', 'file_read_identity', 'supported_complete_prefix',
-                    'solver_result', 'concrete_prefix_preserved_branch_inversion'],
-                'protected_diagnostic_channel': False}
-            request['request_id'] = canonical_hash(request)
-            requests.append(request)
+    raw_sites = [(by_case[row['case']], group)
+                 for row in accepted for group in by_case[row['case']]['groups']]
+    # Audit all recorded groups above; this bound affects only DSE recapture hints.
+    # Prefer distinct branch outcomes/dependencies instead of spending 256 hints
+    # on successive occurrences of the same loop branch. Never synthesize a
+    # group or change its (case, occurrence, sequence) provenance.
+    selected_sites = _select_recapture_sites(raw_sites, known, max_sites)
+    for case, group in selected_sites:
+        opposite = 'not-taken' if group['outcome'] == 'taken' else 'taken'
+        request = {'schema': 1, 'kind': 'DTA_SITE_RECAPTURE_REQUEST',
+            'status': 'NEEDS_FRESH_IR_AND_FLAGS', 'dse_eligible': False, 'solver_executed': False,
+            'source_case': case['case'], 'source_receipt_sha256': case['receipt_sha256'],
+            'trace_sha256': case['trace_sha256'], 'input_sha256': case['sha256'],
+            'target_sha256': target_identity['sha256'], 'snapshot': report['snapshot'],
+            'runtime_bundle_sha256': bundle['bundle_sha256'], 'input_path': input_path, 'argv': argv,
+            'observed_site': group,
+            'diagnostic_occurrence_semantics': 'all_logged_conditional_events_at_PC_per_vCPU',
+            'exact_instruction_generation': None, 'instruction_bytes': None, 'ir_origin': None,
+            'executable_selector': None, 'flags_verified_in_source_run': case['phase']['flags_verified'],
+            'desired_outcome': opposite, 'opposite_observed_elsewhere': (group['pc'], opposite) in known,
+            'required_checks': ['fresh_exact_instruction_and_IR_origin', 'post_read_occurrence_mapping',
+                'verified_x86_flag_contract', 'file_read_identity', 'supported_complete_prefix',
+                'solver_result', 'concrete_prefix_preserved_branch_inversion'],
+            'protected_diagnostic_channel': False}
+        request['request_id'] = canonical_hash(request)
+        requests.append(request)
     requests.sort(key=lambda item: (item['opposite_observed_elsewhere'], item['source_case'], item['observed_site']['seq']))
     result = {'schema': 1, 'status': 'AUDITED_DTA_CORPUS_AND_RECAPTURE_HINTS',
         'audit_scope': 'offline_artifact_consistency_not_independent_runtime_reverification',
@@ -302,6 +338,12 @@ def export_handoff(*, analysis, out, max_sites=256):
         'historical_isolation_independently_reexecuted': False, 'universal_equivalence': False,
         'evidence': {key: {field: value[field] for field in ('sha256', 'size')}
                      for key, value in sorted(inventory.items())}}
+    if len(raw_sites) > max_sites:
+        # Never present a truncated hint inventory as complete. The entire raw
+        # trace and all source cases have already passed the normal DTA audit.
+        result.update(recapture_site_candidates_total=len(raw_sites),
+                      recapture_sites_omitted_due_to_budget=len(raw_sites) - len(requests),
+                      recapture_selection_policy='diverse_site_first_v1')
     # Recheck all consumed artifacts before creating anything at the destination.
     for identity in inventory.values():
         _equal(_pin(identity['path'], identity['size'])[1], identity, 'DTA evidence changed before publication')

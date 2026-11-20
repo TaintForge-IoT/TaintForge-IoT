@@ -80,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--adopt-existing-session", action="store_true")
     run.add_argument("--initialize-only", action="store_true")
+    run.add_argument("--network-repair-policy", type=Path,
+                     help="Explicit offline network repair authorizations; bound to this session")
 
     status = subparsers.add_parser("status", help="show loop and controller state")
     status.add_argument("--session-dir", type=Path, required=True)
@@ -131,6 +133,7 @@ def main() -> int:
                 max_steps=args.max_steps,
                 adopt_existing_session=args.adopt_existing_session,
                 initialize_only=args.initialize_only,
+                network_repair_policy_path=args.network_repair_policy,
             )
         ).run()
         print("[+] Environment synthesis loop finished")

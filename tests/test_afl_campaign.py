@@ -26,7 +26,7 @@ class CampaignTests(unittest.TestCase):
         with patch.object(old.resources,'preflight'), patch.object(old.c,'build_plugin',return_value=built), \
              patch.object(old.c.p,'load_phase1',return_value=(None,Phase1Runtime.load(self.plugin),None)):
             f.prepare_campaign(root,binary=self.built['guest'],qemu=self.qemu,plugin=self.plugin,
-                               guest_path='/etc/afl-input',seeds=seeds)
+                               guest_path='/etc/afl-input',seeds=seeds,analysis_policy='research')
         return root
 
     def test_fresh_session_input_and_coverage_for_each_case(self):
@@ -61,6 +61,22 @@ class CampaignTests(unittest.TestCase):
         self.assertFalse(any(e.path=='/tmp/attempt-only' for e in saved.entries))
         self.assertEqual((root/'cases/00000000/coverage.map').read_bytes()[ord('B')],1)
         self.assertEqual((root/'cases/00000001/coverage.map').read_bytes()[ord('C')],1)
+
+    def test_clone_verifies_the_real_relocated_bundle_and_rebinds_seed_assets(self):
+        from taintforge_env import afl_warm as warm
+        from taintforge_env.afl_replay import clone_campaign
+        root=self.prepare();value=f.read_json(root/'campaign.json')
+        value['warm']=warm.configuration(root,bootstrap_seconds=30,campaign_seconds=60,timeout_ms=100,max_rss_mib=512)
+        value['execution_mode']=warm.PROFILE
+        f.atomic_json(root/'campaign.json',value)
+        output=self.base/'cloned'
+        cloned=clone_campaign(root,output,inputs=[b'C'])
+        self.assertEqual(f.verify_campaign(output),cloned)
+        seed=next((output/'seeds').iterdir())
+        self.assertIn(str(seed),cloned['assets'])
+        seed.write_bytes(b'different')
+        with self.assertRaisesRegex(RuntimeError,'asset changed'):
+            f.verify_campaign(output)
 
     def test_snapshot_and_asset_tampering_are_rejected(self):
         root=self.prepare()

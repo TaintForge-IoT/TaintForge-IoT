@@ -50,9 +50,10 @@ class RepairDecisionResult:
     reason: str
     target_path: str | None = None
     created_paths: tuple[str, ...] = ()
+    network_service: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "decision_id": self.decision_id,
             "requirement_id": self.requirement_id,
             "action": self.action,
@@ -62,6 +63,9 @@ class RepairDecisionResult:
             "target_path": self.target_path,
             "created_paths": list(self.created_paths),
         }
+        if self.network_service is not None:
+            value["network_service"] = self.network_service
+        return value
 
 
 @dataclass(slots=True, frozen=True)
@@ -176,6 +180,12 @@ class _PreparedDirectoryRepair:
 
 
 @dataclass(slots=True, frozen=True)
+class _PreparedNetworkRepair:
+    decision: RepairDecision
+    selection: dict[str, Any]
+
+
+@dataclass(slots=True, frozen=True)
 class RepairApplierConfig:
     allowed_actions: tuple[RepairActionKind, ...] = (
         RepairActionKind.CREATE_DIRECTORY,
@@ -185,6 +195,7 @@ class RepairApplierConfig:
         "/sys",
         "/dev",
     )
+    network_repair_policy: Any = None
 
 
 class RepairApplier:
@@ -242,7 +253,7 @@ class RepairApplier:
         )
 
         results: list[RepairDecisionResult] = []
-        prepared: list[_PreparedDirectoryRepair] = []
+        prepared: list[_PreparedDirectoryRepair | _PreparedNetworkRepair] = []
         created_paths: list[Path] = []
         rollback_errors: list[str] = []
 
@@ -251,6 +262,7 @@ class RepairApplier:
                 plan,
                 rootfs_resolved,
                 dry_run=dry_run,
+                requirements_path=requirements_path,
             )
 
             if dry_run:
@@ -320,11 +332,12 @@ class RepairApplier:
         rootfs: Path,
         *,
         dry_run: bool,
+        requirements_path: Path | None = None,
     ) -> tuple[
-        list[_PreparedDirectoryRepair],
+        list[_PreparedDirectoryRepair | _PreparedNetworkRepair],
         list[RepairDecisionResult],
     ]:
-        prepared: list[_PreparedDirectoryRepair] = []
+        prepared: list[_PreparedDirectoryRepair | _PreparedNetworkRepair] = []
         results: list[RepairDecisionResult] = []
         virtually_created: set[Path] = set()
 
@@ -351,6 +364,33 @@ class RepairApplier:
                     "not have disposition=auto_candidate"
                 )
 
+            network_action = decision.action in {RepairActionKind.CONFIGURE_TCP_SERVICE,
+                                                  RepairActionKind.CONFIGURE_UDP_SERVICE}
+            if network_action and self.config.network_repair_policy is not None:
+                from .requirements import RequirementReport
+                from .network_repair import NetworkRepairError
+                try:
+                    requirements = RequirementReport.load(requirements_path)
+                    requirement = next((item for item in requirements.requirements
+                                        if item.requirement_id == decision.requirement_id), None)
+                    if requirement is None or decision.requirement_kind != "network":
+                        raise NetworkRepairError("network decision has no matching requirement")
+                    selection = self.config.network_repair_policy.authorize(requirement)
+                    transport = selection["service"]["service_type"]
+                    expected_action = (RepairActionKind.CONFIGURE_TCP_SERVICE if transport == "tcp"
+                                       else RepairActionKind.CONFIGURE_UDP_SERVICE)
+                    if (decision.resource != requirement.resource or decision.operation != requirement.operation
+                            or decision.action != expected_action
+                            or dict(decision.parameters).get("network_repair") != selection):
+                        raise NetworkRepairError("network decision differs from its bound authorization")
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise RepairApplicationError(str(exc)) from exc
+                prepared.append(_PreparedNetworkRepair(decision, selection))
+                results.append(RepairDecisionResult(decision.decision_id, decision.requirement_id,
+                    decision.action.value, decision.resource, RepairResultStatus.PLANNED,
+                    "Validated offline network configuration; requires a fresh execution attempt.",
+                    network_service=selection))
+                continue
             if decision.action not in self.config.allowed_actions:
                 raise RepairApplicationError(
                     f"automatic action {decision.action.value} is not enabled "
@@ -468,7 +508,7 @@ class RepairApplier:
 
     def _apply_prepared(
         self,
-        prepared: list[_PreparedDirectoryRepair],
+        prepared: list[_PreparedDirectoryRepair | _PreparedNetworkRepair],
         *,
         initial_results: list[RepairDecisionResult],
         created_paths: list[Path],
@@ -478,6 +518,14 @@ class RepairApplier:
         }
 
         for item in prepared:
+            if isinstance(item, _PreparedNetworkRepair):
+                decision = item.decision
+                by_decision[decision.decision_id] = RepairDecisionResult(
+                    decision.decision_id, decision.requirement_id, decision.action.value,
+                    decision.resource, RepairResultStatus.APPLIED,
+                    "Recorded authorized offline service configuration for the next environment version; guest behavior is unvalidated.",
+                    network_service=item.selection)
+                continue
             if item.already_satisfied:
                 continue
 
@@ -552,7 +600,7 @@ class RepairApplier:
         updated: list[RepairDecisionResult] = []
 
         for result in results:
-            if created_strings.intersection(result.created_paths):
+            if created_strings.intersection(result.created_paths) or result.network_service is not None:
                 updated.append(
                     RepairDecisionResult(
                         decision_id=result.decision_id,
@@ -561,8 +609,8 @@ class RepairApplier:
                         resource=result.resource,
                         status=RepairResultStatus.ROLLED_BACK,
                         reason=(
-                            "The transaction failed and paths created for this "
-                            "decision were rolled back where possible."
+                            "The transaction failed; its network configuration was not published "
+                            "and created paths were rolled back where possible."
                         ),
                         target_path=result.target_path,
                         created_paths=result.created_paths,

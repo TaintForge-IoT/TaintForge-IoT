@@ -8,12 +8,12 @@ import subprocess
 from unittest.mock import patch
 
 from experiments.afl_file.build import components
-from taintforge_env import afl_file as f, afl_transport as transport
+from taintforge_env import afl_file as f, afl_transport as transport, afl_outcome as outcome
 from taintforge_env.afl_warm import FilesystemBaseline, MAGIC
 
 
 class NativeSession:
-    def __init__(self, root, built, qemu, *, extra=None):
+    def __init__(self, root, built, qemu, *, extra=None, guard=None, stdout=None):
         self.root = Path(root).resolve(); self.root.mkdir(parents=True, exist_ok=False)
         self.fs = self.root/'fs'; self.fs.mkdir()
         (self.fs/'etc').mkdir(); (self.fs/'tmp').mkdir()
@@ -24,30 +24,52 @@ class NativeSession:
         self.connection.settimeout(10)
         plugin = built['probe']+f',coverage={self.map},input={self.input},warm=fd:{peer.fileno()}'
         if extra: plugin += ','+extra
+        if guard: plugin += ',guard='+str(guard)
         self.output = (self.root/'qemu.log').open('wb')
         self.process = subprocess.Popen([str(qemu), '-strace', '-plugin', plugin, built['guest'],
-            str(self.input), str(self.marker), str(self.prepared)], cwd='/', pass_fds=(peer.fileno(),),
-            stdout=self.output, stderr=self.output, stdin=subprocess.DEVNULL)
+            str(self.input), str(self.marker), str(self.prepared), str(self.fs/'state/entry')], cwd='/', pass_fds=(peer.fileno(),),
+            stdout=self.output if stdout is None else stdout, stderr=self.output, stdin=subprocess.DEVNULL)
         peer.close()
         try:
             magic, version, self.pid, self.rss = struct.unpack('!4I', transport.recv_exact(self.connection, 16))
-            f.p.require((magic, version) == (MAGIC, 1), 'Invalid native handshake')
+            f.p.require((magic, version) == (MAGIC, outcome.VERSION), 'Invalid native handshake')
             self.baseline = FilesystemBaseline(self.fs, self.root/'baseline')
         except BaseException:
             self.close(abort=True); raise
         self.children = []
 
-    def attempt(self, data, *, timeout_ms=1000):
+    def parent_fd_count(self):
+        # Some component runners inherit procfs from an outer PID namespace.
+        namespace=os.readlink('/proc/self/ns/pid')
+        matches=[]
+        for directory in Path('/proc').iterdir():
+            if not directory.name.isdecimal():continue
+            try:
+                if os.readlink(directory/'ns/pid')!=namespace:continue
+                status=dict(line.split(':',1) for line in (directory/'status').read_text().splitlines())
+                if int(status['NSpid'].split()[-1])==self.pid:
+                    matches.append(directory)
+            except (FileNotFoundError,PermissionError,ProcessLookupError):continue
+        f.p.require(self.process.poll() is None and self.process.pid==self.pid and len(matches)==1,
+                    'Live native parent not uniquely bound in procfs')
+        return len(list((matches[0]/'fd').iterdir()))
+
+    def attempt_outcome(self, data, *, timeout_ms=1000, before=None):
         self.baseline.restore(); self.input.write_bytes(data)
+        if before is not None: before()
         with self.map.open('r+b') as output:
             output.write(f.HEADER.pack(b'TFACOV1\0', 1, f.MAP_SIZE, 0, 0, 0, 0, 0, 0)+bytes(f.MAP_SIZE))
         self.connection.sendall(struct.pack('!3I', MAGIC, 1, timeout_ms))
-        magic, child, status, timed_out = struct.unpack('!4I', transport.recv_exact(self.connection, 16))
-        self.children.append(child)
-        f.p.require(magic == MAGIC and status == 0 and not timed_out, 'Native attempt failed')
-        coverage, bitmap = f.inspect_map(self.map)
+        value = outcome.decode(transport.recv_exact(self.connection, outcome.RESPONSE.size))
+        self.children.append(value['child_namespace_pid'])
+        coverage, bitmap = f.inspect_map(self.map, complete=value['kind'] == 'normal')
         f.p.require(self.marker.is_file(), 'Child failed its clean-filesystem oracle')
         f.p.require(self.prepared.read_bytes() == b'P', 'Preparation repeated or checkpoint changed')
+        return value, coverage, bitmap
+
+    def attempt(self, data, *, timeout_ms=1000, before=None):
+        value, coverage, bitmap = self.attempt_outcome(data, timeout_ms=timeout_ms, before=before)
+        f.p.require(value['kind'] == 'normal' and value['guest_exit'] == 0, 'Native attempt failed: '+str(value))
         return coverage, bitmap
 
     def close(self, *, abort=False):

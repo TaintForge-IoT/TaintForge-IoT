@@ -44,14 +44,19 @@ def unit_name(binding):
 def command(binding, sandbox_command):
     config = binding["settings"]["resources"]
     validate(config)
-    probe.require(sandbox_command[:2] == ["sudo", "unshare"], "Resource service requires the isolated unified wrapper")
+    if 'network' in binding:
+        from .network_capsule import service_command
+        isolated_command = service_command(binding, sandbox_command)
+    else:
+        probe.require(sandbox_command[:2] == ["sudo", "unshare"], "Resource service requires the isolated unified wrapper")
+        isolated_command = sandbox_command[1:]
     properties = {"MemoryMax": config["memory_bytes"], "MemorySwapMax": 0, "OOMPolicy": "kill",
                   "TasksMax": config["tasks"], "KillMode": "control-group", "TimeoutStopSec": "5s",
                   "RuntimeMaxSec": f"{config['seconds']}s", "LimitCORE": 0, "CoredumpFilter": "0x0",
                   "NoNewPrivileges": "yes", "UMask": "0077", "Slice": "system.slice"}
     return ["sudo", "systemd-run", "--quiet", "--wait", "--pipe", "--service-type=exec",
             "--expand-environment=no", "--unit=" + unit_name(binding),
-            *[f"--property={key}={value}" for key, value in properties.items()], *sandbox_command[1:]]
+            *[f"--property={key}={value}" for key, value in properties.items()], *isolated_command]
 
 
 def inspect_self(binding):

@@ -23,6 +23,7 @@
 static TfConcolic *g_concolic;
 #include "runtime_diag.h"
 #include "qemu_flags_contract.h"
+#include "qemu_loaded_image.h"
 #include "qemu_plugin_compat.h"
 #include "elf_image.h"
 #include "phase1_io.h"
@@ -30,6 +31,19 @@ static TfConcolic *g_concolic;
 #include "phase1_resources.h"
 
 static TfRuntimeDiag g_runtime_diag;
+
+static bool phase1_flags_receipt(const char *receipt) {
+    int fd = tf_qemu_loaded_image_fd((const void *)qemu_plugin_register_vcpu_init_cb);
+    if (fd < 0) {
+        fputs("[REG] cannot identify the loaded QEMU executable\n", stderr);
+        return false;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    bool valid = tf_qemu_flags_receipt_check(receipt, path, stderr);
+    close(fd);
+    return valid;
+}
 static TfPhase1Io g_phase1;
 static TfRetire g_retire = {.fd = -1};
 static qemu_plugin_id_t g_plugin_id;
@@ -7725,7 +7739,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     if (!tf_qemu_flags_options(argc, argv, &flags_receipt, stderr))
         goto fail;
     if (flags_receipt && (!is_i386 || info->system_emulation ||
-                          !tf_qemu_flags_receipt_check(flags_receipt, "/proc/self/exe", stderr)))
+                          !phase1_flags_receipt(flags_receipt)))
         goto fail;
     g_x86_flags_verified = is_i386 && !info->system_emulation &&
                            (flags_receipt || (qemu_plugin_taintforge_x86_flags_v1 &&

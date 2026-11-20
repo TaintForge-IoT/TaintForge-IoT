@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 from .replay_store import ReplayStore, ReplayStoreValidationError
+from .network_runtime import NetworkRuntimeOwner, NetworkRuntimeLimits, CONTROLLED_HEARTBEAT_PROFILE
+from .network_host_route import HostReplyRoute
 
 
 class ControlledNetworkError(RuntimeError):
@@ -83,7 +85,14 @@ class PopenBackgroundProcess:
 
 
 class SubprocessProcessSupervisor:
+    def __init__(self, runtime=None):
+        self.runtime = runtime
+
     def start(self,command: Sequence[str],*,cwd: Path,stdout_path: Path,stderr_path: Path) -> PopenBackgroundProcess:
+        if self.runtime is not None:
+            from .network_process import CapturedNetworkProcess
+            return CapturedNetworkProcess(command, cwd=cwd, stdout_path=stdout_path,
+                                          stderr_path=stderr_path, runtime=self.runtime)
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
         stdout_handle = stdout_path.open("w", encoding="utf-8")
@@ -148,6 +157,7 @@ class NetworkServiceMapping:
     upstream_ip: str | None = None
     upstream_port: int | None = None
     dns_records: dict | None = None
+    replay_session_id: str | None = None
 
     def to_policy_dict(self) -> dict[str, Any]:
         return {
@@ -161,7 +171,8 @@ class NetworkServiceMapping:
             "protocol_hint": self.protocol_hint,
             **({"upstream_ip": self.upstream_ip, "upstream_port": self.upstream_port}
                if self.upstream_ip is not None else {}),
-            **({"dns_records": self.dns_records} if self.dns_records is not None else {})
+            **({"dns_records": self.dns_records} if self.dns_records is not None else {}),
+            **({"replay_session_id": self.replay_session_id} if self.replay_session_id is not None else {})
         }
 
 
@@ -215,6 +226,8 @@ class ControlledNetworkConfig:
     replay_store_path: Path | None = None
     replay_store_expected_sha256: str | None = None
     process_start_grace_seconds: float = 0.50
+    allow_empty_replay: bool = False
+    attempt_id: str | None = None
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root).resolve(strict=False)
@@ -275,6 +288,11 @@ class ControlledNetworkBackend:
         self.loopback_policy_path = (self.config_dir / "network_policy_loopback.json")
         self.manifest_path = self.config_dir / "network_backend_manifest.json"
         self.events_path = self.logs_dir / "network_events.jsonl"
+        self.runtime = None
+        self._stopping = False
+        self._logs_finalized = False
+        self._topology_owned = {"veth": False, "namespace": False}
+        self._host_reply_route = None
 
     def setup(self) -> ControlledNetworkResult:
         if self._setup_started:
@@ -283,14 +301,25 @@ class ControlledNetworkBackend:
         self._validate_inputs()
         requested = _load_json_object(self.config.template_policy_path,"template network policy")
         _atomic_write_json(self.requested_policy_path, requested)
-
         topology = _derive_topology(self.config.session_id,self.config.iteration_index)
-        self._cleanup_topology(topology, ignore_errors=True)
 
         try:
+            self.runtime = NetworkRuntimeOwner(self.config_dir / "network_runtime", self.logs_dir,
+                attempt_id=self.config.attempt_id or f"{self.config.session_id}:{self.config.iteration_index}",
+                limits=NetworkRuntimeLimits.parse(requested.get("runtime_limits")),
+                heartbeat_profile=CONTROLLED_HEARTBEAT_PROFILE)
+            self.runtime.health_check = self._runtime_health
+            if isinstance(self.process_supervisor, SubprocessProcessSupervisor):
+                self.process_supervisor.runtime = self.runtime
             self._create_topology(topology)
             self.plan = self._build_plan(requested, topology)
             self._validate_replay_plan(self.plan)
+            if self.plan.host_services:
+                self._host_reply_route = HostReplyRoute(
+                    executor=self.executor, project_root=self.config.project_root,
+                    host_ip=self.plan.host_ip, namespace_ip=self.plan.namespace_ip,
+                    interface=self.plan.veth_host)
+                self._host_reply_route.ensure()
             self._write_policies(requested, self.plan)
             self._configure_firewall(self.plan)
             self._configure_namespace_service_privileges(self.plan)
@@ -303,12 +332,19 @@ class ControlledNetworkBackend:
             self._write_manifest("ready")
             return ControlledNetworkResult(plan=self.plan,manifest_path=self.manifest_path,effective_policy_path=self.effective_policy_path,network_events_path=self.events_path)
         except Exception as exc:
-            try:
-                self._stop_services()
-                self._cleanup_topology(topology, ignore_errors=True)
-                self._write_manifest("failed",error=f"{type(exc).__name__}: {exc}")
-            except Exception:
-                pass
+            cleanup_errors = []
+            if self.runtime is not None:
+                self.runtime.fail("network_setup_failed")
+            for cleanup in (self._stop_services, lambda: self._cleanup_topology(topology, ignore_errors=False)):
+                try:
+                    cleanup()
+                except Exception as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+            if self.runtime is not None:
+                self.runtime.close(cleanup_status="cleanup_failed" if cleanup_errors else "cleaned",
+                                   remaining_resources=self._remaining_resources())
+            self._write_manifest("failed",error=f"{type(exc).__name__}: {exc}",cleanup_errors=cleanup_errors)
+            self._cleaned = not cleanup_errors
             if isinstance(exc, ControlledNetworkError):
                 raise
             raise ControlledNetworkError(str(exc)) from exc
@@ -316,20 +352,44 @@ class ControlledNetworkBackend:
     def guest_command(self, sandbox_script: Path) -> list[str]:
         if self.plan is None:
             raise ControlledNetworkError("network backend is not ready")
-        return ["sudo","-n","ip","netns","exec",self.plan.namespace_name,"unshare","--mount","--pid","--fork","--uts","--ipc","--","bash",str(sandbox_script)]
+        prefix = ["sudo","-n","ip","netns","exec",self.plan.namespace_name]
+        command = ["unshare","--mount","--pid","--fork","--uts","--ipc","--","bash",str(sandbox_script)]
+        if self.runtime is not None:
+            prefix += ["env", f"PYTHONPATH={self.config.project_root}", sys.executable,
+                       str(self.config.project_root / "scripts/run_network_guard.py"),
+                       "--runtime", str(self.runtime.client_path), "--result",
+                       str(self.config_dir / "network_guard_result.json"), "--"]
+        return prefix + command
+
+    def _runtime_health(self):
+        if self._stopping or self.runtime is None:
+            return
+        for process in tuple(self.processes):
+            if process.poll() is not None:
+                self.runtime.fail("network_responder_exited")
+                return
+        self.runtime.check_peers()
+
+    def _remaining_resources(self):
+        return ([str(process.command) for process in self.processes]
+                + [kind for kind, owned in self._topology_owned.items() if owned]
+                + (self._host_reply_route.remaining_resources() if self._host_reply_route else []))
 
     def cleanup(self, *, finalize_logs: bool = True) -> None:
         if self._cleaned:
             return
-        self._cleaned = True
+        self._stopping = True
+        if not finalize_logs and not self._logs_finalized and self.runtime is not None:
+            self.runtime.fail("network_evidence_not_finalized")
         errors: list[str] = []
         try:
             self._stop_services()
         except Exception as exc:
             errors.append(f"service cleanup: {exc}")
-        if finalize_logs:
+        if finalize_logs and not self._logs_finalized and not self.processes:
             try:
                 self._aggregate_network_events()
+                self._logs_finalized = True
             except Exception as exc:
                 errors.append(f"network log aggregation: {exc}")
         if self.plan is not None:
@@ -337,12 +397,21 @@ class ControlledNetworkBackend:
                 self._cleanup_topology(self.plan, ignore_errors=False)
             except Exception as exc:
                 errors.append(f"topology cleanup: {exc}")
+        if self.runtime is not None:
+            try:
+                status = self.runtime.close(cleanup_status="cleanup_failed" if errors else "cleaned",
+                    remaining_resources=self._remaining_resources())
+                if status["cleanup_status"] != "cleaned":
+                    errors.append("network runtime retained resources")
+            except Exception as exc:
+                errors.append(f"runtime cleanup: {exc}")
         try:
             self._write_manifest("cleaned" if not errors else "cleanup_failed",cleanup_errors=errors)
         except Exception as exc:
             errors.append(f"manifest update: {exc}")
         if errors:
             raise ControlledNetworkError("; ".join(errors))
+        self._cleaned = True
 
     def _validate_inputs(self) -> None:
         _validate_directory(self.config.project_root, "project root")
@@ -394,8 +463,12 @@ class ControlledNetworkBackend:
             self._ns_command(topology, "ip", "link", "set", "lo", "up"),
             self._ns_command(topology,"ip","route","add","default","via",topology.host_ip)
         ]
-        for command in commands:
+        for index, command in enumerate(commands):
             self.executor.run(command, cwd=self.config.project_root, check=True)
+            if index == 0:
+                self._topology_owned["namespace"] = True
+            elif index == 1:
+                self._topology_owned["veth"] = True
 
     def _build_plan(self,requested: dict[str, Any],topology: ControlledNetworkPlan) -> ControlledNetworkPlan:
         services_raw = requested.get("services", [])
@@ -467,7 +540,9 @@ class ControlledNetworkBackend:
             if self.config.responder_mode == "emulated" and protocol_hint == "dns" and not static_dns:
                 skipped.append({"index": index, "reason": "synthetic DNS requires explicit dns_records"})
                 continue
-            extra = {"domain": item.get("domain"), "upstream_ip": item.get("upstream_ip"), "upstream_port": item.get("upstream_port"), "dns_records": item.get("dns_records")}
+            if item.get("replay_session_id") is not None and self.config.responder_mode != "replay":
+                raise ControlledNetworkError("replay_session_id requires replay mode")
+            extra = {"domain": item.get("domain"), "upstream_ip": item.get("upstream_ip"), "upstream_port": item.get("upstream_port"), "dns_records": item.get("dns_records"), "replay_session_id": item.get("replay_session_id")}
             if remote_ip.is_loopback and self.config.responder_mode != "record":
                 loopback_services.append(NetworkServiceMapping(service_type=service_type,role=role,remote_ip=str(remote_ip),remote_port=remote_port,protocol_hint=protocol_hint,placement="namespace_loopback",bind_ip=str(remote_ip),bind_port=remote_port,**extra))
             else:
@@ -502,15 +577,20 @@ class ControlledNetworkBackend:
         if plan.skipped_services:
             reasons = "; ".join(str(item.get("reason") or "unsupported service") for item in plan.skipped_services)
             raise ControlledNetworkError("deterministic replay refuses a partially supported policy: " + reasons)
-        if not plan.all_services:
+        if not plan.all_services and not self.config.allow_empty_replay:
             raise ControlledNetworkError("deterministic replay policy contains no supported TCP services")
         assert self.config.replay_store_path is not None
         store = ReplayStore(self.config.replay_store_path)
         missing: list[str] = []
         for service in plan.all_services:
             try:
+                if service.replay_session_id is not None:
+                    from .network_policy import NetworkServicePolicy
+                    from .network_replay import session_for_service
+                    session_for_service(NetworkServicePolicy(**service.to_policy_dict()), store)
+                    continue
                 exchanges = store.exchanges_for_endpoint(transport=service.service_type,remote_ip=service.remote_ip,remote_port=service.remote_port,protocol_hint=service.protocol_hint)
-            except ReplayStoreValidationError as exc:
+            except (ReplayStoreValidationError, ValueError, RuntimeError) as exc:
                 raise ControlledNetworkError(str(exc)) from exc
             if not exchanges:
                 missing.append(f"{service.remote_ip}:{service.remote_port} protocol_hint={service.protocol_hint!r}")
@@ -550,6 +630,9 @@ class ControlledNetworkBackend:
             "requested_policy_sha256": _sha256_file(self.requested_policy_path),
             "requested_mode": requested.get("mode")
         }
+        limits = asdict(NetworkRuntimeLimits.parse(requested.get("runtime_limits")))
+        for policy in (host_policy, loopback_policy, effective):
+            policy["runtime_limits"] = limits
         if self.config.responder_mode == "record":
             for policy in (host_policy, loopback_policy, effective):
                 policy["recording"] = requested["recording"]
@@ -633,9 +716,12 @@ class ControlledNetworkBackend:
         return ["setpriv","--reuid",str(os.getuid()),"--regid",str(os.getgid()),"--clear-groups"]
 
     def _start_services(self, plan: ControlledNetworkPlan) -> None:
-        self.processes = []
+        if self.processes:
+            raise ControlledNetworkError("previous network processes have not stopped")
+        self._stopping = False
+        runtime_arguments = ["--runtime", str(self.runtime.client_path)] if self.runtime is not None else []
         service_script = ("scripts/start_network_record.py" if self.config.responder_mode == "record" else "scripts/start_network_replay.py" if self.config.responder_mode == "replay" else "scripts/start_network_emulator.py")
-        replay_arguments = (["--store", str(self.config.replay_store_path), "--expected-store-sha256", str(self.config.replay_store_expected_sha256)] if self.config.responder_mode == "replay" else [])
+        replay_arguments = (["--store", str(self.config.replay_store_path), "--expected-store-sha256", str(self.config.replay_store_expected_sha256)] if self.config.responder_mode == "replay" else []) + runtime_arguments
         if plan.host_services:
             self.processes.append(
                 self.process_supervisor.start([sys.executable,service_script,"--policy",str(self.host_policy_path),"--log-dir",str(self.logs_dir / "network_host"),*replay_arguments],cwd=self.config.project_root,stdout_path=self.logs_dir / "network_host_stdout.log",stderr_path=self.logs_dir / "network_host_stderr.log"))
@@ -646,7 +732,7 @@ class ControlledNetworkBackend:
         if plan.catch_all_enabled:
             self.processes.append(
                 self.process_supervisor.start(
-                    ["sudo","-n","ip","netns","exec",plan.namespace_name,*self._drop_privileges_command(),"env",f"PYTHONPATH={self.config.project_root}",sys.executable,"scripts/start_transparent_logger.py","--log-dir",str(self.logs_dir / "network_transparent"),"--tcp-bind-ip","127.0.0.1","--tcp-port",str(plan.catch_all_tcp_port),"--udp-bind-ip","127.0.0.1","--udp-port",str(plan.catch_all_udp_port)],cwd=self.config.project_root,stdout_path=self.logs_dir / "network_transparent_stdout.log",stderr_path=self.logs_dir / "network_transparent_stderr.log"))
+                    ["sudo","-n","ip","netns","exec",plan.namespace_name,*self._drop_privileges_command(),"env",f"PYTHONPATH={self.config.project_root}",sys.executable,"scripts/start_transparent_logger.py","--log-dir",str(self.logs_dir / "network_transparent"),"--tcp-bind-ip","127.0.0.1","--tcp-port",str(plan.catch_all_tcp_port),"--udp-bind-ip","127.0.0.1","--udp-port",str(plan.catch_all_udp_port),*runtime_arguments],cwd=self.config.project_root,stdout_path=self.logs_dir / "network_transparent_stdout.log",stderr_path=self.logs_dir / "network_transparent_stderr.log"))
 
     def _wait_for_services(self) -> None:
         deadline = time.monotonic() + self.config.process_start_grace_seconds
@@ -660,6 +746,18 @@ class ControlledNetworkBackend:
             code = process.poll()
             if code is not None:
                 raise ControlledNetworkError(f"network background service exited during startup with code {code}: {' '.join(process.command)}")
+        if self.runtime is not None and isinstance(self.process_supervisor, SubprocessProcessSupervisor):
+            expected = len(self.plan.all_services) + (2 if self.plan.catch_all_enabled else 0)
+            ready_deadline = time.monotonic() + 3
+            while True:
+                state = self.runtime.snapshot()
+                if state["termination_reason"]:
+                    raise ControlledNetworkError(state["termination_reason"])
+                if state["ready_listeners"] == expected:
+                    break
+                if time.monotonic() >= ready_deadline:
+                    raise ControlledNetworkError("network responders did not bind all listeners")
+                time.sleep(0.02)
 
     def _run_self_test(self, plan: ControlledNetworkPlan) -> None:
         probes: list[dict[str, Any]] = []
@@ -708,9 +806,21 @@ class ControlledNetworkBackend:
         stdout_path = self.logs_dir / "network_self_test_stdout.log"
         stderr_path = self.logs_dir / "network_self_test_stderr.log"
         code = _self_test_code(probes,retry_timeout_seconds=5.0,retry_interval_seconds=0.10)
-        result = self.executor.run(
-            ["sudo","-n","ip","netns","exec",plan.namespace_name,sys.executable,"-c",code],cwd=self.config.project_root,check=False,stdout_path=stdout_path,stderr_path=stderr_path)
-        if result.returncode != 0:
+        command = ["sudo","-n","ip","netns","exec",plan.namespace_name,sys.executable,"-c",code]
+        if isinstance(self.process_supervisor, SubprocessProcessSupervisor) and self.runtime is not None:
+            process = self.process_supervisor.start(command, cwd=self.config.project_root,
+                stdout_path=stdout_path, stderr_path=stderr_path)
+            try:
+                returncode = process.wait(timeout=30)
+            except BaseException:
+                process.kill()
+                process.wait(timeout=2)
+                raise
+        else:
+            result = self.executor.run(command,cwd=self.config.project_root,check=False,
+                stdout_path=stdout_path,stderr_path=stderr_path)
+            returncode = result.returncode
+        if returncode != 0:
             stdout_tail = _tail_text(stdout_path)
             stderr_tail = _tail_text(stderr_path)
             raise ControlledNetworkError("controlled network self-test failed" + (f"\nSelf-test stdout:\n{stdout_tail}" if stdout_tail else "")+ (f"\nSelf-test stderr:\n{stderr_tail}" if stderr_tail else ""))
@@ -737,87 +847,68 @@ class ControlledNetworkBackend:
                 if source.is_symlink():
                     raise ControlledNetworkError(f"network log path must not be a symlink: {source}")
                 shutil.move(str(source), archive / name)
+        if self.runtime is not None:
+            client = self.runtime.client()
+            for path in archive.rglob("*"):
+                if path.is_file():
+                    client.reserve_log(path, 0)
         self._prepare_service_log_directories()
         self._start_services(plan)
         self._wait_for_services()
 
     def _stop_services(self) -> None:
-        errors: list[str] = []
+        self._stopping = True
+        timeout = self.runtime.limits.shutdown_timeout_ms / 1000 if self.runtime is not None else 5
+        started = time.monotonic()
+        graceful_deadline, deadline = started + timeout * 0.6, started + timeout
+        errors = []
+        remaining = []
         for process in reversed(self.processes):
             try:
                 process.terminate()
             except Exception as exc:
-                errors.append(f"terminate {' '.join(process.command)}: {exc}")
+                errors.append(f"terminate {process.command}: {exc}")
         for process in reversed(self.processes):
             try:
-                process.wait(timeout=2.0)
+                process.wait(timeout=max(0.001, graceful_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 try:
                     process.kill()
-                    process.wait(timeout=2.0)
+                    process.wait(timeout=max(0.001, deadline - time.monotonic()))
                 except Exception as exc:
-                    errors.append(f"kill {' '.join(process.command)}: {exc}")
+                    remaining.append(process)
+                    errors.append(f"kill/wait {process.command}: {exc}")
             except Exception as exc:
-                errors.append(f"wait {' '.join(process.command)}: {exc}")
-        self.processes = []
+                remaining.append(process)
+                errors.append(f"wait {process.command}: {exc}")
+        self.processes = list(reversed(remaining))
         if errors:
             raise ControlledNetworkError("; ".join(errors))
 
     def _aggregate_network_events(self) -> None:
-        sources = (("host", self.logs_dir / "network_host"),("loopback", self.logs_dir / "network_loopback"),("transparent", self.logs_dir / "network_transparent"))
-        payload_root = self.logs_dir / "network_payloads"
-        events: list[dict[str, Any]] = []
-        for source_name, source_dir in sources:
-            if not source_dir.exists():
-                continue
-            if source_dir.is_symlink() or not source_dir.is_dir():
-                raise ControlledNetworkError(f"network source log directory is invalid: {source_dir}")
-            event_path = source_dir / "network_events.jsonl"
-            if event_path.is_symlink():
-                raise ControlledNetworkError(f"network event log must not be a symlink: {event_path}")
-            if not event_path.exists():
-                continue
-            for line_number, line in enumerate(event_path.read_text(encoding="utf-8").splitlines(),start=1):
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ControlledNetworkError(f"invalid network JSONL at {event_path}:{line_number}") from exc
-                if not isinstance(event, dict):
-                    raise ControlledNetworkError(f"network event is not an object at {event_path}:{line_number}")
-                normalized = dict(event)
-                normalized["backend_source"] = source_name
-                payload = normalized.get("payload_file")
-                if isinstance(payload, str) and payload:
-                    payload_path = source_dir / payload
-                    if payload_path.is_file() and not payload_path.is_symlink():
-                        payload_root.mkdir(parents=True, exist_ok=True)
-                        destination_name = f"{source_name}_{payload_path.name}"
-                        destination = payload_root / destination_name
-                        counter = 1
-                        while destination.exists():
-                            destination_name = (f"{source_name}_{counter}_{payload_path.name}")
-                            destination = payload_root / destination_name
-                            counter += 1
-                        shutil.copy2(payload_path, destination)
-                        normalized["payload_file"] = (f"network_payloads/{destination_name}")
-                events.append(normalized)
-        events.sort(
-            key=lambda item: (str(item.get("timestamp_utc") or ""),str(item.get("backend_source") or ""),str(item.get("event") or "")))
-        self.events_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.events_path.open("w", encoding="utf-8") as stream:
-            for event in events:
-                stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        from .network_aggregation import aggregate_network_events
+        aggregate_network_events(self.logs_dir, runtime=self.runtime)
 
     def _cleanup_topology(self,topology: ControlledNetworkPlan,*,ignore_errors: bool) -> None:
-        commands = [["sudo", "-n", "ip", "link", "del", topology.veth_host],["sudo", "-n", "ip", "netns", "del", topology.namespace_name]]
+        commands = [("veth", ["sudo", "-n", "ip", "link", "del", topology.veth_host]),
+                    ("namespace", ["sudo", "-n", "ip", "netns", "del", topology.namespace_name])]
         failures: list[str] = []
-        for command in commands:
+        if self._host_reply_route is not None:
+            try:
+                self._host_reply_route.cleanup()
+            except Exception as error:
+                failures.append(f"host reply routing: {error}")
+        for kind, command in commands:
+            if not self._topology_owned[kind]:
+                continue
             result = self.executor.run(command,cwd=self.config.project_root,check=False)
             if result.returncode == 0:
+                self._topology_owned[kind] = False
                 continue
-            if ignore_errors or _network_resource_is_absent(command,result.stderr):
+            if _network_resource_is_absent(command,result.stderr):
+                self._topology_owned[kind] = False
+                continue
+            if ignore_errors:
                 continue
             failures.append(f"{' '.join(command)}: {result.stderr.strip()}")
         if failures:
@@ -833,6 +924,7 @@ class ControlledNetworkBackend:
             "iteration_index": self.config.iteration_index,
             "self_test": self.config.self_test,
             "responder_mode": self.config.responder_mode,
+            "network_runtime": self.runtime.snapshot() if self.runtime is not None else None,
             "replay_store_path": (str(self.config.replay_store_path) if self.config.replay_store_path is not None else None),
             "replay_store_sha256": (self.replay_store_validation.get("store_sha256") if self.replay_store_validation is not None else None),
             "replay_store_entries": (self.replay_store_validation.get("entries") if self.replay_store_validation is not None else None),
@@ -843,6 +935,8 @@ class ControlledNetworkBackend:
             "plan": self.plan.to_dict() if self.plan is not None else None,
             "allow_internet": False,
             "host_ip_forwarding_modified": False,
+            "host_reply_routing": (self._host_reply_route.snapshot()
+                                   if self._host_reply_route is not None else None),
             "error": error,
             "cleanup_errors": cleanup_errors or []
         }

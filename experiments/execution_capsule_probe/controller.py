@@ -106,14 +106,16 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def write_json(path, obj):
+def write_json(path, obj, *, durable=True):
+    """Publish complete JSON atomically; selected live observations sync later."""
     path = Path(path)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(obj, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
         stream.flush()
-        os.fsync(stream.fileno())
+        if durable:
+            os.fsync(stream.fileno())
     temporary.replace(path)
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import select
 import shlex
 import socket
+import stat
 import struct
 import time
 
@@ -38,7 +39,9 @@ def build_plugin(out):
               "-Wl,-z,relro,-z,now", "-I", header.parent, HERE / "observer.c", "-o", plugin, *flags)
     result = dict(plugin=str(plugin), plugin_sha256=p.sha(plugin),
                   source_sha256={"observer.c": p.sha(HERE / "observer.c"), "qemu-plugin.h": p.sha(header),
-                                 "afl_coverage.h": p.sha(HERE.parent / "afl_file/coverage.h")})
+                                 "control_guard.h": p.sha(HERE / "control_guard.h"),
+                                 "afl_coverage.h": p.sha(HERE.parent / "afl_file/coverage.h"),
+                                 "afl_no_core.h": p.sha(HERE.parent / "afl_file/no_core.h")})
     p.write_json(out / "build.json", result)
     return result
 
@@ -125,12 +128,41 @@ class EarlyExit(p.ProbeError):
     pass
 
 
-def snapshot_ok(item, pid, point, sample, protocol=PROTOCOL):
+def warm_checkpoint_ok(item, pid, held_seq, protocol=PROTOCOL):
+    # HOLD 2 may be on the input syscall itself. Reaching the host checkpoint
+    # then needs no further guest instruction callback after RESUME 2.
+    p.require(item.get("event") == "warm_checkpoint" and
+              type(item.get("protocol")) is int and item["protocol"] == protocol and
+              type(item.get("host_pid")) is int and item["host_pid"] == pid and
+              type(item.get("seq")) is int and item["seq"] >= held_seq,
+              "Invalid warm checkpoint identity or sequence")
+
+
+def continuation_ok(done, pid, held_seq, protocol=PROTOCOL, *, checkpoint=None):
+    valid = (done.get("event") == "done" and
+             type(done.get("protocol")) is int and done["protocol"] == protocol and
+             type(done.get("host_pid")) is int and done["host_pid"] == pid and
+             type(done.get("seq")) is int)
+    if checkpoint is None:
+        p.require(valid and done["seq"] > held_seq, "No progress after final resume")
+    else:
+        warm_checkpoint_ok(checkpoint, pid, held_seq, protocol)
+        # The parent remains in the host fork loop until shutdown; guest
+        # execution and its instruction counters belong to separate children.
+        p.require(valid and done["seq"] == checkpoint["seq"],
+                  "Warm parent counter changed after checkpoint")
+
+
+def snapshot_ok(item, pid, point, sample, protocol=PROTOCOL, *, control_guard=False):
     p.require(protocol in (2, PROTOCOL), "Unsupported snapshot protocol")
     keys = {"event", "protocol", "host_pid", "point", "sample", "seq", "pc",
             "monotonic_ms", "regs", "stack_readable", "stack_hex"}
     if protocol == PROTOCOL:
         keys |= {"pc_source", "qemu_eip"}
+    if control_guard:
+        from taintforge_env.capsule_control import verify_snapshot
+        keys.add('control_guard')
+        verify_snapshot(item.get('control_guard'), private=control_guard)
     p.require(set(item) == keys and
               item["event"] == "snapshot" and type(item["protocol"]) is int and
               item["protocol"] == protocol and item["host_pid"] == pid and
@@ -155,6 +187,8 @@ def same_hold(first, second, hold_ms):
     keys = ["protocol", "host_pid", "seq", "pc", "regs", "stack_hex"]
     if first["protocol"] == PROTOCOL:
         keys += ["pc_source", "qemu_eip"]
+    if 'control_guard' in first or 'control_guard' in second:
+        keys.append('control_guard')
     p.require(all(first[k] == second[k] for k in keys) and
               second["monotonic_ms"] >= first["monotonic_ms"] + hold_ms - 2,
               "Guest changed while held")
@@ -197,6 +231,39 @@ def live_unmapped(binding, pid):
     raise TimeoutError("Phase 1 module still mapped after release")
 
 
+def sync_observation_evidence(binding):
+    """Sync exact saved bytes only after closing the live observer channel."""
+    output = Path(binding['run_dir']) / 'logs/capsule'
+    retirement_output = mappings.directory(binding)
+    paths = [output/'observer-events.json',
+             *(output/f'execution-context-{point}.json' for point in (1, 2)),
+             retirement_output/'mapping-identity.json',
+             *(retirement_output/f'maps-{point}.txt' for point in (1, 2)),
+             *(retirement_output/f'process-{point}.stat' for point in (1, 2)),
+             retirement_output/'maps-unmapped.txt', retirement_output/'process-unmapped.stat']
+    for path in paths:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            continue  # Failed/aborted attempts may have only a partial prefix.
+        try:
+            info = os.fstat(descriptor)
+            p.require(stat.S_ISREG(info.st_mode) and info.st_size <= 2*1024**2,
+                      'Invalid observer evidence file during persistence')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    for path in (retirement_output, output):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            continue
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def control_worker(endpoint, pipe, gate, binding):
     output = Path(binding["run_dir"]) / "logs/capsule"
     result = {"status": "failed", "profile": PROFILE}
@@ -208,7 +275,9 @@ def control_worker(endpoint, pipe, gate, binding):
 
     def save_journal():
         # Atomic bounded journal: at most a few dozen records in this protocol.
-        p.write_json(output / "observer-events.json", {"schema": 2, "events": journal})
+        # Publish prefixes for fault/cancellation readers, without blocking the
+        # five-second native HOLD/permit exchange on a filesystem barrier.
+        p.write_json(output / "observer-events.json", {"schema": 2, "events": journal}, durable=False)
 
     def record(event):
         journal.append(event | {"controller_seq": len(journal)+1, "controller_ns": time.monotonic_ns()})
@@ -248,21 +317,23 @@ def control_worker(endpoint, pipe, gate, binding):
         stage = "bootstrap"
         for point in (1, 2):
             first = channel.receive("snapshot")
-            snapshot_ok(first, pid, point, 1, protocol)
+            from taintforge_env.capsule_control import private_prefix
+            guard_prefix = private_prefix(binding) if 'control_guard' in binding.get('settings', {}) else False
+            snapshot_ok(first, pid, point, 1, protocol, control_guard=guard_prefix)
             if point == 2:
                 # Persist after HOLD; disk latency consumes the hold budget.
                 stage = "post_unmap_evidence"
                 save_pending()
                 stage = "post_unmap_hold"
-            mapping = mappings.capture(binding, pid, point)
+            mapping = mappings.capture(binding, pid, point, durable=False)
             if 'hardening' in binding.get('settings', {}):
                 from taintforge_env.capsule_hardening import capture_context
-                mapping.update(capture_context(binding, pid, point))
+                mapping.update(capture_context(binding, pid, point, durable=False))
             record(dict(event="maps_held", point=point, **mapping))
             time.sleep(config["hold_ms"] / 1000)
             channel.command("CHECK " + str(point))
             second = channel.receive("snapshot")
-            snapshot_ok(second, pid, point, 2, protocol)
+            snapshot_ok(second, pid, point, 2, protocol, control_guard=guard_prefix)
             same_hold(first, second, config["hold_ms"])
             fault_point = "before" if point == 1 else "after"
             if config["fault"].endswith("-" + fault_point):
@@ -305,16 +376,16 @@ def control_worker(endpoint, pipe, gate, binding):
                 record(dict(event="progress_window", scope=WINDOW, lower_seq=stamp["seq"],
                             upper_seq=first["seq"], entries=first["seq"]-stamp["seq"],
                             exact_uninstall_interval=False, exact_oep_cutover=False))
+        checkpoint = None
         if 'afl_warm' in binding:
             stage = 'warm_checkpoint'
             channel.timeout = binding['afl_warm']['bootstrap_seconds'] + 1
             checkpoint = channel.receive('warm_checkpoint')
-            p.require(checkpoint['host_pid'] == pid and checkpoint['seq'] > first['seq'],
-                      'Warm checkpoint precedes retirement continuation')
+            warm_checkpoint_ok(checkpoint, pid, first['seq'], protocol)
         stage = "guest_exit"
         channel.timeout = config["total_ms"] / 1000 + 1
         done = channel.receive("done")
-        p.require(done["host_pid"] == pid and done["seq"] > first["seq"], "No progress after final resume")
+        continuation_ok(done, pid, first["seq"], protocol, checkpoint=checkpoint)
         # Wait for QEMU to close the socket so its watchdog cannot race us.
         connection.settimeout(2)
         p.require(not channel.buffer and connection.recv(1) == b"", "Trailing observer events")
@@ -341,6 +412,8 @@ def control_worker(endpoint, pipe, gate, binding):
         # Preserve partial evidence; persistence failure cannot pass.
         try:
             save_pending()
+            sync_observation_evidence(binding)
+            result['evidence_persistence'] = {'profile': 'observer-atomic-buffered-v1', 'status': 'synced'}
         except Exception as exc:
             result.update(status="failed", evidence_persistence_error=f"{type(exc).__name__}: {exc}",
                           failure=p.worker_failure(exc, "observer", "persist_evidence", ready))
@@ -357,6 +430,8 @@ def verify_attempt(binding, result):
         p.require(binding.get("observer", {}).get("profile") == PROFILE, "Unsupported observer profile")
     config = binding["observer"]
     protocol = observation_protocol(config)
+    from taintforge_env.capsule_control import private_prefix
+    guard_prefix = private_prefix(binding) if 'control_guard' in binding.get('settings', {}) else False
     p.require(config["fault"] in FAULTS, "Unknown observer fault")
     root = Path(binding["run_dir"])
     contract = root / "config/observer-contract.json"
@@ -385,7 +460,12 @@ def verify_attempt(binding, result):
         success_order.insert(-1, 'warm_checkpoint')
     controller = read_json(output / "controller.json")
     fault, code = config["fault"], result["qemu_exit"]
-    if fault == "none" and (code == 0 or (input_mode and type(code) is int and
+    denied = (input_mode and 'analysis_policy' in binding['settings'] and fault == 'none' and
+              type(code) is int and code == 88 and kinds == first_order + ['RESUME 1', 'resumed'])
+    if denied:
+        p.require(kinds == first_order + ['RESUME 1', 'resumed'], 'Analysis denial crossed the permit boundary')
+        status = 'failed'
+    elif fault == "none" and (code == 0 or (input_mode and type(code) is int and
                                          0 <= code <= 255 and kinds == success_order)):
         p.require(kinds == success_order and controller["status"] == "passed", "Invalid successful observer order")
         status = "passed"
@@ -417,7 +497,8 @@ def verify_attempt(binding, result):
         snapshots = [e for e in stripped if e["event"] == "snapshot" and e["point"] == point]
         p.require(len(snapshots) in (0,2), "Incomplete hold observation")
         if snapshots:
-            for sample, snap in enumerate(snapshots, 1): snapshot_ok(snap, pid, point, sample, protocol)
+            for sample, snap in enumerate(snapshots, 1):
+                snapshot_ok(snap, pid, point, sample, protocol, control_guard=guard_prefix)
             same_hold(*snapshots, config["hold_ms"])
             if point == 1:
                 p.require(snapshots[0]["seq"] == 1, "Bootstrap was not at the first observer boundary")
@@ -462,18 +543,37 @@ def verify_attempt(binding, result):
                   upper_seq=held["seq"], entries=held["seq"]-pre[0]["seq"],
                   exact_uninstall_interval=False, exact_oep_cutover=False) and window["entries"] >= 0,
                   "Invalid measured progress window")
-        p.require(stripped[-1]["seq"] > held["seq"] and stripped[-1]["host_pid"] == pid and
-                  (input_mode or (stdout == b"CAPSULE_OK\n" and
-                  (output / "capsule-fd.txt").read_bytes() == p.FILE_BYTES)),
+        checkpoint = next(e for e in stripped if e['event'] == 'warm_checkpoint') if 'afl_warm' in binding else None
+        continuation_ok(stripped[-1], pid, held["seq"], protocol, checkpoint=checkpoint)
+        p.require(input_mode or (stdout == b"CAPSULE_OK\n" and
+                  (output / "capsule-fd.txt").read_bytes() == p.FILE_BYTES),
                   "Guest continuation oracle failed")
-    else:
+    elif not denied:
         p.require(f"OBSERVER_ABORT code={code} " in diagnostic, "Missing native terminal diagnosis")
     hardening = {}
+    if denied:
+        from taintforge_env.analysis_quality import verify_denial
+        hardening['analysis_quality'] = verify_denial(binding, result, stripped, controller)
+    if accepted and 'analysis_policy' in binding.get('settings', {}):
+        hardening['analysis_quality'] = accepted['analysis_quality']
     if 'hardening' in binding.get('settings', {}) and status == 'passed':
         from taintforge_env.capsule_hardening import verify_saved, verify_ledger
         hardening['hardening'] = verify_saved(binding, stripped, pid)
         report = read_json(retirement.analysis(binding).paths['report'])
         verify_ledger(binding, accepted['events'][-1]['data'], report)
+    if 'control_guard' in binding.get('settings', {}) and status == 'passed':
+        from taintforge_env.capsule_control import verify_snapshot
+        guard = verify_snapshot(stripped[-1].get('control_guard'), private=guard_prefix)
+        first = verify_snapshot(stripped[0].get('control_guard'), private=guard_prefix)
+        p.require(first['checked_syscalls'] == 0 and first['guest_fds'] == 3 and
+                  guard['checked_syscalls'] > 0 and
+                  all(e['control_guard']['checked_syscalls'] <= guard['checked_syscalls']
+                      for e in stripped if e['event'] == 'snapshot'), 'Invalid control guard counters')
+        counts = [e['control_guard']['checked_syscalls'] for e in stripped
+                  if e['event'] in {'snapshot', 'done'}]
+        p.require(counts == sorted(counts), 'Control guard counter moved backwards')
+        hardening['control_guard'] = {'status': 'verified', **guard,
+                                     'scope': 'allowlisted_guest_syscalls', 'memory_isolation': False}
     return dict(status=status, **hardening, continuation_observed=status == "passed", guest_completed=status == "passed" and "afl_warm" not in binding,
-                phase1_retirement=dict(status="verified" if accepted else "unproven", phase1_retired=bool(accepted),
+                phase1_retirement=dict(status="denied" if denied else "verified" if accepted else "unproven", phase1_retired=bool(accepted),
                     claims=retirement.CLAIMS, verdict=accepted["events"][0]["data"] if accepted else None))

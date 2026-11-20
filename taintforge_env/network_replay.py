@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from .network_runtime import payload_scope, network_open, network_write
+from .network_runtime_transport import start_server as runtime_start_server
+
 import asyncio
 import ipaddress
-import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .event_logger import append_jsonl_event
 from .network_policy import NetworkPolicy, NetworkServicePolicy
 from .dns_protocol import DNSError, answer_addresses, build_query, canonical_query, error_response, question, replay_response, validate_response
 from .message_transport import MessageServer
+from .network_events import ObservedReply, prepared_reply
 from .replay_store import (
     ReplayExchange,
     ReplayStore,
@@ -44,7 +49,7 @@ class TCPReplayService:
             raise NetworkReplayError("Replay store has no exact TCP exchange for " f"{service.remote_ip}:{service.remote_port} protocol_hint={service.protocol_hint!r}")
 
     async def start(self) -> asyncio.AbstractServer:
-        server = await asyncio.start_server(self.handle_client,host=self.service.bind_ip,port=self.service.bind_port)
+        server = await runtime_start_server(self.handle_client,host=self.service.bind_ip,port=self.service.bind_port)
         print(f"[+] Deterministic TCP replay listening on {server.sockets[0].getsockname()}; original target {self.service.remote_ip}:{self.service.remote_port}; exchanges={len(self.exchanges)}")
         return server
 
@@ -52,7 +57,7 @@ class TCPReplayService:
         self.connection_counter += 1
         connection_id = self.connection_counter
         peer_host, peer_port = self._parse_peer(writer.get_extra_info("peername"))
-        payload_name = (f"replay_tcp_{self.service.bind_port}_conn_{connection_id}.bin")
+        payload_name = (f"replay_tcp_{self.service.bind_port}{payload_scope(self.service)}_conn_{connection_id}.bin")
         payload_path = self.log_dir / payload_name
         pending = bytearray()
         self._write_event(
@@ -73,7 +78,7 @@ class TCPReplayService:
         )
 
         try:
-            with payload_path.open("ab") as payload_stream:
+            with network_open(payload_path, "ab") as payload_stream:
                 while True:
                     data = await reader.read(4096)
                     if not data:
@@ -127,8 +132,13 @@ class TCPReplayService:
             self._write_event(
                 {
                     "event": "tcp_connection_error",
+                    "transport": "tcp",
                     "listener_type": "deterministic_replay",
                     "connection_id": connection_id,
+                    "peer_host": peer_host,
+                    "peer_port": peer_port,
+                    "bind_ip": self.service.bind_ip,
+                    "bind_port": self.service.bind_port,
                     "service_role": self.service.role,
                     "original_remote_ip": self.service.remote_ip,
                     "original_remote_port": self.service.remote_port,
@@ -181,6 +191,16 @@ class TCPReplayService:
 
     async def _send_hit(self,*,exchange: ReplayExchange,writer: asyncio.StreamWriter,connection_id: int,peer_host: str | None,peer_port: int | None,payload_name: str) -> None:
         response = exchange.entry.response
+        self._write_event({
+            "event": "replay_response_prepared", "network_event_version": 1,
+            "listener_type": "deterministic_replay", "transport": "tcp",
+            "connection_id": connection_id, "peer_host": peer_host, "peer_port": peer_port,
+            "bind_ip": self.service.bind_ip, "bind_port": self.service.bind_port,
+            "original_remote_ip": self.service.remote_ip, "original_remote_port": self.service.remote_port,
+            "protocol_hint": self.service.protocol_hint, "replay_status": "hit",
+            "response_prepared": True, "response_sent": False, "response_origin": "replay",
+            "request_sha256": exchange.entry.request.payload_sha256, "response_sha256": response.sha256,
+        })
         if response.delay_ms:
             await asyncio.sleep(response.delay_ms / 1000)
         if exchange.response_bytes:
@@ -189,6 +209,11 @@ class TCPReplayService:
         self._write_event(
             {
                 "event": "replay_hit",
+                "network_event_version": 1,
+                "transport": "tcp",
+                "response_prepared": True,
+                "response_sent": bool(exchange.response_bytes),
+                "response_origin": "replay",
                 "listener_type": "deterministic_replay",
                 "connection_id": connection_id,
                 "service_role": self.service.role,
@@ -214,6 +239,9 @@ class TCPReplayService:
         self._write_event(
             {
                 "event": "replay_miss",
+                "transport": "tcp",
+                "response_prepared": False,
+                "response_sent": False,
                 "listener_type": "deterministic_replay",
                 "connection_id": connection_id,
                 "service_role": self.service.role,
@@ -234,8 +262,7 @@ class TCPReplayService:
 
     def _write_event(self, event: dict[str, Any]) -> None:
         payload = {"timestamp_utc": datetime.now(timezone.utc).isoformat(),**event}
-        with self.events_log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        append_jsonl_event(self.events_log_path, payload)
 
     @staticmethod
     def _parse_peer(peer: Any) -> tuple[str | None, int | None]:
@@ -273,10 +300,10 @@ class MessageReplayService:
     async def start(self):
         return await MessageServer(self.handle).start(self.service.bind_ip, self.service.bind_port, self.service.service_type)
 
-    async def handle(self, data: bytes, peer: tuple) -> bytes | None:
+    async def handle(self, data: bytes, peer: tuple) -> ObservedReply | None:
         self.counter += 1
-        payload_name = f"replay_{self.service.service_type}_{self.service.bind_port}_{self.counter}.bin"
-        (self.log_dir / payload_name).write_bytes(data)
+        payload_name = f"replay_{self.service.service_type}_{self.service.bind_port}{payload_scope(self.service)}_{self.counter}.bin"
+        network_write(self.log_dir / payload_name, data)
         event = {"timestamp_utc": datetime.now(timezone.utc).isoformat(),
                  "listener_type": "deterministic_replay", "transport": self.service.service_type,
                  "service_role": self.service.role,
@@ -284,6 +311,7 @@ class MessageReplayService:
                  "original_remote_ip": self.service.remote_ip, "original_remote_port": self.service.remote_port,
                  "peer_host": str(peer[0]), "peer_port": int(peer[1]), "payload_file": payload_name,
                  "observed_request_sha256": sha256_bytes(data), "observed_request_size": len(data)}
+        event.update(exchange_id=self.counter, bind_ip=self.service.bind_ip, bind_port=self.service.bind_port)
         response = None
         try:
             key = canonical_query(data) if self.dns else data
@@ -303,11 +331,14 @@ class MessageReplayService:
                              response_sha256=sha256_bytes(response), response_size=len(response))
         except DNSError as exc:
             event.update(event="dns_replay_miss", reason=str(exc))
+        except asyncio.CancelledError:
+            prepared_reply(self.log_dir / "network_events.jsonl",
+                           {**event, "event": "dns_replay_hit" if self.dns else "replay_hit",
+                            "status": "cancelled"}, data, None, dns=self.dns)
+            raise
         if self.dns:
             event["dns_response_prepared"] = response is not None
-        with (self.log_dir / "network_events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, sort_keys=True) + "\n")
-        return response
+        return prepared_reply(self.log_dir / "network_events.jsonl", event, data, response, dns=self.dns)
 
 
 UDPReplayService = MessageReplayService
@@ -315,8 +346,29 @@ DNSReplayService = MessageReplayService
 
 
 def replay_service(*, service: NetworkServicePolicy, store: ReplayStore, log_dir: str | Path):
+    if service.replay_session_id is not None:
+        from .network_session_service import TCPSessionService
+        return TCPSessionService(service=service, session=session_for_service(service, store), log_dir=log_dir)
     cls = MessageReplayService if service.service_type == "udp" or service.protocol_hint == "dns" else TCPReplayService
     return cls(service=service, store=store, log_dir=log_dir)
+
+
+def session_for_service(service: NetworkServicePolicy, store: ReplayStore):
+    identity = service.replay_session_id
+    if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity):
+        raise NetworkReplayError("replay_session_id must be a canonical SHA-256 identity")
+    if type(service.remote_port) is not int:
+        raise NetworkReplayError("session service remote_port must be an integer")
+    try:
+        session = store.load_session(identity)
+    except ReplayStoreValidationError as exc:
+        raise NetworkReplayError(str(exc)) from exc
+    if ((service.service_type, service.remote_ip, service.remote_port, service.protocol_hint)
+            != ("tcp", session.remote_ip, session.remote_port, session.protocol_hint)):
+        raise NetworkReplayError("selected replay session does not match the exact service endpoint and hint")
+    if service.upstream_ip is not None or service.upstream_port is not None or service.dns_records is not None:
+        raise NetworkReplayError("session replay cannot include upstream or synthetic DNS configuration")
+    return session
 
 
 async def run_network_replay(*,policy: NetworkPolicy,replay_store: ReplayStore,log_dir: str | Path) -> None:
@@ -339,7 +391,7 @@ async def run_network_replay(*,policy: NetworkPolicy,replay_store: ReplayStore,l
         await asyncio.gather(*(server.wait_closed() for server in servers))
 
 
-def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore) -> dict[str, Any]:
+def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore, allow_empty: bool = False) -> dict[str, Any]:
 
     if policy.allow_internet:
         raise NetworkReplayError("deterministic replay policy must not allow Internet access")
@@ -347,10 +399,11 @@ def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore) ->
         store_validation = replay_store.validate()
     except ReplayStoreValidationError as exc:
         raise NetworkReplayError(str(exc)) from exc
-    if not policy.services:
+    if not policy.services and not allow_empty:
         raise NetworkReplayError("deterministic replay policy contains no services")
 
     covered_exchanges = 0
+    covered_sessions = 0
     dns_reports = []
     endpoints = set()
     for service in policy.services:
@@ -368,6 +421,11 @@ def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore) ->
             raise NetworkReplayError(f"deterministic replay service has invalid remote_ip: {service.remote_ip}") from exc
         if remote_ip.version != 4:
             raise NetworkReplayError(f"deterministic replay v1 supports IPv4 services only: {service.remote_ip}")
+        if service.replay_session_id is not None:
+            session = session_for_service(service, replay_store)
+            covered_sessions += 1
+            covered_exchanges += len(session.steps)
+            continue
         try:
             exchanges = replay_store.exchanges_for_endpoint(transport=service.service_type,remote_ip=service.remote_ip,remote_port=service.remote_port,protocol_hint=service.protocol_hint)
         except ReplayStoreValidationError as exc:
@@ -395,4 +453,5 @@ def validate_replay_policy(*,policy: NetworkPolicy,replay_store: ReplayStore) ->
                 raise NetworkReplayError("invalid service domain") from exc
             if service.remote_ip not in addresses:
                 raise NetworkReplayError(f"DNS replay does not bind {service.domain} to {service.remote_ip}")
-    return {**store_validation,"covered_services": len(policy.services),"covered_exchanges": covered_exchanges}
+    return {**store_validation,"covered_services": len(policy.services),"covered_exchanges": covered_exchanges,
+            **({"covered_sessions": covered_sessions} if covered_sessions else {})}

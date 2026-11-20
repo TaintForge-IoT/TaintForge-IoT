@@ -33,6 +33,7 @@ class NetworkServicePolicy:
     upstream_ip: Optional[str] = None
     upstream_port: Optional[int] = None
     dns_records: dict[str, list[str]] | None = None
+    replay_session_id: str | None = None
 
 
 
@@ -44,6 +45,7 @@ class NetworkPolicy:
     services: list[NetworkServicePolicy] = field(default_factory=list)
     catch_all: CatchAllPolicy = field(default_factory=CatchAllPolicy)
     recording: dict | None = None
+    runtime_limits: dict | None = None
 
     def to_dict(self) -> dict:
         result = {
@@ -54,6 +56,9 @@ class NetworkPolicy:
         }
         if self.recording is not None:
             result["recording"] = self.recording
+        if self.runtime_limits is not None:
+            from .network_runtime import NetworkRuntimeLimits
+            result["runtime_limits"] = asdict(NetworkRuntimeLimits.parse(self.runtime_limits))
         return result
 
 
@@ -187,4 +192,7 @@ def load_network_policy(path: str | Path) -> NetworkPolicy:
     )
     )
 
-    return NetworkPolicy(mode=raw.get("mode", "local_test"), allow_internet=bool(raw.get("allow_internet", False)), services=services, catch_all=catch_all, recording=raw.get("recording"))
+    from .network_runtime import NetworkRuntimeLimits
+    limits = raw.get("runtime_limits")
+    NetworkRuntimeLimits.parse(limits)
+    return NetworkPolicy(mode=raw.get("mode", "local_test"), allow_internet=bool(raw.get("allow_internet", False)), services=services, catch_all=catch_all, recording=raw.get("recording"), runtime_limits=limits)

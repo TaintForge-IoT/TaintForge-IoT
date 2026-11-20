@@ -7,6 +7,7 @@ from pathlib import Path
 from taintforge_env.repair_applier import (
     RepairApplicationError,
     RepairApplier,
+    RepairApplierConfig,
 )
 
 
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate and report changes without mutating rootfs",
     )
+    parser.add_argument("--network-repair-policy", type=Path)
     return parser.parse_args()
 
 
@@ -55,14 +57,16 @@ def main() -> int:
     args = parse_args()
 
     try:
-        report = RepairApplier().apply_file(
+        from taintforge_env.network_repair import NetworkRepairPolicy
+        authorization = NetworkRepairPolicy.load(args.network_repair_policy) if args.network_repair_policy else None
+        report = RepairApplier(RepairApplierConfig(network_repair_policy=authorization)).apply_file(
             plan_path=args.plan,
             requirements_path=args.requirements,
             rootfs=args.rootfs,
             out_path=args.out,
             dry_run=args.dry_run,
         )
-    except RepairApplicationError as exc:
+    except (RepairApplicationError, ValueError, OSError) as exc:
         print(f"[!] Repair application failed: {exc}")
         if args.out.exists():
             print(f"[!] Failure report: {args.out}")

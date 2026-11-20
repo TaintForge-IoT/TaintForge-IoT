@@ -88,6 +88,13 @@ def prepare(binding, ipc):
     p.require(phase == run / 'logs/phase1' and phase.is_dir() and not phase.is_symlink(),
               'Unbound M4 Phase 1 output directory')
     os.chown(phase, c['uid'], c['gid']); phase.chmod(0o700)
+    observer = read_json(run / 'config/phase1_binding.json').get('network_observer')
+    if observer is not None:
+        network_output = Path(observer['output_directory'])
+        p.require(network_output == run / 'logs/network_endpoints' and network_output.is_dir()
+                  and not network_output.is_symlink(), 'Invalid network observer output directory')
+        os.chown(network_output, c['uid'], c['gid'])
+        network_output.chmod(0o700)
     os.chown(ipc, 0, c['gid']); ipc.chmod(0o710)
     private_controls(run)
     p.write_json(run / 'logs/capsule/m4-setup.json', {
@@ -132,6 +139,16 @@ def budget_usage(binding):
             info = path.lstat()
             p.require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'Unsafe runtime journal')
             journal += info.st_size
+    endpoint = read_json(run / 'config/phase1_binding.json').get('network_observer')
+    if endpoint is not None:
+        recorded_phase = Path(binding.get('recorded_phase1_directory', str(run / 'logs/phase1')))
+        directory = run / 'logs/network_endpoints'
+        p.require(Path(endpoint['output_directory']) == recorded_phase.parent / 'network_endpoints' and directory.is_dir()
+                  and not directory.is_symlink(), 'Unsafe endpoint observer journal directory')
+        for path in directory.iterdir():
+            info = path.lstat()
+            p.require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'Unsafe endpoint observer journal')
+            journal += info.st_size
     controls = run / 'logs/capsule'
     for path in controls.rglob('*'):
         if 'export' in path.relative_to(controls).parts: continue
@@ -145,7 +162,7 @@ def budget_usage(binding):
     return {'export_bytes': export, 'journal_bytes': journal}
 
 
-def capture_context(binding, pid, point):
+def capture_context(binding, pid, point, *, durable=True):
     c = config(binding)
     proc = Path(binding['rootfs']) / 'proc' / str(pid)
     before = (proc / 'stat').read_text()
@@ -171,7 +188,7 @@ def capture_context(binding, pid, point):
     p.require(len(json.dumps(item).encode()) <= 1024**2, 'M4 execution context exceeds its byte budget')
     verify_context(binding, item, pid, point, start)
     path = Path(binding['run_dir']) / f'logs/capsule/execution-context-{point}.json'
-    p.write_json(path, item)
+    p.write_json(path, item, durable=durable)
     return {'execution_context_sha256': p.sha(path)}
 
 
@@ -198,6 +215,9 @@ def verify_context(binding, item, pid, point, start):
               'Analyzer runtime mount lacks required restrictions')
     p.require(item['protected_control_channel'] is False and
               item['fd_table_scope'] == 'shared_linux_user_host_process', 'M4 context overstates FD isolation')
+    if point == 1 and 'control_guard' in binding.get('settings', {}):
+        p.require(any(f['fd'] == 0 and f['target'] == '/dev/null' for f in item['fds']),
+                  'Control guard requires a dedicated null stdin')
     p.require(set(item['namespaces']) == {'mnt','pid','net','uts','ipc','user'} and
               all(isinstance(value,str) and value for value in item['namespaces'].values()), 'Missing M4 namespace identities')
     p.require(type(item['fds']) is list and len(item['fds']) <= 1024 and
@@ -282,6 +302,12 @@ def launch(binding, argv, *, direct_qemu=False):
     root = Path(binding['rootfs'])
     executable = '/__taintforge/bin/qemu-i386' if direct_qemu else '/__taintforge/bin/loader'
     p.require(root.is_dir() and not root.is_symlink() and argv[0] == executable, 'Invalid M4 launch root/loader')
+    native_command = None
+    if not direct_qemu:
+        from .capsule_exec_identity import prepare_launch
+        native_command = prepare_launch(binding, argv)
+        if native_command is not None:
+            argv = native_command
     libc = ctypes.CDLL(None, use_errno=True)
     prctl_call, capset = libc.prctl, libc.capset
     class Header(ctypes.Structure):
@@ -312,7 +338,7 @@ def launch(binding, argv, *, direct_qemu=False):
     p.require(os.getresuid() == (c['uid'],)*3 and os.getresgid() == (c['gid'],)*3 and not os.getgroups(),
               'M4 credential drop failed')
     env = {'PATH':'/usr/bin:/bin','HOME':'/','LANG':'C','LC_ALL':'C'}
-    if direct_qemu:
+    if direct_qemu or native_command is not None:
         env['LD_LIBRARY_PATH'] = '/__taintforge/lib'
     os.execve(argv[0], argv, env)
 

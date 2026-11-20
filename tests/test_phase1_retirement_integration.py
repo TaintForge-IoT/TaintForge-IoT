@@ -28,6 +28,15 @@ def capture(binding, packets):
         ("oep_candidate_selected", {"candidate_id": 1, "address": verdict["oep"]}),
         ("oep_verdict", {k: v for k, v in verdict.items() if k not in {"epoch", "generation"}} | {"rewind": False}),
         ("analysis_finished", {})]
+    quality = 'analysis_policy' in binding.get('settings', {})
+    if quality:
+        records[0][1].update(profile='linux-i386-single-thread-v1', ir_enabled=True,
+                             flags_contract='unverified')
+        records[2][1].update(dse_verdict='UNKNOWN', dse_reason='UNSUPPORTED_INSN')
+        records[-1][1].update(capture_status='success', storage_status='ok', dropped_events=0)
+        records.insert(-1, ('analysis_summary', dict(trace_dropped=0, trace_incomplete=1,
+            shadow_knowledge_valid=True, flags_verified=False, ir_matches=0, ir_mismatches=0,
+            ir_unknown=1, ir_errors=0, ir_skipped_budget=0)))
     events = [{"schema_version": 1, **identity, "event_type": name, "event_seq": index,
                "event_id": identity["analysis_instance_id"] + f":{index}", "data": data,
                "status": "selected_candidate" if name == "oep_verdict" else "partial",
@@ -36,6 +45,13 @@ def capture(binding, packets):
         events[2].update(status="candidate", current_pc=verdict["decision_pc"], trace_seq=verdict["decision_trace_seq"])
         events[2]["data"]["decision_trace_seq"] = verdict["decision_trace_seq"]
         events[3].update(current_pc=verdict["continuation_pc"], trace_seq=verdict["decision_trace_seq"])
+    if quality:
+        events[0]['status'] = 'observing'
+        events[1]['status'] = 'observed'
+        events[2]['incomplete_reasons'] = ['dse_incomplete']
+        analyzer.paths['ir'].write_text(json.dumps({'schema': 1, 'event': 'check', 'status': 'UNKNOWN'})+'\n'+
+            json.dumps({'schema': 1, 'event': 'summary', 'checks': 1, 'matches': 0,
+                'mismatches': 0, 'unknown': 1, 'errors': 0, 'skipped_budget': 0})+'\n')
     analyzer.paths["events"].write_text("".join(json.dumps(e) + "\n" for e in events))
     analyzer.paths["dump"].write_bytes(b"A" * 4096)
     report = {"schema_version": 1, **identity, "capture_status": "success", "capture_pc": verdict["continuation_pc"],
@@ -44,7 +60,7 @@ def capture(binding, packets):
                   "size": 4096, "prot": 5, "offset": 0, "sha256": probe.sha(analyzer.paths["dump"])}]}
     write_json(analyzer.paths["report"], report)
     artifacts = {"ir": None}
-    for name in ("events", "dump", "report"):
+    for name in ("events", "dump", "report", *(("ir",) if quality else ())):
         path = analyzer.paths[name]
         artifacts[name] = {"path": str(path), "size": path.stat().st_size, "sha256": probe.sha(path)}
     write_json(analyzer.paths["manifest"], {"schema_version": 1, **identity, "storage_status": "ok",

@@ -178,7 +178,7 @@ class BudgetGuestTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
-    def run_launcher(self, failure=None):
+    def run_launcher(self, failure=None, *, direct_qemu=False, native_command=None):
         entered = False
         layouts, lookups, calls = [], [], []
         structure = m4.ctypes.Structure
@@ -227,17 +227,28 @@ class LauncherTests(unittest.TestCase):
              patch.object(m4.resource, 'setrlimit', side_effect=record('rlimit')), \
              patch.object(m4.ctypes, 'Structure', CheckedStructure), \
              patch.object(m4.ctypes, 'CDLL', return_value=Libc()), \
-             patch.object(m4.ctypes, 'get_errno', return_value=1):
+             patch.object(m4.ctypes, 'get_errno', return_value=1), \
+             patch('taintforge_env.capsule_exec_identity.prepare_launch', return_value=native_command) as prepare:
             binding = {'rootfs': root, 'settings': {'hardening': m4.policy()}}
-            command = ['/__taintforge/bin/loader', '/__taintforge/bin/qemu-i386']
+            if direct_qemu:
+                binding['profile'] = 'dse-file-analysis-v1'
+            command = ['/__taintforge/bin/qemu-i386'] if direct_qemu else [
+                '/__taintforge/bin/loader', '/__taintforge/bin/qemu-i386']
             if failure:
                 with self.assertRaisesRegex(OSError, 'M4 ' + ('prctl' if failure == 'prctl' else 'capability clear')):
-                    m4.launch(binding, command)
+                    m4.launch(binding, command, direct_qemu=direct_qemu)
                 system['execve'].assert_not_called()
             else:
-                m4.launch(binding, command)
-                system['execve'].assert_called_once_with(command[0], command,
-                    {'PATH':'/usr/bin:/bin', 'HOME':'/', 'LANG':'C', 'LC_ALL':'C'})
+                m4.launch(binding, command, direct_qemu=direct_qemu)
+                expected_command = native_command if native_command is not None else command
+                expected_env = {'PATH':'/usr/bin:/bin', 'HOME':'/', 'LANG':'C', 'LC_ALL':'C'}
+                if direct_qemu or native_command is not None:
+                    expected_env['LD_LIBRARY_PATH'] = '/__taintforge/lib'
+                system['execve'].assert_called_once_with(expected_command[0], expected_command, expected_env)
+            if direct_qemu:
+                prepare.assert_not_called()
+            else:
+                prepare.assert_called_once_with(binding, command)
         return layouts, lookups, calls
 
     def test_native_dependencies_are_prepared_before_chroot(self):
@@ -254,6 +265,22 @@ class LauncherTests(unittest.TestCase):
         for failure in ('prctl', 'capset'):
             with self.subTest(failure=failure):
                 self.run_launcher(failure)
+
+    def test_dse_direct_qemu_keeps_credential_drop_and_library_path(self):
+        _, _, calls = self.run_launcher(direct_qemu=True)
+        execution = next(call for call in calls if isinstance(call, tuple) and call[0] == 'execve')
+        self.assertLess(calls.index('capset'), calls.index(execution))
+        self.run_launcher('capset', direct_qemu=True)
+
+    def test_capsule_native_identity_command_survives_the_dse_merge(self):
+        self.run_launcher(native_command=['/__taintforge/bin/qemu-i386', '-U', 'LD_LIBRARY_PATH'])
+
+    def test_direct_qemu_cannot_bypass_the_dse_profile_gate(self):
+        for profile in (None, 'phase1', 'execution-capsule-v1'):
+            with self.subTest(profile=profile), patch.object(m4.os, 'execve') as execute:
+                with self.assertRaisesRegex(RuntimeError, 'isolated DSE profile'):
+                    m4.launch({'profile': profile}, ['/__taintforge/bin/qemu-i386'], direct_qemu=True)
+                execute.assert_not_called()
 
 
 class HardeningPolicyTests(unittest.TestCase):
@@ -450,21 +477,26 @@ class CollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'validation').mkdir()
             (root/'validation/preflight.log').write_text('systemd unavailable\n')
+            (root/'phase1-runtime').mkdir()
+            runtime=b'{"tests":[],"scope":"incomplete_runtime_test"}\n'
+            (root/'phase1-runtime/results.json').write_bytes(runtime)
             result=collect(root,7)
             self.assertFalse(result['complete'])
             with tarfile.open(result['archive']) as archive:
                 manifest=json.load(archive.extractfile('evidence/collection.json'))
                 self.assertEqual(manifest['kind'],'m4-acceptance')
                 self.assertEqual(manifest['command_exit_code'],7)
-                self.assertEqual(len(manifest['files']),1)
+                self.assertEqual(len(manifest['files']),2)
+                self.assertEqual(archive.extractfile('evidence/phase1-runtime/results.json').read(),runtime)
                 self.assertIn('extra/report.json',manifest['missing_required'])
 
     def test_collection_refuses_a_symlink_in_extra_evidence(self):
         from scripts.collect_capsule_hardening_evidence import collect
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d);(root/'extra').mkdir()
-            (root/'extra/report.json').symlink_to('/etc/passwd')
-            with self.assertRaisesRegex(RuntimeError,'Symlink'):collect(root,0)
+        for prefix in ('extra','phase1-runtime'):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as d:
+                root=Path(d);(root/prefix).mkdir()
+                (root/prefix/'report.json').symlink_to('/etc/passwd')
+                with self.assertRaisesRegex(RuntimeError,'Symlink'):collect(root,0)
 
 
 if __name__ == '__main__':unittest.main()

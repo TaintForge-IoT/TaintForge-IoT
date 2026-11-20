@@ -80,7 +80,7 @@ def _number(value, bits=64):
     return result
 
 
-def parse_trace(trace, input_path, input_size, *, max_groups=64, max_offsets=16,
+def parse_trace(trace, input_path, input_size, *, max_groups=4096, max_offsets=16,
                 max_trace_bytes=64 * 1024**2):
     """Read the exact native stderr records; reject ambiguous or partial groups."""
     _limit(max_groups, 4096, 'groups')
@@ -211,7 +211,7 @@ def _variants(seed, group):
 
 
 def generate_corpus(*, seed, binary, trace, input_path, out, max_candidates=128,
-                    max_groups=64, max_offsets=16, max_trace_bytes=64 * 1024**2):
+                    max_groups=4096, max_offsets=16, max_trace_bytes=64 * 1024**2):
     """Plan all bounded candidates before publishing a new corpus directory."""
     _limit(max_candidates, 4096, 'candidates')
     seed, seed_record = _pin(seed, 4096)

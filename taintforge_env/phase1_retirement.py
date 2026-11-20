@@ -1,6 +1,7 @@
 """Cooperative Phase 1 retirement for controlled inputs."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -215,32 +216,49 @@ def verify_export(binding, packets):
         probe.require(report["capture_trace_seq"] == packets[0]["data"]["decision_trace_seq"] and
                       report["capture_generation"] == packets[0]["data"]["generation"],
                       "Capture was delayed after the selected verdict")
+    if 'analysis_policy' in binding.get('settings', {}):
+        from .analysis_quality import assess
+        verified['analysis_quality'] = assess(binding, run, verified, stream)
     return run, verified
 
 
-def preserve_export(binding, run):
+def preserve_export(binding, run, *, mark=None):
     """Copy and fsync the accepted bytes before granting the permit."""
     destination = directory(binding) / "export"
     destination.mkdir(exist_ok=False)
-    hashes = {}
-    for name, path in run.paths.items():
-        if not path.exists():
-            continue
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        with os.fdopen(fd, "rb") as source, (destination / path.name).open("xb") as target:
-            st = os.fstat(source.fileno())
-            probe.require(stat.S_ISREG(st.st_mode) and st.st_size <= 1024**3, "Unbounded export")
-            left = st.st_size
-            while left:
-                data = source.read(min(left, 1024**2))
-                probe.require(data, "Export truncated while preserving")
-                target.write(data)
-                left -= len(data)
-            probe.require(not source.read(1), "Export grew while preserving")
-            target.flush()
+    copies = {}
+    # Queue the whole export before the first barrier so the filesystem can
+    # write these files together. Sync the original writing descriptors.
+    with ExitStack() as outputs:
+        for path in run.paths.values():
+            if not path.exists():
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            with os.fdopen(fd, "rb") as source:
+                st = os.fstat(source.fileno())
+                probe.require(stat.S_ISREG(st.st_mode) and st.st_size <= 1024**3, "Unbounded export")
+                target = outputs.enter_context((destination / path.name).open("xb"))
+                left = st.st_size
+                while left:
+                    data = source.read(min(left, 1024**2))
+                    probe.require(data, "Export truncated while preserving")
+                    target.write(data)
+                    left -= len(data)
+                probe.require(not source.read(1), "Export grew while preserving")
+                target.flush()
+                copies[path] = target
+        if mark is not None:
+            mark("sync_export_files")
+        for target in copies.values():
             os.fsync(target.fileno())
+    if mark is not None:
+        mark("check_export_copies")
+    hashes = {}
+    for path in copies:
         hashes[path.name] = probe.sha(destination / path.name)
         probe.require(hashes[path.name] == probe.sha(path), "Export changed while preserving")
+    if mark is not None:
+        mark("sync_export_directories")
     for path in (destination, destination.parent):
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
@@ -257,6 +275,12 @@ def permit_worker(endpoint, pipe, binding, *, progress_pipe=None):
     listener = connection = None
     ready = False
     stage = "socket"
+
+    def mark(name):
+        nonlocal stage
+        stage = name
+        result["permit_timeline_ns"][name] = time.monotonic_ns()
+
     try:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         stage = "bind"
@@ -289,15 +313,35 @@ def permit_worker(endpoint, pipe, binding, *, progress_pipe=None):
             result["events"].append(_parse(data.decode("utf-8")))
             check_packets(binding, result["events"], qpid, complete=False)
             if index == 1:
-                stage = "export_verification"
+                result["permit_timeline_ns"] = {}
+                mark("export_verification")
                 run, result["export_verification"] = verify_export(binding, result["events"])
-                result["preserved_sha256"] = preserve_export(binding, run)
+                if 'analysis_policy' in binding.get('settings', {}):
+                    mark("analysis_policy")
+                    decision = result['export_verification']['analysis_quality']
+                    result['analysis_quality'] = decision
+                    probe.write_json(output / 'retirement.json', result)
+                    if decision['status'] != 'accepted':
+                        connection.sendall(b'DENY\n')
+                        result.update(status='analysis_rejected', permit='DENY\n')
+                        probe.write_json(output / 'retirement.json', result)
+                        probe.require(connection.recv(2049) == b'', 'Phase 1 continued after analysis rejection')
+                        result['stream_closed'] = True
+                        return
+                mark("copy_export")
+                result["preserved_sha256"] = preserve_export(binding, run, mark=mark)
                 # Recheck the full manifest after copying, before acknowledging it.
-                verify_export(binding, result["events"])
+                mark("recheck_export")
+                _, rechecked = verify_export(binding, result["events"])
+                if 'analysis_policy' in binding.get('settings', {}):
+                    from .analysis_quality import verify_saved
+                    verify_saved(binding, rechecked, result)
                 result["accepted_manifest_sha256"] = probe.sha(run.paths["manifest"])
                 if progress_pipe is not None:
                     # STAMP runs on the host thread; a vCPU HOLD here would deadlock.
+                    mark("notify_observer")
                     progress_pipe.send("export_ready")
+                    mark("wait_for_observer_grant")
                     probe.require(progress_pipe.poll(3) and progress_pipe.recv() == "grant",
                                   "Observer did not authorize the pre-permit progress stamp")
                 if fault in {"disconnect", "timeout"}:
@@ -314,7 +358,9 @@ def permit_worker(endpoint, pipe, binding, *, progress_pipe=None):
                 if fault == "bad-digest":
                     digest = ("1" if digest[0] == "0" else "0") + digest[1:]
                 command = f"RETIRE {nonce} {candidate} {digest}\n" if fault != "deny" else "DENY\n"
+                mark("send_permit_reply")
                 connection.sendall(command.encode("ascii"))
+                mark("permit_reply_sent")
                 result.update(permit_sent=fault == "none", permit=command,
                               permit_after_verified_export=True, fault=fault)
                 probe.write_json(output / "retirement.json", result)
@@ -330,6 +376,8 @@ def permit_worker(endpoint, pipe, binding, *, progress_pipe=None):
             probe.write_json(output / "retirement.json", result)
             progress_pipe.send("released")
     except Exception as exc:
+        if "permit_timeline_ns" in result:
+            result["permit_timeline_ns"]["failure_observed"] = time.monotonic_ns()
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["failure"] = probe.worker_failure(exc, "permit", stage, ready)
         if not ready:
@@ -388,7 +436,10 @@ def verify_retirement(binding, qpid):
                   result["permit_after_verified_export"] is True, "Incomplete retirement evidence")
     packets = result["events"]
     check_packets(binding, packets, qpid, complete=True)
-    run, _ = verify_export(binding, packets)
+    run, verified = verify_export(binding, packets)
+    if 'analysis_policy' in binding.get('settings', {}):
+        from .analysis_quality import verify_saved
+        verify_saved(binding, verified, result)
     digest = probe.sha(run.paths["manifest"])
     candidate = packets[0]["data"]["candidate_id"]
     probe.require(result["accepted_manifest_sha256"] == digest and

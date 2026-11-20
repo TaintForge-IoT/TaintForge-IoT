@@ -8,6 +8,9 @@ from pathlib import Path
 
 from taintforge_env.c2_record_broker import C2RecordBroker
 from taintforge_env.c2_record_policy import parse_c2_record_policy
+from taintforge_env.observations import ObservationBundle
+from taintforge_env.requirement_extractor import RequirementExtractor
+from taintforge_env.requirements import RequirementStatus
 
 
 class C2RecordBrokerTests(unittest.IsolatedAsyncioTestCase):
@@ -94,6 +97,14 @@ class C2RecordBrokerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary["server_to_client"]["bytes"], 5)
 
             await broker.close()
+            events = [json.loads(line) for line in broker.event_path.read_text().splitlines()]
+            finished = next(event for event in events if event["event"] == "broker_session_finished")
+            self.assertTrue(finished["response_sent"])
+            self.assertEqual(finished["response_size"], 5)
+            requirements = RequirementExtractor().extract(ObservationBundle(
+                run_dir=Path(temp_dir), network_events=tuple(events))).requirements
+            self.assertEqual(len(requirements), 1)
+            self.assertEqual(requirements[0].status, RequirementStatus.PROVIDED)
 
         mock_server.close()
         await mock_server.wait_closed()

@@ -160,7 +160,8 @@ void check(void *p, const char *s) {
                     self.assertEqual(event["data"]["decision_trace_seq"], 23)
 
     def test_real_owner_cleanup_full_partial_and_repeated_under_sanitizers(self):
-        for arg in ("full", "partial", "m4-full", "m4-partial"):
+        for arg in ("full", "partial", "m4-full", "m4-partial", "stage-full", "stage-partial",
+                    "m4-stage-full", "m4-stage-partial"):
             with self.subTest(arg=arg):
                 result = subprocess.run([str(self.out / "release_test"), arg], capture_output=True, text=True,
                     env={**os.environ, "ASAN_OPTIONS": "detect_leaks=" + os.environ.get("TF_RETIRE_LSAN", "1") + ":halt_on_error=1",

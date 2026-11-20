@@ -26,14 +26,20 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Output path for repair_plan.json",
     )
+    parser.add_argument("--network-repair-policy", type=Path)
+    parser.add_argument("--network-policy", type=Path)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        plan = RepairPlanner().plan_file(args.requirements, args.out)
-    except RepairPlanningError as exc:
+        from taintforge_env.network_repair import NetworkRepairPolicy
+        from taintforge_env.network_policy import load_network_policy
+        authorization = NetworkRepairPolicy.load(args.network_repair_policy) if args.network_repair_policy else None
+        active = load_network_policy(args.network_policy) if args.network_policy else None
+        plan = RepairPlanner(network_repair_policy=authorization, network_policy=active).plan_file(args.requirements, args.out)
+    except (RepairPlanningError, ValueError, OSError) as exc:
         print(f"[!] Repair planning failed: {exc}")
         return 2
 

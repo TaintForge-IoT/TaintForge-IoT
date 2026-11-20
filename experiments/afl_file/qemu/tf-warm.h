@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- * Included by linux-user/syscall.c, after plugin callbacks have returned.
- * Private TaintForge ABI 1; Linux i386, one guest task, serial children.
+ * Included by linux-user/syscall.c. The input gate precedes syscall callbacks;
+ * the fork checkpoint follows them.
+ * Private TaintForge ABI 3; Linux i386, one guest task, serial children.
  */
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -10,6 +11,10 @@
 #include <malloc.h>
 
 #define TF_WARM_MAGIC 0x54465731U
+/* Written only by the backend, never by a plugin. Read after wait4(). */
+typedef struct TFWarmOutcome {
+    uint32_t event, target_signal, host_signal, exit_code, pc;
+} TFWarmOutcome;
 static struct {
     char *input, *endpoint;
     uint64_t max_rss_mib;
@@ -17,7 +22,43 @@ static struct {
     int observer_fd;
     void (*prepare)(void);
     void (*on_child)(void);
+    void (*input_gate)(void);
+    TFWarmOutcome *outcome;
 } tf_warm;
+
+unsigned int qemu_plugin_tf_warm_abi2(void)
+{
+    return 2;
+}
+
+unsigned int qemu_plugin_tf_warm_abi3(void)
+{
+    return 3;
+}
+
+int qemu_plugin_tf_warm_set_input_gate(void (*gate)(void))
+{
+    if (!tf_warm.input || !gate || tf_warm.input_gate || tf_warm.armed ||
+        tf_warm.entered) {
+        return -1;
+    }
+    tf_warm.input_gate = gate;
+    return 0;
+}
+
+void tf_warm_note_exit(CPUArchState *env, int code, int target_signal, int host_signal)
+{
+#if defined(TARGET_I386) && !defined(TARGET_X86_64)
+    if (tf_warm.child && tf_warm.outcome &&
+        (target_signal || !tf_warm.outcome->event)) {
+        tf_warm.outcome->target_signal = target_signal;
+        tf_warm.outcome->host_signal = host_signal;
+        tf_warm.outcome->exit_code = code & 255;
+        tf_warm.outcome->pc = env->eip + env->segs[R_CS].base;
+        qatomic_store_release(&tf_warm.outcome->event, target_signal ? 2 : 1);
+    }
+#endif
+}
 
 static G_NORETURN void tf_warm_fail(const char *reason)
 {
@@ -64,6 +105,18 @@ static int tf_warm_io(int fd, void *data, size_t length, bool sending)
         length -= n;
     }
     return 0;
+}
+
+static uint32_t tf_warm_rss_mib(void)
+{
+    FILE *file = fopen("/proc/self/statm", "r");
+    unsigned long pages, resident;
+    if (!file || fscanf(file, "%lu %lu", &pages, &resident) != 2) {
+        tf_warm_fail("rss_unavailable");
+    }
+    fclose(file);
+    uint64_t bytes = (uint64_t)resident * sysconf(_SC_PAGESIZE);
+    return (bytes + 1024 * 1024 - 1) / (1024 * 1024);
 }
 
 /* Inherited open-file descriptions and writable shared mappings do not roll
@@ -116,17 +169,11 @@ static uint32_t tf_warm_validate(int control)
     /* Release free glibc arenas after the explicit Phase-1 retirement. This
      * cannot free live/untracked allocations; the RSS gate remains mandatory. */
     malloc_trim(0);
-    file = fopen("/proc/self/statm", "r");
-    unsigned long pages, resident;
-    if (!file || fscanf(file, "%lu %lu", &pages, &resident) != 2) {
-        tf_warm_fail("rss_unavailable");
-    }
-    fclose(file);
-    uint64_t bytes = (uint64_t)resident * sysconf(_SC_PAGESIZE);
-    if (bytes > tf_warm.max_rss_mib * 1024 * 1024) {
+    uint32_t rss = tf_warm_rss_mib();
+    if (rss > tf_warm.max_rss_mib) {
         tf_warm_fail("phase1_resident_memory_not_released");
     }
-    return (bytes + 1024 * 1024 - 1) / (1024 * 1024);
+    return rss;
 }
 
 static void tf_warm_checkpoint(void)
@@ -150,8 +197,13 @@ static void tf_warm_checkpoint(void)
         connect(control, (struct sockaddr *)&address, sizeof(address)))) {
         tf_warm_fail("controller_connect");
     }
-    uint32_t hello[] = {htonl(TF_WARM_MAGIC), htonl(1), htonl(getpid()),
-                       htonl(tf_warm_validate(control))};
+    uint32_t rss = tf_warm_validate(control);
+    tf_warm.outcome = mmap(NULL, sizeof(*tf_warm.outcome), PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (tf_warm.outcome == MAP_FAILED) {
+        tf_warm_fail("outcome_mapping");
+    }
+    uint32_t hello[] = {htonl(TF_WARM_MAGIC), htonl(2), htonl(getpid()), htonl(rss)};
     if (tf_warm_io(control, hello, sizeof(hello), true)) {
         tf_warm_fail("hello");
     }
@@ -170,6 +222,7 @@ static void tf_warm_checkpoint(void)
         if (operation != 1 || timeout < 10 || timeout > 600000) {
             tf_warm_fail("command");
         }
+        memset(tf_warm.outcome, 0, sizeof(*tf_warm.outcome));
         fork_start();
         pid_t child = fork();
         fork_end(child);
@@ -189,8 +242,9 @@ static void tf_warm_checkpoint(void)
         uint64_t start = g_get_monotonic_time();
         int status = 0;
         bool timed_out = false;
+        struct rusage usage = {0};
         for (;;) {
-            pid_t done = waitpid(child, &status, WNOHANG);
+            pid_t done = wait4(child, &status, WNOHANG, &usage);
             if (done == child) {
                 break;
             }
@@ -202,7 +256,7 @@ static void tf_warm_checkpoint(void)
             bool lost = n > 0 && poller.revents;
             if (lost || g_get_monotonic_time() - start > (uint64_t)timeout * 1000) {
                 kill(child, SIGKILL);
-                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                while (wait4(child, &status, 0, &usage) < 0 && errno == EINTR) {}
                 if (lost) {
                     tf_warm_fail("controller_lost_during_child");
                 }
@@ -211,18 +265,26 @@ static void tf_warm_checkpoint(void)
             }
         }
         uint32_t response[] = {htonl(TF_WARM_MAGIC), htonl(child),
-                               htonl(status), htonl(timed_out)};
+                               htonl(status), htonl(timed_out),
+                               htonl(qatomic_load_acquire(&tf_warm.outcome->event)),
+                               htonl(tf_warm.outcome->target_signal),
+                               htonl(tf_warm.outcome->host_signal),
+                               htonl(tf_warm.outcome->exit_code),
+                               htonl(tf_warm.outcome->pc),
+                               htonl((g_get_monotonic_time() - start) / 1000),
+                               htonl(MIN((uint64_t)usage.ru_maxrss, UINT32_MAX)),
+                               htonl(tf_warm_rss_mib())};
         if (tf_warm_io(control, response, sizeof(response), true)) {
             tf_warm_fail("result");
         }
     }
 }
 
-static void tf_warm_syscall(int num, abi_long arg1, abi_long arg2)
+static bool tf_warm_input_syscall(int num, abi_long arg1, abi_long arg2)
 {
 #if defined(TARGET_I386) && !defined(TARGET_X86_64)
     if (!tf_warm.input || tf_warm.entered) {
-        return;
+        return false;
     }
     abi_ulong address = num == TARGET_NR_open ? arg1 :
                         num == TARGET_NR_openat ? arg2 : 0;
@@ -232,12 +294,33 @@ static void tf_warm_syscall(int num, abi_long arg1, abi_long arg2)
         if (path) {
             unlock_user(path, address, 0);
         }
-        if (matches) {
-            if (!tf_warm.armed) {
-                tf_warm_fail("input_opened_before_retirement");
-            }
-            tf_warm_checkpoint();
-        }
+        return matches;
     }
 #endif
+    return false;
+}
+
+/* cpu_loop has processed queued CPU work before reaching do_syscall. Run the
+ * gate before syscall callbacks so a restart has no observable syscall effects.
+ * The observer requests HOLD 2, then the normal instruction callback takes it
+ * when cpu_loop retries the still-unexecuted input syscall. */
+QEMU_DISABLE_CFI
+static bool tf_warm_pre_syscall(int num, abi_long arg1, abi_long arg2)
+{
+    if (tf_warm.armed || !tf_warm.input_gate ||
+        !tf_warm_input_syscall(num, arg1, arg2)) {
+        return false;
+    }
+    tf_warm.input_gate();
+    return true;
+}
+
+static void tf_warm_syscall(int num, abi_long arg1, abi_long arg2)
+{
+    if (tf_warm_input_syscall(num, arg1, arg2)) {
+        if (!tf_warm.armed) {
+            tf_warm_fail("input_opened_before_retirement");
+        }
+        tf_warm_checkpoint();
+    }
 }

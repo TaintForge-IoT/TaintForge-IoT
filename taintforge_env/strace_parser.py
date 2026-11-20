@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .syscall_result import parse_result, syscall_success
+from .network_endpoints import SocketTraceTracker, printed_endpoint
 
 
 SYSCALL_RE = re.compile(
@@ -68,6 +69,8 @@ NETWORK_SYSCALLS = {
     "recvfrom",
     "sendmsg",
     "recvmsg",
+    "send",
+    "recv",
 }
 
 PROCESS_SYSCALLS = {
@@ -136,6 +139,13 @@ class SyscallEvent:
 
     high_risk: bool = False
     success: Optional[bool] = None
+    socket_fd: Optional[int] = None
+    transport: Optional[str] = None
+    endpoint_resolution: Optional[str] = None
+    endpoint_source: Optional[str] = None
+    endpoint_reason: Optional[str] = None
+    endpoint_observer_status: Optional[str] = None
+    endpoint_observation_seq: Optional[int] = None
 
 
 class StraceParserError(RuntimeError):
@@ -200,6 +210,7 @@ def is_guest_execve_line(line: str) -> bool:
 
 def parse_strace_file(path: Path) -> list[SyscallEvent]:
     events: list[SyscallEvent] = []
+    sockets = SocketTraceTracker()
 
     execution_context = "host_wrapper"
 
@@ -213,6 +224,7 @@ def parse_strace_file(path: Path) -> list[SyscallEvent]:
             continue
 
         if "<unfinished ...>" in line or "resumed>" in line:
+            sockets.reset()
             continue
 
         if is_guest_execve_line(line):
@@ -226,6 +238,9 @@ def parse_strace_file(path: Path) -> list[SyscallEvent]:
         )
 
         if parsed is not None:
+            if parsed.pid is None and re.fullmatch(r"strace\.[0-9]+", path.name):
+                parsed.pid = int(path.name.split(".")[1])
+            sockets.apply(parsed)
             events.append(parsed)
 
         if is_successful_chroot_line(line):
@@ -295,7 +310,7 @@ def parse_syscall_match(
     result = match.group("result")
 
     paths = extract_paths(syscall=syscall, args=args)
-    remote_ip, remote_port = extract_network_target(args)
+    remote_ip, remote_port = printed_endpoint(syscall, args)
 
     return_value, errno = parse_result(result)
 

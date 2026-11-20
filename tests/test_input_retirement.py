@@ -23,6 +23,14 @@ from tests.test_phase1_retirement_integration import capture
 from tests.test_capsule_unified_lifecycle import resource_entry
 
 
+def save_quality(binding, analyzer, saved):
+    if 'analysis_policy' in binding.get('settings', {}):
+        from taintforge_env.analysis_quality import assess
+        verified = analyzer.verify()
+        verified['analysis_quality'] = assess(binding, analyzer, verified, analyzer.events())
+        saved.update(export_verification=verified, analysis_quality=verified['analysis_quality'])
+
+
 def synthetic_evidence(run, code, fault=None):
     binding = c.read_json(run / "config/capsule_binding.json")
     output, out = run / "logs/capsule", r.directory(binding)
@@ -39,10 +47,12 @@ def synthetic_evidence(run, code, fault=None):
     analyzer = capture(binding, packets)
     hashes = r.preserve_export(binding, analyzer)
     digest = c.p.sha(analyzer.paths["manifest"])
-    c.p.write_json(out / "retirement.json", dict(status="released", qemu_pid=77, events=packets,
+    saved = dict(status="released", qemu_pid=77, events=packets,
         nonce=binding["lifecycle_attempt"], permit_sent=True, stream_closed=True,
         permit_after_verified_export=True, accepted_manifest_sha256=digest, preserved_sha256=hashes,
-        permit=f"RETIRE {binding['lifecycle_attempt']} 1 {digest}\n", fault="none", claims=r.CLAIMS))
+        permit=f"RETIRE {binding['lifecycle_attempt']} 1 {digest}\n", fault="none", claims=r.CLAIMS)
+    save_quality(binding, analyzer, saved)
+    c.p.write_json(out / "retirement.json", saved)
     identity = mappings.record_identity(binding, 77, 12345)
     c.p.write_json(out / "mapping-identity.json", identity)
     def maps(point):
@@ -105,17 +115,19 @@ def synthetic_evidence(run, code, fault=None):
 
 
 class InputExecutor(ObservedExecutor):
-    def __init__(self, *, repair=False, fault=None):
+    def __init__(self, *, repair=False, fault=None, exit_code=0):
         super().__init__()
         self.repair, self.fault, self.runs = repair, fault, []
+        self.normal_exit_code = exit_code
 
     def run(self, command, **kwargs):
         guest = "unshare" in command and str(command[-1]).endswith("run_prebuilt_sandbox.sh")
         if guest:
-            self.guest_exit_code = (42 if self.repair and not (self.rootfs / "var/lib/taintforge-m3").exists() else 0)
+            self.guest_exit_code = (42 if self.repair and not (self.rootfs / "var/lib/taintforge-m3").exists() else self.normal_exit_code)
             if self.fault == "early": self.guest_exit_code = 123
             if self.fault == "timeout": self.guest_exit_code = 124
             if self.fault == "disconnect": self.guest_exit_code = 125
+            if self.fault == 'analysis': self.guest_exit_code = 88
         result = super().run(command, **kwargs)
         if not guest: return result
         run = Path(command[-1]).parent
@@ -124,6 +136,7 @@ class InputExecutor(ObservedExecutor):
         trace = ('77 open("/var/lib/taintforge-m3/output",O_WRONLY|O_CREAT|O_TRUNC,0600) = -1 errno=2 (No such file or directory)\n' if code == 42 else
                  '77 write(1,0x8049000,12) = 12\n')
         if self.fault == "early": trace += "OBSERVER_ABORT code=123 reason=exit_before_observation\n"
+        if self.fault == 'analysis': trace += 'CAPSULE_PHASE1_ABORT code=88 reason=invalid_permit\n'
         (run / "logs/qemu_strace.log").write_text(trace+f"77 exit({code})\n")
         if self.runs and (self.rootfs / "tmp/attempt-only").exists():
             raise AssertionError("Runtime mutation leaked into repaired attempt")
@@ -139,7 +152,7 @@ class InputExecutor(ObservedExecutor):
 class InputRetirementTests(unittest.TestCase):
     setUp = fixture.UnifiedCapsuleTests.setUp
 
-    def prepare_input(self, *, name="m3", extra=()):
+    def prepare_input(self, *, name="m3", extra=(), analysis_policy='research'):
         sidecar = Path(str(self.plugin)+".runtime.json")
         manifest = c.read_json(sidecar)
         manifest["formats"] = {"cooperative_retirement":1,"verdict_retirement":2}
@@ -147,7 +160,8 @@ class InputRetirementTests(unittest.TestCase):
         self.goal = self.base / "goal.json"
         c.p.write_json(self.goal, dict(schema_version=1, goal_id="input-complete", description="Benign input completes", mode="all", rules=[
             dict(id="stdout",type="text_contains",source="stdout",needle="M3_INPUT_OK\n",min_count=1)]))
-        args = parser().parse_args(["run","--retire-phase1","--binary",self.built["guest"],
+        args = parser().parse_args(["run","--retire-phase1",*(['--analysis-policy', analysis_policy] if analysis_policy else []),
+            "--binary",self.built["guest"],
             "--qemu",str(self.qemu),"--plugin",str(self.plugin),"--out",str(self.base/name),
             "--target-spec",str(self.goal),"--max-iterations","3",*extra])
         built = dict(plugin=self.built["plugin"],source_sha256={"observer.c":"a"*64,"qemu-plugin.h":"b"*64})
@@ -282,10 +296,11 @@ class InputRetirementTests(unittest.TestCase):
                 context.Process.side_effect=workers
                 process=Mock(pid=77)
                 process.poll.return_value=None if timeout else 0
-                process.wait.side_effect=([subprocess.TimeoutExpired("qemu",35),-9] if timeout else [0])
+                process.wait.return_value=-9 if timeout else 0
                 with tempfile.TemporaryDirectory() as ipc,patch.object(m3.mp,"get_context",return_value=context), \
                      patch.object(m3.p,"wait_worker_ready"),patch.object(resources,"inspect_self",return_value=resource_entry(binding)), \
-                     patch.object(m3.subprocess,"Popen",return_value=process) as start:
+                     patch.object(m3.subprocess,"Popen",return_value=process) as start, \
+                     patch.object(m3,"wait_qemu",side_effect=subprocess.TimeoutExpired("qemu",35) if timeout else m3.wait_qemu):
                     code=m3.supervise(binding,ipc)
                 saved=c.read_json(run/"logs/capsule/supervisor.json")
                 argv=start.call_args.args[0]

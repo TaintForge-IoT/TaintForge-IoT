@@ -49,9 +49,10 @@ class CheckpointTests(unittest.TestCase):
 
     def test_default_cli_prepares_warm_not_repeated_phase1(self):
         from scripts import run_afl_file as cli
+        from taintforge_env import afl_strict
         with patch('sys.argv', ['run_afl_file', 'prepare', '--binary', '/x', '--qemu', '/q',
                    '--plugin', '/p', '--seeds', '/s', '--guest-file', '/etc/input', '--out', '/out']), \
-             patch.object(w, 'prepare_campaign', return_value={'status': 'prepared'}) as warm, \
+             patch.object(afl_strict, 'prepare_campaign', return_value={'status': 'prepared'}) as warm, \
              patch.object(f, 'prepare_campaign') as fresh:
             self.assertEqual(cli.main(), 0)
         warm.assert_called_once(); fresh.assert_not_called()
@@ -81,10 +82,12 @@ class WarmEvidenceTests(unittest.TestCase):
     prepare_m4 = hard.HardeningIntegrationTests.prepare_m4
     invoke = hard.HardeningIntegrationTests.invoke
 
-    def test_warm_checkpoint_requires_retirement_order_and_is_not_guest_exit(self):
+    def warm_session(self, *, child_signals=False):
         from experiments.retirement_observer import controller
         from taintforge_env import retirement_evidence
         out, launch = self.prepare_m4()
+        if child_signals:
+            launch = launch | {'target_spec_path': None, 'max_iterations': 1}
         rootfs = Path(launch['seed_rootfs'])
         f.create_guest_file(rootfs, '/etc/afl-input', b'A')
         runtime_path = Path(launch['template_run_dir'])/'config/runtime.json'
@@ -99,12 +102,16 @@ class WarmEvidenceTests(unittest.TestCase):
             path = run/'logs/capsule/observer-events.json'
             journal = f.read_json(path)
             events = journal['events']
-            events.insert(-1, dict(event='warm_checkpoint', protocol=3, host_pid=77, seq=515))
+            events.insert(-1, dict(event='warm_checkpoint', protocol=3, host_pid=77, seq=520))
             for index, event in enumerate(events, 1):
                 event.update(controller_seq=index, controller_ns=index*1000)
             f.atomic_json(path, journal)
             result['warm'] = {'status': 'passed', 'phase1_runs': 1, 'children': 2}
+            result['controller_failures'] = []
             f.atomic_json(run/'logs/capsule/supervisor.json', result)
+            if child_signals:
+                with (run/'logs/qemu_strace.log').open('a') as stream:
+                    stream.write('--- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=NULL} ---\n')
             return binding, result
 
         executor = old.InputExecutor()
@@ -114,6 +121,11 @@ class WarmEvidenceTests(unittest.TestCase):
         self.assertEqual(len(executor.runs), 1)
         self.assertTrue(report['capsule']['phase1_retirement']['phase1_retired'])
         self.assertFalse(report['capsule']['guest_completed'])
+        self.assertNotEqual(report['stop_reason'], 'execution_crashed')
+        if child_signals:
+            observation = f.read_json(Path(launch['session_dir'])/'iterations/0000/observation.json')
+            self.assertEqual(observation['metrics']['fatal_signals'], 1)
+            self.assertFalse(observation['goal_reached'])
         run, binding, result = executor.runs[0]
         self.assertEqual(retirement_evidence.verify(run/'retirement-evidence')['attempt_outcome'], 'passed')
         path = run/'logs/capsule/observer-events.json'
@@ -124,6 +136,12 @@ class WarmEvidenceTests(unittest.TestCase):
         f.atomic_json(path, journal)
         with self.assertRaisesRegex(RuntimeError, 'order'):
             controller.verify_attempt(binding, result)
+
+    def test_warm_checkpoint_requires_retirement_order_and_is_not_guest_exit(self):
+        self.warm_session()
+
+    def test_child_signal_survives_full_finalization_without_failing_parent(self):
+        self.warm_session(child_signals=True)
 
 
 class NativeForkTests(unittest.TestCase):
@@ -196,9 +214,9 @@ class NativeForkTests(unittest.TestCase):
         try:
             session.input.write_bytes(b'H')
             session.connection.sendall(struct.pack('!3I', w.MAGIC, 1, 20))
-            magic, child, status, timed_out = struct.unpack('!4I', recv_exact(session.connection, 16))
-            self.assertEqual((magic, timed_out), (w.MAGIC, 1))
-            self.assertTrue(os.WIFSIGNALED(status))
+            value = w.outcome.decode(recv_exact(session.connection, w.outcome.RESPONSE.size))
+            self.assertEqual(value['kind'], 'timeout')
+            self.assertTrue(os.WIFSIGNALED(value['wait_status']))
             session.attempt(b'A')
         finally: session.close()
 

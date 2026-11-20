@@ -9,7 +9,12 @@ import tempfile
 
 HERE = Path(__file__).resolve().parent
 BASELINES = {
+    'linux-user/signal.c': '4db2a49eb05d4c240c8bc6e2a9774572d67001322b0c0a8ce156b009a6e40c61',
+    'linux-user/exit.c': '8492e22cb53d600b62f34b04e89bfae71bc509efd596e5bfdbddc6db18d170dd',
+    'linux-user/user-internals.h': '956c1740e8f884161aa685e87252b94199ba6b12ea3bb0dcec8ddf215bfc1b47',
     'linux-user/syscall.c': 'c327a29ff382a1ee10528a9354b3fded934f9497f565c92d620ab5546da4fbe8',
+    # The input gate relies on queued CPU work and i386 syscall restart ordering.
+    'linux-user/i386/cpu_loop.c': '36b862e46c2511c68ddb37f1b0a0b32d52e43e5e3911238874b9e4c7902ea4bf',
     'linux-user/syscall_defs.h': '850be5489422d063ea1d213f9a31b66130b4f72445b1bc893b01d750fccbb359',
     'linux-user/strace.c': '8c470c56124e23606edd089606d69d778d7d1db10db2e91e9c82e602f50bd592',
     'include/plugins/qemu-plugin.h': '9592f519d7344b1e38b0123b92c28c4e688faedf41263984910353736bb0b7be',
@@ -65,6 +70,9 @@ LEGACY_EFLAGS_REPLACEMENTS = {
 }
 INCLUDE = b'#include "tf-warm.h"\n\n'
 HOOK = b'    tf_warm_syscall(num, arg1, arg2);\n'
+PRE_HOOK = (b'    if (tf_warm_pre_syscall(num, arg1, arg2)) {\n'
+            b'        return -QEMU_ERESTARTSYS;\n'
+            b'    }\n\n')
 DECLARATIONS = b'''
 /* Private TaintForge warm-fork ABI 1, linux-user only. */
 QEMU_PLUGIN_API
@@ -73,6 +81,15 @@ int qemu_plugin_tf_warm_configure(const char *input, const char *endpoint,
 QEMU_PLUGIN_API
 void qemu_plugin_tf_warm_arm(void);
 '''
+V2_DECLARATION = b'QEMU_PLUGIN_API\nunsigned int qemu_plugin_tf_warm_abi2(void);\n'
+V3_DECLARATIONS = b'''QEMU_PLUGIN_API
+unsigned int qemu_plugin_tf_warm_abi3(void);
+QEMU_PLUGIN_API
+int qemu_plugin_tf_warm_set_input_gate(void (*gate)(void));
+'''
+EXIT_NOTE = b'        tf_warm_note_exit(env, code, 0, 0);\n'
+SIGNAL_NOTE = b'    tf_warm_note_exit(env, 128 + target_sig, target_sig, host_sig);\n'
+OUTCOME_DECLARATION = b'void tf_warm_note_exit(CPUArchState *env, int code, int target_signal, int host_signal);\n'
 API_END = b'#ifdef __cplusplus\n} /* extern "C" */\n#endif\n\n#endif /* QEMU_QEMU_PLUGIN_H */\n'
 
 
@@ -81,12 +98,17 @@ def target_mask(source):
     return source.replace(b'FUTEX_CMD_MASK', b'TARGET_FUTEX_CMD_MASK')
 
 
-def warm_syscall(source):
+def warm_syscall(source, *, gate=True):
     anchor = b'static void record_syscall_start(CPUState *cpu, int num,'
     needle = b'                         arg2, arg3, arg4, arg5, arg6, arg7, arg8);\n\n    if (unlikely(qemu_loglevel_mask(LOG_STRACE)))'
     if source.count(anchor) != 1 or source.count(needle) != 1:
         raise ValueError('Syscall insertion point changed')
     source = source.replace(anchor, INCLUDE + anchor, 1)
+    if gate:
+        entry = b'    record_syscall_start(cpu, num, arg1,\n'
+        if source.count(entry) != 1:
+            raise ValueError('Pre-syscall insertion point changed')
+        source = source.replace(entry, PRE_HOOK + entry, 1)
     return source.replace(needle, needle.replace(b'\n\n    if', b'\n' + HOOK + b'\n    if'), 1)
 
 
@@ -130,18 +152,31 @@ def changes(root):
         if name in EFLAGS_REPLACEMENTS:
             baseline, desired, accepted = flags_source(name, original)
         elif name == 'include/plugins/qemu-plugin.h':
-            baseline = original.replace(DECLARATIONS, b'')
+            baseline = original.replace(V3_DECLARATIONS, b'').replace(V2_DECLARATION, b'').replace(DECLARATIONS, b'')
             if baseline.count(API_END) != 1:
                 raise ValueError('Plugin API insertion point changed')
-            desired = baseline.replace(API_END, DECLARATIONS + API_END, 1)
-            accepted = (baseline, baseline + DECLARATIONS, desired)
+            legacy = baseline.replace(API_END, DECLARATIONS + API_END, 1)
+            v2 = baseline.replace(API_END, DECLARATIONS + V2_DECLARATION + API_END, 1)
+            desired = baseline.replace(API_END, DECLARATIONS + V2_DECLARATION + V3_DECLARATIONS + API_END, 1)
+            accepted = (baseline, baseline + DECLARATIONS, legacy, v2, desired)
+        elif name in {'linux-user/signal.c', 'linux-user/exit.c', 'linux-user/user-internals.h'}:
+            note, anchor = {
+                'linux-user/signal.c': (SIGNAL_NOTE, b'    trace_user_dump_core_and_abort(env, target_sig, host_sig);'),
+                'linux-user/exit.c': (EXIT_NOTE, b'        gdb_exit(code);'),
+                'linux-user/user-internals.h': (OUTCOME_DECLARATION, b'void preexit_cleanup(CPUArchState *env, int code);'),
+            }[name]
+            baseline = original.replace(note, b'')
+            if baseline.count(anchor) != 1:
+                raise ValueError('Outcome insertion point changed: ' + name)
+            desired = baseline.replace(anchor, note + anchor, 1)
+            accepted = (baseline, desired)
         else:
             baseline = original.replace(b'TARGET_FUTEX_CMD_MASK', b'FUTEX_CMD_MASK')
             if name == 'linux-user/syscall.c':
-                baseline = baseline.replace(INCLUDE, b'').replace(HOOK, b'')
-                legacy = warm_syscall(baseline)
-                desired = target_mask(legacy)
-                accepted = (baseline, legacy, desired)
+                baseline = baseline.replace(INCLUDE, b'').replace(HOOK, b'').replace(PRE_HOOK, b'')
+                legacy = warm_syscall(baseline, gate=False)
+                desired = target_mask(warm_syscall(baseline))
+                accepted = (baseline, legacy, target_mask(legacy), desired)
             else:
                 desired = target_mask(baseline)
                 accepted = (baseline, desired)
@@ -152,7 +187,8 @@ def changes(root):
     backend = 'linux-user/tf-warm.h'
     original = read_regular(root, backend)
     desired = (HERE / 'tf-warm.h').read_bytes()
-    if original is not None and original != desired:
+    if original is not None and original not in (desired, (HERE / 'tf-warm-v1.h').read_bytes(),
+                                                (HERE / 'tf-warm-v2.h').read_bytes()):
         raise ValueError('Existing warm backend differs; refusing to overwrite')
     if original != desired:
         pending.append((root / backend, original, desired))

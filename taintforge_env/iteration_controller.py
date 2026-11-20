@@ -47,7 +47,7 @@ from .progress_oracle import (
     ProgressOracle,
     ProgressOracleError,
 )
-from .repair_applier import RepairApplicationError, RepairApplier
+from .repair_applier import RepairApplicationError, RepairApplier, RepairApplierConfig
 from .repair_plan import RepairPlan, RepairPlanValidationError
 
 
@@ -690,6 +690,10 @@ class IterationController:
                 RepairPlan.load(
                     temporary_artifacts / "repair_plan.json"
                 )
+                from .afl_session import completed_coordinator
+                warm_completed = completed_coordinator(
+                    temporary_artifacts, contract, guest_exit_code, timed_out,
+                )
                 oracle = ProgressOracle()
                 observation = oracle.observe(
                     temporary_artifacts,
@@ -709,6 +713,8 @@ class IterationController:
                 ProgressOracleError,
                 RepairPlanValidationError,
                 OSError,
+                ValueError,
+                RuntimeError,
             ) as exc:
                 if temporary_artifacts.exists():
                     shutil.rmtree(temporary_artifacts, ignore_errors=True)
@@ -729,6 +735,7 @@ class IterationController:
                 guest_exit_code=guest_exit_code,
                 timed_out=timed_out,
                 stage_transitions=stage_transitions,
+                warm_completed=warm_completed,
             )
             try:
                 attempt_result_path = AttemptStore(
@@ -799,6 +806,11 @@ class IterationController:
                 raise IterationControllerError(
                     "seed environment manifest sample mismatch"
                 )
+            try:
+                from .network_repair import verify_applied_services
+                verify_applied_services(self.session_dir, semantic_chain, manifest.iterations)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise IterationControllerError(str(exc)) from exc
             expected_attempt_ids = tuple(
                 record.attempt_id for record in manifest.iterations
             )
@@ -986,14 +998,16 @@ class IterationController:
             store.clone(parent_snapshot_id, candidate_rootfs)
             application_path = staging / "repair_application.json"
             try:
-                RepairApplier().apply_file(
+                from .network_repair import bound_policy
+                authorization = bound_policy(self.session_dir)
+                RepairApplier(RepairApplierConfig(network_repair_policy=authorization)).apply_file(
                     plan_path=plan_path,
                     requirements_path=requirements_path,
                     rootfs=candidate_rootfs,
                     out_path=application_path,
                     dry_run=False,
                 )
-            except RepairApplicationError as exc:
+            except (RepairApplicationError, ValueError) as exc:
                 raise IterationControllerError(str(exc)) from exc
             capture = store.capture(candidate_rootfs)
             try:
@@ -1084,6 +1098,7 @@ def _build_attempt_result(
     guest_exit_code: int | None,
     timed_out: bool,
     stage_transitions: tuple[StageTransition, ...] = (),
+    warm_completed: bool = False,
 ) -> AttemptResult:
     if guest_exit_code is not None and (
         not isinstance(guest_exit_code, int) or isinstance(guest_exit_code, bool)
@@ -1096,7 +1111,7 @@ def _build_attempt_result(
     elif timed_out or guest_exit_code == 124:
         outcome = AttemptOutcome.TIMED_OUT
         error_code = "execution_timeout"
-    elif observation.metrics.fatal_signals > 0:
+    elif observation.metrics.fatal_signals > 0 and not warm_completed:
         outcome = AttemptOutcome.CRASHED
         error_code = "fatal_guest_signal"
     elif observation.metrics.automatic_candidates > 0:

@@ -7,6 +7,7 @@
 _start:
     movl $input_name, input_pointer
     movl $marker_name, marker_pointer
+    movl $state_name, state_pointer
     cmpl $2, (%esp)
     jl 1f
     movl 8(%esp), %eax
@@ -17,6 +18,11 @@ _start:
     movl %eax, marker_pointer
     cmpl $4, (%esp)
     jl 1f
+    cmpl $5, (%esp)
+    jl 7f
+    movl 20(%esp), %eax
+    movl %eax, state_pointer
+7:
     /* Component oracle: one append for the original preparation, never for
      * each post-checkpoint child. No open descriptor survives this operation. */
     movl 16(%esp), %ebx
@@ -65,6 +71,7 @@ quit:
 .section .rodata
 input_name: .asciz "/etc/afl-input"
 marker_name: .asciz "/tmp/afl-marker"
+state_name: .asciz "/var/fuzz-state/entry"
 prepared_byte: .byte 80
 payload_source:
     movl $WORK_LOOPS, %ecx
@@ -102,6 +109,48 @@ payload_source:
     int $0x80
     popl %ebx
 
+.ifdef FAULT_FIXTURE
+.if FAULT_FIXTURE
+    /* Exposes an unmet parent-directory requirement to Phase 2. */
+    pushl %ebx
+    movl $5, %eax
+    movl state_pointer, %ebx
+    movl $65, %ecx
+    movl $0600, %edx
+    int $0x80
+    testl %eax, %eax
+    js 6f
+    movl %eax, %ebx
+    movl $6, %eax
+    int $0x80
+6:  popl %ebx
+    cmpb $67, buffer /* C: genuine guest SIGILL */
+    jne 6f
+    ud2
+6:  cmpb $83, buffer /* S: genuine guest SIGSEGV */
+    jne 6f
+    movl $0, %eax
+    movl $1, (%eax)
+6:  cmpb $66, buffer /* B: guest SIGABRT */
+    jne 6f
+    movl $20, %eax
+    int $0x80
+    movl %eax, %ebx
+    movl $6, %ecx
+    movl $37, %eax
+    int $0x80
+6:  cmpb $72, buffer /* H: bounded by the native parent's deadline */
+    jne 6f
+6:  cmpb $72, buffer
+    je 6b
+    cmpb $69, buffer /* E: ordinary exit(86), never an infrastructure sentinel */
+    jne 6f
+    movl $86, %ebx
+    movl $1, %eax
+    int $0x80
+6:
+.endif
+.endif
 .if !CONSTANT_PATH
     cmpb $65, buffer
     jne 3f
@@ -137,6 +186,7 @@ payload_page: .space 4096
 .balign 4
 input_pointer: .space 4
 marker_pointer: .space 4
+state_pointer: .space 4
 mutation_counter: .space 4
 buffer: .space 4096
 .section .note.GNU-stack,"",@progbits

@@ -8,6 +8,7 @@ from pathlib import Path
 from taintforge_env.network_policy import load_network_policy
 from taintforge_env.network_replay import NetworkReplayError, run_network_replay
 from taintforge_env.replay_store import ReplayStore, ReplayStoreError
+from taintforge_env.network_runtime import run_network_service, NetworkRuntimeLimits, NetworkRuntimeError
 
 
 def main() -> int:
@@ -16,6 +17,7 @@ def main() -> int:
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--expected-store-sha256", required=True)
     parser.add_argument("--log-dir", type=Path, required=True)
+    parser.add_argument("--runtime", type=Path)
     args = parser.parse_args()
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
@@ -26,10 +28,13 @@ def main() -> int:
             raise NetworkReplayError(
                 f"replay store digest does not match the bound execution contract: expected {args.expected_store_sha256}, got {validation['store_sha256']}"
             )
-        asyncio.run(run_network_replay(policy=load_network_policy(args.policy),replay_store=store,log_dir=args.log_dir))
+        policy = load_network_policy(args.policy)
+        asyncio.run(run_network_service(
+            lambda: run_network_replay(policy=policy,replay_store=store,log_dir=args.log_dir),
+            log_dir=args.log_dir, runtime_path=args.runtime, limits=NetworkRuntimeLimits.parse(policy.runtime_limits)))
     except KeyboardInterrupt:
         return 0
-    except (NetworkReplayError, ReplayStoreError, OSError, ValueError) as exc:
+    except (NetworkReplayError, ReplayStoreError, NetworkRuntimeError, OSError, ValueError) as exc:
         print(f"Network replay failed: {exc}")
         return 2
     return 0

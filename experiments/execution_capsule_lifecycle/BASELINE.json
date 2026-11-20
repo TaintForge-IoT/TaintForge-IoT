@@ -4,16 +4,13 @@
   "github_reference_revision": "3e74e480eea3e945786aa931690609afb81f5f24",
   "read_only_guards": {
     "taintforge_env/phase1_runtime.py": [
-      "b98aa60144b0ffa5b1b116a4e21f96be96f8af2d016a5dc4277faf3c7e6f9093",
-      "d310c66f0cde4f4d5ba55605da9eb885c59752d5d94415a6f8c5192d4d57e2ff"
+      "abf98800e32064b601b725101d772a3d2462f7a9f2b878ac677433e1b679c308"
     ],
     "taintforge_env/elf_target.py": [
       "87c8257c869e7cd98c4f0f2aa54fd94af4d9cdbaf9e3e5c49906eac3e90bbd5f"
     ],
     "taintforge_env/unified_runtime.py": [
-      "bc1bab5f5a020f4bff5b448565509408a237d854706197a64a6ee068217d2efd",
-      "535be84c548990998755d1e510db0919f003a0e92e0927d8fb04e7aef5387afe",
-      "180b4b61f8c8dfc08df868f17f1f85a8cfaf738adc565fc16e5a8728fa525dfb"
+      "7650dcc84db7ffe102ecc640dda43b59fed7aa91053ae0af22109f9223814c6d"
     ],
     "taintforge_env/syscall_result.py": [
       "faa0184a840389d4faa35c6a5881435fa1f3ebef789340794d00440d86f53536"
@@ -25,12 +22,10 @@
       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     ],
     "experiments/execution_capsule_probe/controller.py": [
-      "df69790cee3a8e96693f0a4c9082fe5ed9e6eefc38c6d2c62598aed8421d4129"
+      "fdff0933d26de5a18fa9da8022815d9f4925b1cfad7544e46482fbf797c7e19c"
     ],
     "experiments/execution_capsule_probe/BASELINE.json": [
-      "61c521a9555e8c9e836c3d91cbb349548bf237ffc58bb551c0fd120e757abd88",
-      "aa826b89b20fa1b6d8ffcaa580ba408e7e598076ad295aff678b1d27c3720c3a",
-      "36a2db1fe25a19286d4df4e114b5b83504ddda8484f5bd5b9ca8fcc3348d63c1"
+      "95a6b3d07ce1edca85cfe1bec3b10c6ceb25a0eb553affdff5fbbfa40ab1714b"
     ],
     "experiments/execution_capsule_probe/vendor/qemu-plugin.h": [
       "9592f519d7344b1e38b0123b92c28c4e688faedf41263984910353736bb0b7be"
@@ -47,5 +42,6 @@
     "experiments/execution_capsule_retire/retire.c": [
       "3400e813a51f2b37c271757cf3eca9b203956a439e45675e10d32a9f853a6b28"
     ]
-  }
+  },
+  "source_note": "Pinned to the supplied actual merge 20261107; native Phase 1 sources are unchanged."
 }

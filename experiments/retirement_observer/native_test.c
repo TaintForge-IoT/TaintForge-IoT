@@ -33,6 +33,12 @@ int main(int argc, char **argv)
     const char *mode = argv[2];
     mock_eip_lag = !strcmp(mode, "lazy-eip") ? 4 : 0;
     cpu_thread = pthread_self();
+    if (!strcmp(mode, "guarded") || !strncmp(mode, "guard-", 6)) {
+        int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (input < 0 || dup2(input, STDIN_FILENO) < 0) return 4;
+        if (input != STDIN_FILENO) close(input);
+        if (cg_enable("/capsule/run")) return 4;
+    }
     pause_ms = 400;
     total_ms = !strcmp(mode,"total-timeout") ? 550 : 4000;
     total_deadline = now_ms() + total_ms;
@@ -44,6 +50,10 @@ int main(int argc, char **argv)
     for (unsigned i=0;i<NREG;++i) {found[i]=true;handles[i]=(void *)(uintptr_t)i;}
     if (pthread_create(&host_thread,NULL,control_host,NULL)) return 3;
     observe(0,(void *)(uintptr_t)mock_pc);
+    if (cg_enabled) {
+        syscall_guard(0,0,4,1,0,1,0,0,0,0,0);
+        syscall_return(0,0,4,1);
+    }
     if (!strcmp(mode,"early")) observer_exit(0,NULL);
     if (!strcmp(mode,"second-vcpu")) observe(1,(void *)(uintptr_t)mock_pc);
     if (!strcmp(mode,"fork")) syscall_guard(0,0,2,0,0,0,0,0,0,0,0);
@@ -60,6 +70,10 @@ int main(int argc, char **argv)
         usleep(100);
     }
     if (!strcmp(mode,"fork-after")) syscall_guard(0,0,120,0,0,0,0,0,0,0,0);
+    if (!strcmp(mode,"guard-after")) syscall_guard(0,0,4,3,0,1,0,0,0,0,0);
+    if (!strcmp(mode,"guard-signal-other")) syscall_guard(0,0,37,getpid()+1,SIGABRT,0,0,0,0,0,0);
+    if (!strcmp(mode,"guard-signal-group")) syscall_guard(0,0,37,0,SIGABRT,0,0,0,0,0,0);
+    if (!strcmp(mode,"guard-signal-otherkind")) syscall_guard(0,0,37,getpid(),SIGKILL,0,0,0,0,0,0);
     ++mock_pc;
     observe(0,(void *)(uintptr_t)mock_pc);
     observer_exit(0,NULL);

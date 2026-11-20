@@ -26,7 +26,7 @@ def verify(out, *, qemu, plugin, afl_bin, seconds=300, executions=64):
         seeds=out/'seeds';seeds.mkdir();(seeds/'seed').write_bytes(b'A')
         root=out/'campaign'
         manifest=f.prepare_campaign(root,binary=binary,qemu=qemu,plugin=plugin,
-                                    guest_path='/etc/afl-input',seeds=seeds)
+                                    guest_path='/etc/afl-input',seeds=seeds,analysis_policy='research')
         (root/'cases').mkdir()
         maps=[];ids=[]
         for index,data in enumerate((b'A',b'A',b'B',b'AFL!',b'A')):

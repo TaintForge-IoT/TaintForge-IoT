@@ -222,6 +222,28 @@ def derive_environment_manifest_from_repair(
         if status == "not_selected":
             continue
         selected_total += 1
+        if decision.action in {RepairActionKind.CONFIGURE_TCP_SERVICE, RepairActionKind.CONFIGURE_UDP_SERVICE}:
+            selection = dict(decision.parameters).get("network_repair")
+            if not isinstance(selection, dict) or result.get("network_service") != selection:
+                raise EnvironmentManifestBuilderError("network application differs from its exact repair decision")
+            from .network_repair import digest, endpoint
+            endpoint(decision.resource)
+            if selection.get("provider") not in {"replay", "dns_records"}:
+                raise EnvironmentManifestBuilderError("unknown network repair provider")
+            replacement = ManifestEntry(resource_id="net:" + decision.resource,
+                kind=ManifestResourceKind.NETWORK_SERVICE, lifecycle_scope=LifecycleScope.ITERATION_RUNTIME,
+                first_seen_stage=source_contract.initial_stage,
+                first_seen_attempt_id=source_contract.attempt_id, provider=selection["provider"],
+                value_id="service-" + digest(selection)[:24], value_sha256=digest(selection),
+                evidence=tuple(sorted((ManifestEvidence(
+                    evidence_id=f"{source_contract.attempt_id}:observation", kind=EvidenceKind.RUNTIME_EVENT,
+                    attempt_id=source_contract.attempt_id, artifact_sha256=observation_sha256),
+                    ManifestEvidence(evidence_id=f"{source_contract.attempt_id}:repair:{decision_id}",
+                    kind=EvidenceKind.REPAIR_APPLICATION, attempt_id=source_contract.attempt_id,
+                    artifact_sha256=application_sha256)), key=lambda item: item.evidence_id)),
+                confidence=ManifestConfidence.HYPOTHESIS, status=ManifestEntryStatus.ACTIVE)
+            entries = _merge_entry(entries, replacement)
+            continue
         if decision.action != RepairActionKind.CREATE_DIRECTORY:
             raise EnvironmentManifestBuilderError(
                 "selected repair action has no manifest mapping: "

@@ -1,10 +1,11 @@
 """Explicit upstream recording for DNS, UDP RPC and the existing TCP broker."""
 from __future__ import annotations
 
+from .network_runtime_transport import open_connection as runtime_open_connection, received_datagram, sending
+
 import asyncio
 from datetime import datetime, timezone
 import ipaddress
-import json
 import math
 from pathlib import Path
 import socket
@@ -16,6 +17,7 @@ from .dns_protocol import DNSError, canonical_query, error_response, question, v
 from .message_capture import publish_capture
 from .message_transport import MessageServer
 from .network_policy import NetworkPolicy, NetworkServicePolicy
+from .network_events import ObservedReply, prepared_reply
 
 
 class NetworkRecordError(ValueError):
@@ -111,7 +113,7 @@ class MessageRecordService:
             timeout=self.options["timeout_seconds"] + 2).start(
                 self.service.bind_ip, self.service.bind_port, self.service.service_type)
 
-    async def handle(self, request: bytes, peer: tuple) -> bytes | None:
+    async def handle(self, request: bytes, peer: tuple) -> ObservedReply | None:
         dns = self.service.protocol_hint == "dns"
         self.count += 1
         exchange_number = self.count
@@ -120,6 +122,8 @@ class MessageRecordService:
                  "service_role": self.service.role, "protocol_hint": self.service.protocol_hint,
                  "original_remote_ip": self.service.remote_ip, "original_remote_port": self.service.remote_port,
                  "peer_host": peer[0], "peer_port": peer[1], "run_id": self.options["run_id"]}
+        event.update(listener_type="brokered_record", exchange_id=exchange_number,
+                     bind_ip=self.service.bind_ip, bind_port=self.service.bind_port)
         response = None
         status, reason = "completed", None
         try:
@@ -137,6 +141,9 @@ class MessageRecordService:
         except asyncio.CancelledError:
             publish_capture(self.log_dir / "captures", **self._capture_args(request, response),
                             status="cancelled", reason="service stopped")
+            prepared_reply(self.log_dir / "network_events.jsonl",
+                           {**event, "status": "cancelled", "reason": "service stopped"},
+                           request, None, dns=dns)
             raise
         if exchange_number <= self.options["max_exchanges"]:
             directory = publish_capture(self.log_dir / "captures", **self._capture_args(request, response),
@@ -152,9 +159,7 @@ class MessageRecordService:
                     pass
             event["dns_response_prepared"] = delivered is not None
             event["response_origin"] = "upstream" if status == "completed" else "synthetic_error"
-        with (self.log_dir / "network_events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, sort_keys=True) + "\n")
-        return delivered
+        return prepared_reply(self.log_dir / "network_events.jsonl", event, request, delivered, dns=dns)
 
     def _capture_args(self, request, response):
         return dict(run_id=self.options["run_id"], transport=self.service.service_type,
@@ -165,7 +170,7 @@ class MessageRecordService:
 
     async def _upstream(self, request: bytes) -> bytes:
         if self.service.service_type == "tcp":
-            reader, writer = await asyncio.open_connection(self.service.upstream_ip, self.service.upstream_port,
+            reader, writer = await runtime_open_connection(self.service.upstream_ip, self.service.upstream_port,
                                                             family=socket.AF_INET)
             try:
                 writer.write(struct.pack("!H", len(request)) + request)
@@ -179,14 +184,17 @@ class MessageRecordService:
             sock.setblocking(False)
             loop = asyncio.get_running_loop()
             await loop.sock_connect(sock, (self.service.upstream_ip, self.service.upstream_port))
+            sending(request)
             await loop.sock_sendto(sock, request, (self.service.upstream_ip, self.service.upstream_port))
             response = await loop.sock_recv(sock, 65536)
+            received_datagram(response)
             if len(response) > 65507:
                 raise NetworkRecordError("oversized upstream UDP datagram")
             # UDP has no EOF. The capture explicitly records this bounded
             # observation window; additional replies make the profile unsupported.
             try:
-                await asyncio.wait_for(loop.sock_recv(sock, 65536), self.options["quiet_seconds"])
+                additional = await asyncio.wait_for(loop.sock_recv(sock, 65536), self.options["quiet_seconds"])
+                received_datagram(additional)
             except TimeoutError:
                 return response
             raise NetworkRecordError("multiple upstream datagrams are outside the one-response profile")

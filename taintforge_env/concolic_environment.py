@@ -230,7 +230,14 @@ def validate_file_observation(report: dict[str, Any], source: EnvironmentFile, r
                 any(not _integer(n, 0xffffffff) for n in args) or
                 not _integer(result, 0x7fffffff) or not _integer(number, 0xffffffff)):
             raise ConcolicError("invalid syscall observation")
-        if number in (5, 295):
+        if number == 125:
+            # A concrete startup protection change precedes the sole input
+            # open. It is recorded in the full prefix and must rerun identically.
+            if (index != 0 or fd is not None or result != 0 or args[0] % 4096 or
+                    not args[1] or args[1] % 4096 or args[0] + args[1] > 1 << 32 or
+                    args[2] & ~7):
+                raise ConcolicError("startup mprotect contract mismatch")
+        elif number in (5, 295):
             flags = args[1 if number == 5 else 2]
             if fd is not None or flags & ~0x88000 or (number == 295 and args[0] != 0xffffff9c):
                 raise ConcolicError("file open contract mismatch")

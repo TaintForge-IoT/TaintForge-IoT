@@ -1,11 +1,16 @@
 from __future__ import annotations
+
+from .network_runtime import network_open, network_write, current_runtime, NetworkRuntimeError
+from .network_runtime_transport import start_server as runtime_start_server, received_datagram, sending, release
 import subprocess
 import asyncio
+import hashlib
 import socket
 import struct
 from pathlib import Path
 
 from .event_logger import append_jsonl_event
+from .network_events import payload_fingerprints
 
 
 SO_ORIGINAL_DST = 80
@@ -415,7 +420,7 @@ class TransparentTCPLogger:
         self.connection_counter = 0
 
     async def start(self) -> asyncio.AbstractServer:
-        server = await asyncio.start_server(
+        server = await runtime_start_server(
             self.handle_client,
             host=self.bind_ip,
             port=self.bind_port,
@@ -468,7 +473,7 @@ class TransparentTCPLogger:
         )
 
         try:
-            with payload_path.open("ab") as f:
+            with network_open(payload_path, "ab") as f:
                 while True:
                     data = await reader.read(4096)
 
@@ -498,6 +503,8 @@ class TransparentTCPLogger:
 
                     data_event = {
                         "event": "tcp_data",
+                        "transport": "tcp",
+                        "request_sha256": hashlib.sha256(data).hexdigest(),
                         "listener_type": "catch_all_transparent",
                         "connection_id": conn_id,
                         "peer_host": peer_host,
@@ -530,6 +537,13 @@ class TransparentTCPLogger:
                         self.events_log_path,
                         {
                             "event": "tcp_response",
+                            "network_event_version": 1,
+                            "transport": "tcp",
+                            "request_sha256": hashlib.sha256(data).hexdigest(),
+                            "response_sha256": hashlib.sha256(response).hexdigest(),
+                            "response_prepared": True,
+                            "response_sent": True,
+                            "response_origin": "synthetic",
                             "listener_type": "catch_all_transparent",
                             "connection_id": conn_id,
                             "peer_host": peer_host,
@@ -625,7 +639,7 @@ class TransparentUDPLogger:
         if self.sock is None:
             return
 
-        while True:
+        for _ in range(128):
             try:
                 data, ancdata, _flags, peer = self.sock.recvmsg(
                     65535,
@@ -634,88 +648,112 @@ class TransparentUDPLogger:
             except BlockingIOError:
                 break
 
-            self.datagram_counter += 1
-            datagram_id = self.datagram_counter
+            runtime = current_runtime()
+            lease = None
+            try:
+                if runtime is not None:
+                    lease = runtime.call("slot", kind="message")
+                    if lease is None:
+                        continue
+                    received_datagram(data)
+                self.handle_datagram(data, ancdata, peer)
+            except NetworkRuntimeError:
+                return
+            finally:
+                release(runtime, lease)
 
-            peer_host, peer_port = self.parse_peer(peer)
+    def handle_datagram(self, data, ancdata, peer):
+        self.datagram_counter += 1
+        datagram_id = self.datagram_counter
 
-            original_ip, original_port = self.extract_udp_original_destination(ancdata)
+        peer_host, peer_port = self.parse_peer(peer)
 
-            original_destination_source = "recvmsg"
+        original_ip, original_port = self.extract_udp_original_destination(ancdata)
 
-            if is_redirected_udp_destination(
-                original_ip=original_ip,
-                original_port=original_port,
-                bind_ip=self.bind_ip,
-                bind_port=self.bind_port,
-            ):
-                ct_ip, ct_port = lookup_udp_original_destination_conntrack(peer_host=peer_host,peer_port=peer_port)
+        original_destination_source = "recvmsg"
 
-                if ct_ip is not None and ct_port is not None:
-                    original_ip = ct_ip
-                    original_port = ct_port
-                    original_destination_source = "conntrack"
-                else:
-                    original_destination_source = "recvmsg_redirected"
+        if is_redirected_udp_destination(
+            original_ip=original_ip,
+            original_port=original_port,
+            bind_ip=self.bind_ip,
+            bind_port=self.bind_port,
+        ):
+            ct_ip, ct_port = lookup_udp_original_destination_conntrack(peer_host=peer_host,peer_port=peer_port)
 
-            udp_role = guess_udp_role(original_port)
+            if ct_ip is not None and ct_port is not None:
+                original_ip = ct_ip
+                original_port = ct_port
+                original_destination_source = "conntrack"
+            else:
+                original_destination_source = "recvmsg_redirected"
 
-            payload_file = (
-                f"{udp_role}_udp_"
-                f"{safe_name(original_ip)}_"
-                f"{safe_name(original_port)}_"
-                f"dgram_{datagram_id}.bin"
-            )
+        udp_role = guess_udp_role(original_port)
 
-            payload_path = self.log_dir / payload_file
-            payload_path.write_bytes(data)
+        payload_file = (
+            f"{udp_role}_udp_"
+            f"{safe_name(original_ip)}_"
+            f"{safe_name(original_port)}_"
+            f"dgram_{datagram_id}.bin"
+        )
 
-            dns_info: dict = {}
-            dns_response: bytes | None = None
-            dns_answer_ip = "10.10.0.1"
+        payload_path = self.log_dir / payload_file
+        network_write(payload_path, data)
 
-            if udp_role == "dns":
-                dns_info = parse_dns_query(data)
+        dns_info: dict = {}
+        dns_response: bytes | None = None
+        dns_answer_ip = "10.10.0.1"
 
-                if dns_info.get("dns_parse_ok"):
-                    dns_response = build_dns_a_response(
-                        query_packet=data,
-                        answer_ip=dns_answer_ip,
-                    )
+        if udp_role == "dns":
+            dns_info = parse_dns_query(data)
 
-                    dns_info["dns_answer_ip"] = dns_answer_ip
-                    dns_info["dns_response_sent"] = dns_response is not None
-                else:
-                    dns_info["dns_response_sent"] = False
+            if dns_info.get("dns_parse_ok"):
+                dns_response = build_dns_a_response(
+                    query_packet=data,
+                    answer_ip=dns_answer_ip,
+                )
 
-            event = {
-                "event": "udp_datagram",
-                "listener_type": "udp_transparent",
-                "datagram_id": datagram_id,
-                "udp_role": udp_role,
-                "peer_host": peer_host,
-                "peer_port": peer_port,
-                "bind_ip": self.bind_ip,
-                "bind_port": self.bind_port,
-                "original_remote_ip": original_ip,
-                "original_remote_port": original_port,
-                "original_destination_source": original_destination_source,
-                "payload_file": payload_file,
-                "bytes_received": len(data),
-                "payload_hex_preview": data[:PREVIEW_BYTES].hex(),
-            }
+                dns_info["dns_answer_ip"] = dns_answer_ip
+                dns_info["dns_response_sent"] = False
+            else:
+                dns_info["dns_response_sent"] = False
 
-            event.update(dns_info)
+        event = {
+            "event": "udp_datagram",
+            "network_event_version": 1,
+            "transport": "udp",
+            "request_sha256": hashlib.sha256(data).hexdigest(),
+            "response_prepared": dns_response is not None,
+            "response_origin": "synthetic" if dns_response is not None else None,
+            "listener_type": "udp_transparent",
+            "datagram_id": datagram_id,
+            "udp_role": udp_role,
+            "peer_host": peer_host,
+            "peer_port": peer_port,
+            "bind_ip": self.bind_ip,
+            "bind_port": self.bind_port,
+            "original_remote_ip": original_ip,
+            "original_remote_port": original_port,
+            "original_destination_source": original_destination_source,
+            "payload_file": payload_file,
+            "bytes_received": len(data),
+            "payload_hex_preview": data[:PREVIEW_BYTES].hex(),
+        }
 
-            if dns_response is not None and self.sock is not None:
-                try:
-                    self.sock.sendto(dns_response, peer)
-                except OSError as e:
-                    event["dns_response_sent"] = False
-                    event["dns_response_error"] = str(e)
+        event.update(dns_info)
+        event.update(payload_fingerprints(data, dns_response, dns=udp_role == "dns"))
 
-            append_jsonl_event(self.events_log_path, event)
+        if dns_response is not None and self.sock is not None:
+            try:
+                sending(dns_response)
+                sent = self.sock.sendto(dns_response, peer)
+                event["dns_response_sent"] = sent == len(dns_response)
+                event["response_sha256"] = hashlib.sha256(dns_response).hexdigest()
+            except OSError as e:
+                event["dns_response_sent"] = False
+                event["dns_response_error"] = str(e)
+                event["status"] = "failed"
 
+        append_jsonl_event(self.events_log_path, event)
 
     @staticmethod
     def extract_udp_original_destination(
@@ -758,9 +796,25 @@ async def run_transparent_logger(
         log_dir=log_dir,
     )
 
-    tcp_server = await tcp_logger.start()
-    udp_logger.start()
-
-    print("[+] Transparent logger is running. Press Ctrl+C to stop.")
-
-    await tcp_server.serve_forever()
+    tcp_server = None
+    udp_lease = None
+    try:
+        tcp_server = await tcp_logger.start()
+        udp_logger.start()
+        runtime = current_runtime()
+        if runtime is not None:
+            udp_lease = runtime.call("listen")
+        print("[+] Transparent logger is running. Press Ctrl+C to stop.")
+        await tcp_server.serve_forever()
+    finally:
+        if udp_lease is not None:
+            try:
+                runtime.call("unlisten", key=udp_lease)
+            except NetworkRuntimeError:
+                pass
+        if udp_logger.sock is not None:
+            asyncio.get_running_loop().remove_reader(udp_logger.sock.fileno())
+            udp_logger.sock.close()
+        if tcp_server is not None:
+            tcp_server.close()
+            await tcp_server.wait_closed()

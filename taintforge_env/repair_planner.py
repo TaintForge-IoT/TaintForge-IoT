@@ -48,8 +48,11 @@ class RepairPlanner:
     later automation is permitted to apply it without human review.
     """
 
-    def __init__(self, config: RepairPlannerConfig | None = None) -> None:
+    def __init__(self, config: RepairPlannerConfig | None = None, *, network_repair_policy=None,
+                 network_policy=None) -> None:
         self.config = config or RepairPlannerConfig()
+        self.network_repair_policy = network_repair_policy
+        self.network_policy = network_policy
 
     def plan(
         self,
@@ -119,7 +122,8 @@ class RepairPlanner:
                 risk=RepairRisk.HIGH,
                 automatic_allowed=False,
                 reason=(
-                    "The failed connect has no complete remote IP and port. "
+                    "The failed network call has no complete remote IP and port "
+                    "with an observed TCP/UDP transport. "
                     "Preserve the failure and resolve its destination before "
                     "planning a network service; a sockaddr pointer is not an endpoint."
                 ),
@@ -377,6 +381,25 @@ class RepairPlanner:
             if transport == "tcp"
             else RepairActionKind.CONFIGURE_UDP_SERVICE
         )
+        denial = None
+        if self.network_repair_policy is not None:
+            from .network_repair import NetworkRepairError
+            try:
+                if requirement.confidence < self.config.minimum_auto_confidence:
+                    raise NetworkRepairError("observed network requirement confidence is below the automation threshold")
+                selection = self.network_repair_policy.authorize(requirement)
+                if self.network_policy is not None and any(
+                    (item.service_type, item.remote_ip, item.remote_port) == endpoint
+                    for item in self.network_policy.services
+                ):
+                    raise NetworkRepairError("endpoint is already configured; inspect its protocol result")
+                return self._decision(requirement, action=action,
+                    disposition=RepairDisposition.AUTO_CANDIDATE, priority=priority,
+                    risk=RepairRisk.MEDIUM, automatic_allowed=True,
+                    reason="Exact offline provider authorized by the bound network repair policy; validate in a fresh attempt.",
+                    parameters={**parameters, "network_repair": selection})
+            except NetworkRepairError as exc:
+                denial = str(exc)
         return self._decision(
             requirement,
             action=action,
@@ -384,7 +407,7 @@ class RepairPlanner:
             priority=priority,
             risk=RepairRisk.MEDIUM,
             automatic_allowed=False,
-            reason=(
+            reason=denial or (
                 "Transport reachability is not equivalent to protocol "
                 "satisfaction. Use a recorded response or a protocol-specific "
                 "emulator rather than an arbitrary generic reply."

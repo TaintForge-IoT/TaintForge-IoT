@@ -19,6 +19,9 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--target-arch", required=True)
+    parser.add_argument("--endpoint-events")
+    parser.add_argument("--endpoint-session")
+    parser.add_argument("--endpoint-attempt")
     args = parser.parse_args()
 
     try:
@@ -26,6 +29,9 @@ def main() -> None:
             args.input,
             args.out,
             target_arch=args.target_arch,
+            endpoint_events=args.endpoint_events,
+            session_id=args.endpoint_session,
+            attempt_id=args.endpoint_attempt,
         )
     except QemuStraceParserError as exc:
         print(f"[!] QEMU strace parsing failed: {exc}")

@@ -179,7 +179,7 @@ class HandoffTests(unittest.TestCase):
             self.operations.append("unmap")
             return result
 
-        def save_json(path, value):
+        def save_json(path, value, **kwargs):
             if path.name == "observer-events.json" and any(
                     e["event"] == "module_unmapped" for e in value["events"]):
                 self.operations.append("save:journal")
@@ -189,7 +189,7 @@ class HandoffTests(unittest.TestCase):
                     self.disk_states.append(self.peer.held)
                     self.clock.advance(.2)
                     self.injected_delay = True
-            return original_json(path, value)
+            return original_json(path, value, **kwargs)
 
         def save_bytes(path, value):
             if path.name in {"maps-unmapped.txt", "process-unmapped.stat"}:

@@ -126,7 +126,7 @@ def main():
             p.write_json(goal,dict(schema_version=1,goal_id="m3-input-complete",description="Benign M3 input completion",
                 mode="all",rules=[dict(id="stdout",type="text_contains",source="stdout",
                                       needle=entry["expected_stdout"] or "M3_INPUT_OK\n",min_count=1)]))
-            argv=["run","--retire-phase1","--binary",entry["path"],
+            argv=["run","--retire-phase1","--analysis-policy","research","--binary",entry["path"],
                 "--qemu",str(args.qemu),"--plugin",str(args.plugin),"--out",str(case_out),
                 "--target-spec",str(goal),"--max-iterations","3","--max-steps","2",
                 "--retirement-max-insns","2048" if name=="missing-verdict" else "10000000"]

@@ -1,6 +1,8 @@
 """Immutable single-message UDP/DNS captures and strict ReplayStore import."""
 from __future__ import annotations
 
+from .network_runtime import network_open
+
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,7 @@ FORMAT = "network-message-v1"
 
 
 def _write(path: Path, content: bytes) -> None:
-    with path.open("xb") as output:
+    with network_open(path, "xb") as output:
         os.chmod(path, 0o600)
         output.write(content)
         output.flush()

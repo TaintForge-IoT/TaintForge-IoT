@@ -111,7 +111,7 @@ def verdict(record, text, released):
     return observed
 
 
-def capture(binding, pid, point):
+def capture(binding, pid, point, *, durable=True):
     """Only the live observer calls this, while the guest is held."""
     output = directory(binding)
     proc = Path(binding["rootfs"]) / "proc" / str(pid)
@@ -124,7 +124,7 @@ def capture(binding, pid, point):
     path = output / "mapping-identity.json"
     if point == 1:
         probe.require(not path.exists(), "Refusing reuse of live mapping identity")
-        probe.write_json(path, current)
+        probe.write_json(path, current, durable=durable)
     else:
         probe.require(current == load_identity(binding), "Live module/process identity changed")
     observed = verdict(current, text, point == 2)

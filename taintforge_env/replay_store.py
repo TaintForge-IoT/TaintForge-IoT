@@ -4,11 +4,14 @@ import hashlib
 import ipaddress
 import json
 import os
+import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .replay_session import ReplaySession, ReplaySessionError
 
 
 SCHEMA_VERSION = 1
@@ -303,14 +306,54 @@ class ReplayStore:
         updated.append(entry)
         updated.sort(key=lambda item: item.entry_id)
 
-        self._atomic_write_index(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "entries": [asdict(item) for item in updated]
-            }
-        )
+        index = self._load_index()
+        index["entries"] = [asdict(item) for item in updated]
+        self._atomic_write_index(index)
 
         return entry
+
+    def load_sessions(self) -> list[ReplaySession]:
+        records = self._load_index().get("sessions", [])
+        if not isinstance(records, list) or len(records) > 128:
+            raise ReplayStoreValidationError("replay sessions must be a list of at most 128 contracts")
+        sessions = []
+        identities = set()
+        for record in records:
+            if not isinstance(record, dict) or "session_id" not in record:
+                raise ReplayStoreValidationError("replay session is missing its identity")
+            try:
+                session = ReplaySession.parse({key: value for key, value in record.items() if key != "session_id"})
+            except ReplaySessionError as exc:
+                raise ReplayStoreValidationError(str(exc)) from exc
+            if record["session_id"] != session.session_id or session.session_id in identities:
+                raise ReplayStoreValidationError("replay session has a changed or duplicate identity")
+            identities.add(session.session_id)
+            sessions.append(session)
+        return sessions
+
+    def load_session(self, session_id: str) -> ReplaySession:
+        for session in self.load_sessions():
+            if session.session_id == session_id:
+                return session
+        raise ReplayStoreValidationError("replay store does not contain the selected session")
+
+    def add_session(self, specification: dict) -> ReplaySession:
+        try:
+            session = ReplaySession.parse(specification)
+        except ReplaySessionError as exc:
+            raise ReplayStoreValidationError(str(exc)) from exc
+        self.initialize()
+        sessions = self.load_sessions()
+        if any(item.session_id == session.session_id for item in sessions):
+            raise ReplayEntryExistsError("replay session already exists: " + session.session_id)
+        if len(sessions) >= 128:
+            raise ReplayStoreValidationError("replay session count exceeds 128")
+        index = self._load_index()
+        index["sessions"] = sorted(
+            [{"session_id": item.session_id, **item.to_dict()} for item in (*sessions, session)],
+            key=lambda item: item["session_id"])
+        self._atomic_write_index(index)
+        return session
 
     def add_from_files(self,*,transport: str,remote_ip: str,remote_port: int,request_path: str | Path,response_path: str | Path,protocol_hint: str | None = None,close_after_send: bool = True,delay_ms: int = 0,source_run_id: str | None = None,notes: str | None = None,replace: bool = False) -> ReplayEntry:
         request_path = Path(request_path)
@@ -370,6 +413,9 @@ class ReplayStore:
     def validate(self) -> dict[str, Any]:
         self._validate_layout_symlinks(allow_missing=False)
         entries = self.load_entries()
+        sessions = self.load_sessions()
+        if len({entry.entry_id for entry in entries}) != len(entries):
+            raise ReplayStoreValidationError("duplicate replay entry identity")
         errors: list[str] = []
 
         exchanges: list[ReplayExchange] = []
@@ -412,13 +458,18 @@ class ReplayStore:
                 for exchange in sorted(exchanges,key=lambda item: item.entry.entry_id)
             ],
         }
+        if sessions:
+            identity_payload["sessions"] = [
+                {"session_id": session.session_id, **session.to_dict()}
+                for session in sorted(sessions, key=lambda item: item.session_id)]
         store_sha256 = sha256_bytes(
             json.dumps(identity_payload,sort_keys=True,separators=(",", ":"),ensure_ascii=True,).encode("utf-8"))
         return {
             "schema_version": SCHEMA_VERSION,
             "entries": len(entries),
             "store_path": str(self.root),
-            "store_sha256": store_sha256
+            "store_sha256": store_sha256,
+            **({"sessions": len(sessions)} if sessions else {})
         }
 
     @staticmethod
@@ -452,20 +503,39 @@ class ReplayStore:
         if not self.index_path.exists():
             raise ReplayStoreValidationError(f"Replay index does not exist: {self.index_path}")
 
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ReplayStoreValidationError("duplicate replay index field")
+                result[key] = value
+            return result
+
         try:
-            raw = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+            fd = os.open(self.index_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
+                    raise ReplayStoreValidationError("replay index must be a bounded regular file")
+                data = handle.read(16 * 1024 * 1024 + 1)
+            if len(data) > 16 * 1024 * 1024:
+                raise ReplayStoreValidationError("replay index exceeds its byte budget")
+            raw = json.loads(data, object_pairs_hook=unique_object)
+        except (ValueError, UnicodeError, OSError) as exc:
             raise ReplayStoreValidationError(f"Invalid replay index JSON: {exc}") from exc
 
         if not isinstance(raw, dict):
             raise ReplayStoreValidationError("Replay index root must be an object")
 
-        if raw.get("schema_version") != SCHEMA_VERSION:
+        if type(raw.get("schema_version")) is not int or raw["schema_version"] != SCHEMA_VERSION:
             raise ReplayStoreValidationError(f"Unsupported replay schema_version: {raw.get('schema_version')}")
 
         return raw
 
     def _atomic_write_index(self, data: dict[str, Any]) -> None:
+        encoded = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+        if len(encoded.encode("utf-8")) > 16 * 1024 * 1024:
+            raise ReplayStoreValidationError("replay index exceeds its byte budget")
         self._validate_layout_symlinks(allow_missing=True)
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -474,8 +544,7 @@ class ReplayStore:
 
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(data,handle,indent=2,ensure_ascii=False,sort_keys=True)
-                handle.write("\n")
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
 

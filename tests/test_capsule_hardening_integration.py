@@ -41,6 +41,7 @@ def hardened_evidence(run, code, fault=None):
     saved['events'][-1]['data']['resource_ledger']=ledger
     saved.update(accepted_manifest_sha256=digest,preserved_sha256=hashes,
                  permit=f"RETIRE {binding['lifecycle_attempt']} 1 {digest}\n")
+    base.save_quality(binding, analyzer, saved)
     base.c.p.write_json(directory/'retirement.json',saved)
     journal=base.c.read_json(output/'observer-events.json')
     prototype=policy_fixture.HardeningPolicyTests.context(SimpleNamespace(binding=binding))

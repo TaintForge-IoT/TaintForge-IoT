@@ -9,6 +9,7 @@ from typing import Any
 
 from .log_io import LogReadError, MAX_LOG_LINE_BYTES, iter_log_lines
 from .syscall_result import parse_result
+from .network_endpoints import CAPTURED, EndpointCapture, EndpointCaptureError, SocketTraceTracker, printed_endpoint
 
 from .strace_parser import (
     StraceParserError,
@@ -27,6 +28,9 @@ def parse_qemu_strace(
     out_path: str | Path,
     *,
     target_arch: str,
+    endpoint_events: str | Path | None = None,
+    session_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     source = Path(input_path)
     destination = Path(out_path)
@@ -45,10 +49,39 @@ def parse_qemu_strace(
     if destination == summary_path:
         raise QemuStraceParserError("QEMU event and summary outputs must be distinct")
 
+    capture = None
+    def parsed_lines():
+        state = SocketTraceTracker(target_arch=target_arch)
+        for number, raw in enumerate(iter_log_lines(source), 1):
+            line = raw.strip()
+            if not line or "<unfinished ...>" in line or ("<... " in line and " resumed>" in line):
+                if line:
+                    state.reset()
+                continue
+            event = parse_strace_line(line, source.name, number, "guest")
+            if event is not None:
+                # QEMU's legacy socketcall printer uses uppercase operation names.
+                if event.syscall.lower() in CAPTURED:
+                    event.syscall = event.syscall.lower()
+                    event.category = "network"
+                    event.remote_ip, event.remote_port = printed_endpoint(event.syscall, event.args)
+                state.apply(event)
+                yield event
+    if endpoint_events is not None:
+        if not session_id or not attempt_id:
+            raise QemuStraceParserError("endpoint events require session_id and attempt_id")
+        try:
+            capture = EndpointCapture(Path(endpoint_events), session_id=session_id,
+                                      attempt_id=attempt_id, target_arch=target_arch)
+            capture.correlate(parsed_lines())
+        except (EndpointCaptureError, LogReadError, OSError) as error:
+            raise QemuStraceParserError(str(error)) from error
+
     statistics = {"lines_total": 0, "ignored_lines": 0, "skipped_unfinished_lines": 0,
                   "max_line_bytes": MAX_LOG_LINE_BYTES}
     temporary_paths = []
     try:
+        sockets = SocketTraceTracker(target_arch=target_arch)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
                                          prefix=f".{destination.name}.", delete=False) as stream:
             temporary_paths.append(Path(stream.name))
@@ -59,11 +92,19 @@ def parse_qemu_strace(
                     line = raw_line.strip()
                     if "<unfinished ...>" in line or ("<... " in line and " resumed>" in line):
                         statistics["skipped_unfinished_lines"] += 1
+                        sockets.reset()
                         continue
                     event = parse_strace_line(line, source.name, line_number, "guest") if line else None
                     if event is None:
                         statistics["ignored_lines"] += 1
                         continue
+                    if event.syscall.lower() in CAPTURED:
+                        event.syscall = event.syscall.lower()
+                        event.category = "network"
+                        event.remote_ip, event.remote_port = printed_endpoint(event.syscall, event.args)
+                    sockets.apply(event)
+                    if capture is not None:
+                        capture.enrich(event)
                     payload = asdict(event)
                     payload.update(trace_backend="qemu_strace", target_arch=target_arch)
                     stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -72,6 +113,7 @@ def parse_qemu_strace(
             summary = build_summary(events())
             summary.update(trace_backend="qemu_strace", target_arch=target_arch,
                            source_file=source.name, input_statistics=statistics)
+            summary["network_endpoint_observer"] = capture.status if capture is not None else {"status": "not_configured", "matched": 0}
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
                                          prefix=f".{summary_path.name}.", delete=False) as stream:
             temporary_paths.append(Path(stream.name))
@@ -81,7 +123,7 @@ def parse_qemu_strace(
         os.replace(temporary_paths[0], destination)
         os.replace(temporary_paths[1], summary_path)
         return summary
-    except (LogReadError, StraceParserError, OSError) as exc:
+    except (LogReadError, StraceParserError, EndpointCaptureError, OSError) as exc:
         raise QemuStraceParserError(str(exc)) from exc
     finally:
         for path in temporary_paths:

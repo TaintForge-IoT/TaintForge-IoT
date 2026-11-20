@@ -30,18 +30,31 @@ def prepare(args) -> dict:
     if min(args.timeout, args.max_iterations, args.max_steps) < 1:
         raise ValueError("timeout and iteration limits must be positive")
     input_config = None
+    receipt = getattr(args, 'phase1_flags_receipt', None)
+    ir_start = getattr(args, 'retirement_ir_start', None)
+    if (receipt is not None or ir_start is not None) and not args.retire_phase1:
+        raise ValueError('Bound EFLAGS/IR options require --retire-phase1')
+    if args.analysis_policy is not None and not args.retire_phase1:
+        raise ValueError('--analysis-policy requires --retire-phase1')
+    if args.capsule_control_guard and not (args.retire_phase1 and args.capsule_hardening):
+        raise ValueError('--capsule-control-guard requires --retire-phase1 --capsule-hardening')
     if args.retire_phase1:
         from taintforge_env import input_retirement
         from taintforge_env.capsule_resources import preflight
         if not args.binary or args.capsule_probe or args.capsule_lifecycle or args.capsule_phase1_retirement:
             raise ValueError("--retire-phase1 requires --binary and cannot select a built-in capsule fixture")
-        if args.network != "none" or args.phase1_option or args.extra_library or args.library_dir:
-            raise ValueError("M3 requires network=none, no extra libraries and bound Phase 1 selection settings")
+        if args.phase1_option or args.extra_library or args.library_dir:
+            raise ValueError("M3 requires no extra libraries and bound Phase 1 selection settings")
         if (args.capsule_case is not None or args.capsule_owner_mode != "remove" or
             args.capsule_owner_order != "after" or args.capsule_retirement_fault != "none" or
             args.capsule_retirement_trigger != "boundary" or args.capsule_selection_delay != 16):
             raise ValueError("Built-in fixture options cannot be combined with --retire-phase1")
         input_retirement.inspect_input(args.binary.expanduser())
+        if ir_start is not None:
+            image = input_retirement.ElfImage(args.binary.expanduser())
+            if not any(s.kind == 1 and s.flags & 1 and s.address <= ir_start < s.address+s.file_size
+                       for s in image.segments):
+                raise ValueError('IR start must be in a file-backed executable input segment')
         input_config = input_retirement.settings(hold_ms=args.capsule_hold_ms,
             pause_ms=args.capsule_pause_ms, total_ms=args.capsule_total_ms, timeout=args.timeout,
             memory_mib=args.capsule_memory_mib, selection_delay=args.retirement_selection_delay,
@@ -53,8 +66,19 @@ def prepare(args) -> dict:
                 memory_mib=args.capsule_memory_mib, selection_delay=args.retirement_selection_delay,
                 max_instructions=args.retirement_max_insns, hardening=policy(analysis_mib=args.analysis_memory_mib,
                     export_mib=args.export_mib, journal_mib=args.journal_mib, uid=args.execution_uid, gid=args.execution_gid))
+        if args.capsule_control_guard:
+            from taintforge_env.capsule_control import policy as control_policy
+            input_config['control_guard'] = control_policy()
+            input_retirement.validate_settings(input_config)
+        from taintforge_env.analysis_quality import policy as analysis_policy
+        input_config['analysis_policy'] = analysis_policy(args.analysis_policy or 'strict')
+        input_retirement.validate_settings(input_config)
+        from taintforge_env.network_capsule import validate_mode
+        validate_mode(args.network, input_config, observer=bool(getattr(args, 'network_observer', None)))
         preflight()
         args.phase1_option = ["tf-selection-delay=" + str(args.retirement_selection_delay)]
+        if ir_start is not None:
+            args.phase1_option.append('ir-start='+hex(ir_start))
     elif args.retirement_selection_delay != 16 or args.retirement_max_insns != 10000000:
         raise ValueError("M3 retirement settings require --retire-phase1")
     if not args.retire_phase1 and (args.capsule_hardening or args.analysis_memory_mib != 512 or
@@ -108,6 +132,14 @@ def prepare(args) -> dict:
         raise ValueError("--capsule-case requires --capsule-probe")
     selected = check_runtime_inputs(PROJECT_ROOT, qemu=args.qemu, plugin=args.plugin)
     qemu, plugin = Path(selected["qemu"]["path"]), Path(selected["plugin"])
+    if receipt is not None:
+        from taintforge_env.capsule_strict import read_receipt
+        read_receipt(receipt, selected['qemu']['sha256'])
+    observer_option = getattr(args, "network_observer", None)
+    if observer_option:
+        from taintforge_env.network_observer import validate_observer
+        observer_option = observer_option.expanduser().resolve(strict=True)
+        validate_observer(observer_option)
     binary = args.binary.expanduser().resolve(strict=True) if args.binary else None
     if capsule_config is not None:
         from experiments.execution_capsule_probe import controller as probe
@@ -117,6 +149,15 @@ def prepare(args) -> dict:
             _, selected_runtime, _ = loaded
             check_runtime(selected_runtime, trigger="verdict" if args.retire_phase1 else args.capsule_retirement_trigger)
     policy = load_network_policy(args.network_policy) if args.network_policy else None
+    repair_option = getattr(args, "network_repair_policy", None)
+    if repair_option:
+        from taintforge_env.network_repair import NetworkRepairPolicy
+        approved = NetworkRepairPolicy.load(repair_option)
+        if approved.mode != args.network or policy is None:
+            raise ValueError("network repair policy requires its matching offline backend and --network-policy")
+        approved.verify_store()
+        if approved.mode == "replay" and (args.replay_store is None or approved.store_path.resolve() != args.replay_store.resolve()):
+            raise ValueError("network repair policy must authorize the selected replay store")
     dns_server = args.dns_server
     if dns_server is None and policy is not None:
         dns_server = next((s.remote_ip for s in policy.services if s.protocol_hint == "dns" and s.remote_ip), None)
@@ -164,7 +205,10 @@ def prepare(args) -> dict:
         raise ValueError("the Phase 1 v1 integration profile supports Linux i386 ELF only")
     config = template / "config"
     bundle_path = config / "analyzer_runtime"
-    bundle = build_bundle(bundle_path, qemu=qemu, plugin=plugin, capsule_probe=capsule_build)
+    observer_kwargs = {"network_observer": observer_option} if observer_option else {}
+    if receipt is not None:
+        observer_kwargs['flags_receipt'] = receipt
+    bundle = build_bundle(bundle_path, qemu=qemu, plugin=plugin, capsule_probe=capsule_build, **observer_kwargs)
     if capsule_config is not None:
         bundled_qemu = next(item for item in bundle["files"] if item["path"] == bundle["qemu"])
         if bundled_qemu["sha256"] != selected["qemu"]["sha256"]:
@@ -192,20 +236,24 @@ def prepare(args) -> dict:
               "binary_path": str(binary), "network_mode": args.network,
               "target_spec_path": str(args.target_spec.expanduser().resolve()) if args.target_spec else None,
               "replay_store_path": str(args.replay_store.expanduser().resolve()) if args.replay_store else None,
+              "network_repair_policy_path": str(repair_option.absolute()) if repair_option else None,
               "timeout_seconds": args.timeout, "max_iterations": args.max_iterations}
     write_json(out / "unified_launch.json", launch)
     return launch
 
 
-def run_session(out: Path, launch: dict, *, max_steps: int, initialize_only=False) -> tuple[dict, int]:
+def run_session(out: Path, launch: dict, *, max_steps: int, initialize_only=False, runner_factory=None) -> tuple[dict, int]:
     if launch.get("schema_version") != 1:
         raise ValueError("unsupported unified launch manifest")
     kwargs = {key: value for key, value in launch.items() if key != "schema_version"}
     session_dir = Path(launch["session_dir"])
     before = _saved_result(session_dir / "synthesis_loop.json")
     try:
-        result = EnvironmentSynthesisLoop(SynthesisLoopConfig(**kwargs, max_steps=max_steps,
-                                                            initialize_only=initialize_only)).run()
+        loop = EnvironmentSynthesisLoop(SynthesisLoopConfig(**kwargs, max_steps=max_steps,
+                                                          initialize_only=initialize_only))
+        if runner_factory is not None:
+            loop.runner_factory = runner_factory
+        result = loop.run()
         result_data = result.to_dict()
         error = None
     except (OSError, ValueError, RuntimeError) as exc:
@@ -242,6 +290,8 @@ def run_session(out: Path, launch: dict, *, max_steps: int, initialize_only=Fals
             report[name] = _saved_result(directory / relative)
         if (directory / "config/capsule_binding.json").is_file():
             report["capsule"] = _saved_result(directory / "config/capsule_result.json")
+            if 'analysis_quality' in report['capsule']:
+                report['analysis_quality'] = report['capsule']['analysis_quality']
             if (directory / "logs/capsule/service.json").is_file():
                 report["capsule_resources"] = _saved_result(directory / "logs/capsule/service.json")
         report["run_dir"] = str(directory)
@@ -271,6 +321,10 @@ def parser():
         help="M3: static i386 input, current heuristic verdict, independent observer and fresh repair attempts")
     run.add_argument("--retirement-selection-delay", type=int, default=16)
     run.add_argument("--retirement-max-insns", type=int, default=10000000)
+    run.add_argument('--retirement-ir-start', type=lambda value: int(value, 0))
+    run.add_argument('--phase1-flags-receipt', type=Path)
+    run.add_argument('--analysis-policy', choices=('strict', 'research'),
+                     help='retirement analysis admission; new retirement runs default to strict')
     run.add_argument("--capsule-probe", action="store_true", help="experimental handoff with the built-in controlled i386 ELF")
     run.add_argument("--capsule-lifecycle", action="store_true", help="run the controlled ELF with verified owner retirement and cgroup limits")
     run.add_argument("--capsule-phase1-retirement", action="store_true", help="retire the real Phase 1 after a verified export, on the controlled ELF")
@@ -283,6 +337,8 @@ def parser():
     run.add_argument("--capsule-owner-order", choices=("before", "after"), default="after")
     run.add_argument("--capsule-memory-mib", type=int, default=1024)
     run.add_argument('--capsule-hardening', action='store_true')
+    run.add_argument('--capsule-control-guard', action='store_true',
+                     help='abort guest syscalls outside the strict M5 FD/path profile')
     run.add_argument('--analysis-memory-mib', type=int, default=512)
     run.add_argument('--export-mib', type=int, default=256)
     run.add_argument('--journal-mib', type=int, default=32)
@@ -308,6 +364,10 @@ def parser():
     run.add_argument("--max-iterations", type=int, default=5)
     run.add_argument("--max-steps", type=int, default=1)
     run.add_argument("--phase1-option", action="append", default=[], help="repeatable Phase 1 v1 key=value analysis option")
+    run.add_argument("--network-observer", type=Path,
+                     help="verified Phase 2 endpoint observer .so built by build_network_observer.py")
+    run.add_argument("--network-repair-policy", type=Path,
+                     help="Explicit NET-3 offline replay or DNS repair authorizations")
     run.add_argument("--prepare-only", action="store_true", help="bind the session without executing the guest")
     resume = commands.add_parser("resume", help="advance using the bound settings and hashes")
     resume.add_argument("--out", type=Path, required=True)
