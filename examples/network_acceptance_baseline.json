@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "reference": "NET-6 routecheck 2026-11-11",
+  "packages": [
+    {
+      "name": "TaintForge_NET6_2026-11-07",
+      "sha256": "c30132f8f43122c13f55400f8141157451453d3968c460ffeffdef2c65f2971e"
+    },
+    {
+      "name": "TaintForge_NET6_hostfix_2026-11-09",
+      "sha256": "149bd0089e2ff81ae08e770efc3f645849828d862761893a6465a8befde98117"
+    },
+    {
+      "name": "TaintForge_NET6_guestfix_2026-11-09",
+      "sha256": "51abcfbb7c1d65f9952a0e66cb050320d8c4ed8a54b86659f5ad3337e29d5d48"
+    },
+    {
+      "name": "TaintForge_NET6_runtimefix_2026-11-10",
+      "sha256": "01bce4a0af4c03d1f478fe8ac731252c97fc2b9465e659a615ac01f7416d602a"
+    },
+    {
+      "name": "TaintForge_NET6_ownerdiag_2026-11-10",
+      "sha256": "91b411bbe79b3ecf7453bde248e72fe0d46f368273b7d8f561ba2102e466ab8b"
+    },
+    {
+      "name": "TaintForge_NET6_routefix_2026-11-10",
+      "sha256": "82ca489b353cf6df840e5cd66e4ef9bec18e046afb05b46c03a3a872ded89d37"
+    },
+    {
+      "name": "TaintForge_NET6_routecheck_2026-11-11",
+      "sha256": "c8c2a9226d4de0979e02323f9723cb13fd8f82d351b963e43d8dd7711d0b35c0"
+    }
+  ],
+  "files": {
+    "samples/network_capsule_i386.S": "7ebddd9c9828f1a60007483bbb69c474960746190b456f6a58c238ad106c3817",
+    "scripts/run_network_capsule_e2e.py": "8eb860b20735ba61d8b4095773284b114b6df9a89a0c9676c1a6aa6c23a35a72",
+    "scripts/run_network_guard.py": "0b563546a52c9e7e793d14d254eb61c8a23a8a95b9bea9eca3d4dc27816baf87",
+    "scripts/run_unified_pipeline.py": "fc4f9ac7fa9ebeb14089d60d303e67565bb6cf1b5a8ea5026d9123e300edf06d",
+    "taintforge_env/capsule_hardening.py": "18a2007f34b5abd15e062ab91b474adc1b6ee9d626b7bb187ebdcd2970deb73a",
+    "taintforge_env/capsule_resources.py": "cf630a809c45489fbbaeb2e6e0f10bea0da8e3225292e0c6f87ca22e0ef4b485",
+    "taintforge_env/controlled_network_backend.py": "4965c292178f56e0f38ed6365458abdebd0dd43f266e41edb7de71313a36ff31",
+    "taintforge_env/input_retirement.py": "e18107bf955e646b39a49634ee02bb69148ab87df890e668e9208e105feb6dd4",
+    "taintforge_env/network_capsule.py": "86a58fe61fadf2f5e3f13c0745117f50f4618f6f24689baba0d87cdefe84ff28",
+    "taintforge_env/network_host_route.py": "268e7cab8547eb314f5ed452c18e10782b517bef0dc11b657cc4ba33be1ad1f8",
+    "taintforge_env/network_runtime.py": "e9770f2e8d1425b87b5b2d92e62a6190951cc85b99c4f0295166d9fd51b4054b",
+    "taintforge_env/prebuilt_runner.py": "453359479c2ca1bfaf16863ef79af91c212172e0fd28a52d57f5cad8f7f428be",
+    "taintforge_env/report_generator.py": "bd96a9f0393e1b41bd3cd4ef518fe7a2b6f28ab2fdf4769c7fb64392c35d0ee2",
+    "taintforge_env/retirement_evidence.py": "693f2112e3480a1679146775dd80997d8435a66c2c78e2510a86e9d648dcf71d",
+    "tests/test_controlled_network_backend.py": "c51b829b475e129c6a00611ac0ec878eae3d690de73fa44284d9dbcb011dd878",
+    "tests/test_network_capsule.py": "90fe9afb84dce19bf815101614005b4de5692803c90bbd0c6d81f02eae29f71d",
+    "tests/test_network_capsule_bootstrap.py": "31fbea196e89da5d4140f03698f381ff1e734079fb2244355862342a1b5ed06e",
+    "tests/test_network_capsule_guest.py": "b82deae70b4e8d9b49be60219dcc06352efb84962f542eac7ecf4c2112b7b836",
+    "tests/test_network_capsule_pipeline.py": "59b3fbc99d29f2f9f9d74d6249e87fa9cf953d5de7ae50aee8188bcda327fb99",
+    "tests/test_network_host_route.py": "43ccbdf6e1e7b141396c3928f0622109f518f74656081a21251b178af1f4899d",
+    "tests/test_network_host_route_privileged.py": "ff169c5fa67da475be3ac5a5b0bc44b37108f946d650cb90cf47dca63eb914fe",
+    "tests/test_network_runtime_diagnostics.py": "5ed04c40a7635011e4c17586e3b14e179e34c9d378ec2d8bd603acb7947b7f92",
+    "tests/test_network_runtime_ownership.py": "a10045596d24d1a1ad242ff8eb9faaf140f57174671e062ab34d66d1b9738021"
+  },
+  "accepted_runtime_reference": {
+    "qemu_sha256": "ea642bd71c15a5727963c6cfc7b9229debdeb357ad2496aabcdd3bc7ece60f1f",
+    "plugin_sha256": "a38fafb1a1d1a9e19c2bc8ee20b750e69f60b208ad5d6e45cda2e5ab5efe663e",
+    "observer_sha256": "150c929d45a486be463c4ba3b5bf0f7509d15ffba70b0847f3277baaf0023ba8",
+    "scope": "native_phase1_retirement_capsule_network",
+    "cases": 8,
+    "guest_executions": 9
+  }
+}

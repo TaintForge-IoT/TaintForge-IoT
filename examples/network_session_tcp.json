@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "transport": "tcp",
+  "remote_ip": "127.0.0.1",
+  "remote_port": 4444,
+  "protocol_hint": "net4_test",
+  "framing": "exact_bytes",
+  "limits": {
+    "max_steps": 3,
+    "max_message_bytes": 256,
+    "max_received_bytes": 4096,
+    "max_sent_bytes": 4096,
+    "idle_timeout_ms": 5000,
+    "session_timeout_ms": 30000,
+    "max_connections": 16,
+    "max_total_connections": 128
+  },
+  "steps": [
+    {"request_hex": "48454c4c4f0a", "response_hex": "52454144590a", "delay_ms": 0},
+    {"request_hex": "4155544820746573740a", "response_hex": "4f4b0a", "delay_ms": 0},
+    {"request_hex": "47455420434f4e4649470a", "response_hex": "696e74657276616c3d33300a", "delay_ms": 0}
+  ]
+}

@@ -1,0 +1,19 @@
+test_actual_controller_process_killed (__main__.NativeTransport.test_actual_controller_process_killed) ... ok
+test_disconnect_at_first_and_second_point (__main__.NativeTransport.test_disconnect_at_first_and_second_point) ... ok
+test_disconnect_without_cpu_callbacks (__main__.NativeTransport.test_disconnect_without_cpu_callbacks) ... ok
+test_fail_closed_for_api_read_errors_and_second_vcpu (__main__.NativeTransport.test_fail_closed_for_api_read_errors_and_second_vcpu) ... ok
+test_oversized_and_nul_commands (__main__.NativeTransport.test_oversized_and_nul_commands) ... ok
+test_partial_bytes_cannot_extend_deadline (__main__.NativeTransport.test_partial_bytes_cannot_extend_deadline) ... ok
+test_pause_timeout (__main__.NativeTransport.test_pause_timeout) ... ok
+test_second_pause_timeout (__main__.NativeTransport.test_second_pause_timeout) ... ok
+test_total_watchdog_without_cpu_callbacks (__main__.NativeTransport.test_total_watchdog_without_cpu_callbacks) ... ok
+test_two_points_bool_api_null_eax_handle_and_same_stack (__main__.NativeTransport.test_two_points_bool_api_null_eax_handle_and_same_stack) ... ok
+test_wrong_api_rejected (__main__.NativeTransport.test_wrong_api_rejected) ... ok
+test_wrong_continue_token (__main__.NativeTransport.test_wrong_continue_token) ... ok
+test_combined_frames_preserved (__main__.PythonProtocol.test_combined_frames_preserved) ... ok
+test_oversized_json_rejected (__main__.PythonProtocol.test_oversized_json_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 1.434s
+
+OK
