@@ -650,7 +650,7 @@ def build_solver(output):
     source.mkdir()
     names = ('ir.c', 'ir_eval.c', 'ir_inputs.c', 'ir_smt.c', 'replay_sources.c')
     headers = (*verifier.IR_HEADER_FILES, 'ir_eval.h', 'ir_inputs.h', 'ir_smt.h', 'replay_sources.h',
-               'ir_smt_diagnostics.h', 'ir_smt_checks.h', 'ir_smt_ownership.h')
+               'ir_phase_profile.h', 'ir_smt_diagnostics.h', 'ir_smt_checks.h', 'ir_smt_ownership.h')
     hashes = {}
     for name in (*names, *headers):
         data = (ROOT / 'test' / name).read_bytes()

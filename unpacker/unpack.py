@@ -150,13 +150,19 @@ def validate_capture(run):
             and all(type(analyses[0].get(k)) is int and analyses[0][k] == 0
                     for k in ('trace_dropped', 'trace_incomplete', 'ir_errors', 'ir_mismatches')),
             'INCOMPLETE_CAPTURE', 'Trace/shadow integrity or analysis error checks are incomplete')
+    report, regions = validate_candidate_image(run, events)
+    return report, regions, verification
+
+
+def validate_candidate_image(run, events, *, trace_archive=False):
+    """Check the selected candidate's identity, bytes and event chain."""
     try:
         report, regions = ct_elf.load_capture(run.paths['report'], run.paths['dump'])
     except (KeyError, TypeError, AttributeError, OverflowError, RecursionError) as error:
         raise UnpackError('INVALID_CAPTURE', 'Malformed capture record: ' + str(error)) from error
     require(report.get('main_image_verified') is True
             and report.get('dse_check_enabled') is False
-            and report.get('trace_archive_enabled') is False,
+            and report.get('trace_archive_enabled') is trace_archive,
             'INVALID_CAPTURE', 'Require verified initial main image and bounded detector mode')
     require(report.get('capture_method') == 'candidate_entry_before_instruction'
             and report.get('capture_consistency') == SCOPE['capture_consistency']
@@ -204,7 +210,7 @@ def validate_capture(run):
             and captured[0]['data'].get('capture_trace_seq') == sequence
             and captured[0]['data'].get('bytes') == run.paths['dump'].stat().st_size,
             'INVALID_CAPTURE', 'Candidate capture event does not identify the retained image')
-    return report, regions, verification
+    return report, regions
 
 
 def _failure(error):

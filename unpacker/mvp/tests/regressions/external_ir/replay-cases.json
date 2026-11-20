@@ -1,0 +1,184 @@
+{
+  "samples": {
+    "bzip2": [
+      {
+        "case": {
+          "argv": [
+            "-c"
+          ],
+          "files": {},
+          "id": "compress-02",
+          "output_files": [],
+          "stdin_base64": "aGVsbG8K"
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 42,
+          "stdout_sha256": "8f2cf133c7cb64e1407f2dc51fe6a966755130de4c257b04e26d1a9a9c92354b"
+        }
+      },
+      {
+        "case": {
+          "argv": [
+            "-dc"
+          ],
+          "files": {},
+          "id": "decompress-04",
+          "output_files": [],
+          "stdin_base64": "QlpoOTFBWSZTWba17pUAAAB/////////////////////////////////////////////sADFUgAAAAAAAAAAAAAAAAAAAAABMAmAAAAAAAAAAAAAAEwABMAEmAAmAAJgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkwAEwABMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPwCAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr/AwcLDxMXGxcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9F3JFOFCQtrXulQ="
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 256,
+          "stdout_sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880"
+        }
+      },
+      {
+        "case": {
+          "argv": [
+            "-dc"
+          ],
+          "files": {},
+          "id": "bad-stream",
+          "output_files": [],
+          "stdin_base64": "YmFk"
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 2,
+          "stderr_bytes": 41,
+          "stderr_sha256": "996856c6a07c5cd59dd26d058bdc907f5646e45b05d7acd3b8114793e59b71f2",
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    ],
+    "lua": [
+      {
+        "case": {
+          "argv": [
+            "-e",
+            "print(100//7,100%7)"
+          ],
+          "files": {},
+          "id": "script-02",
+          "output_files": [],
+          "stdin_base64": ""
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 5,
+          "stdout_sha256": "8ba1f09b76ec55b989d9398e719efa7a265a86e3eedc84104f12c1fb2b3bc051"
+        }
+      },
+      {
+        "case": {
+          "argv": [
+            "-e",
+            "io.write(string.reverse(io.read(\"*a\")))"
+          ],
+          "files": {},
+          "id": "stdin-1",
+          "output_files": [],
+          "stdin_base64": "YWJj"
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 3,
+          "stdout_sha256": "6d970874d0db767a7058798973f22cf6589601edab57996312f2ef7b56e5584d"
+        }
+      },
+      {
+        "case": {
+          "argv": [
+            "-e",
+            "local x ="
+          ],
+          "files": {},
+          "id": "syntax-error",
+          "output_files": [],
+          "stdin_base64": ""
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 1,
+          "stderr_bytes": 59,
+          "stderr_sha256": "8422a28e724279243caabfb39cc9b834f5e627eda3891446d6938bb68d99f093",
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    ],
+    "minigzip": [
+      {
+        "case": {
+          "argv": [],
+          "files": {},
+          "id": "compress-02",
+          "output_files": [],
+          "stdin_base64": "aGVsbG8K"
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 26,
+          "stdout_sha256": "cf8187e9a5d4c53e63790f6350ea61dee4929bf6b6402c10307df634a741dd41"
+        }
+      },
+      {
+        "case": {
+          "argv": [
+            "-d"
+          ],
+          "files": {},
+          "id": "decompress-04",
+          "output_files": [],
+          "stdin_base64": "H4sIAAAAAAAC/wEAAf/+AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/3OMBSkAAQAA"
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 0,
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 256,
+          "stdout_sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880"
+        }
+      },
+      {
+        "case": {
+          "argv": [
+            "-d"
+          ],
+          "files": {},
+          "id": "bad-checksum",
+          "output_files": [],
+          "stdin_base64": "H4sIAAAAAAAC/0sqys9OzVNIzkhNzi4uzQUA+Ms4kQ8AAAA="
+        },
+        "m22_original": {
+          "output_files": {},
+          "returncode": 1,
+          "stderr_bytes": 41,
+          "stderr_sha256": "89410b35a42e5c5407ea0d9c509d9c25add7136a8de64ac8ce4b2d5832d9abb8",
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    ]
+  },
+  "schema": 1,
+  "source_m22_evidence_sha256": "a6bfe9fee7aec731cc34f0aef72ba77e3d5cff4db2de973406aabe9b0d6288de"
+}

@@ -145,17 +145,26 @@ class Phase1Run:
         options.extend(f"tf-{'ir-report' if key == 'ir' else key}={path}" for key, path in self.paths.items())
         options.append(f"ir-check={'on' if ir else 'off'}")
         allowed = {"ir-probe", "ir-start", "ir-window", "ir-flat-memory", "ir-tls32", "ir-observed-munmap", "ir-observed-mprotect", "ir-ssa", "tf-selection-delay", "tf-max-events", "tf-max-dump-bytes", "tf-max-candidates"}
+        observed_ir = {"ir-observed-files", "ir-observed-proc-exe-boundary",
+                       "ir-observed-memfd-boundary", "ir-observed-set-thread-area",
+                       "ir-observed-mov-gs", "ir-observed-set-tid-address", "ir-xmm-movq",
+                       "ir-lock-or32", "ir-observed-sigprocmask", "ir-observed-sigaction",
+                       "ir-observed-stdio", "ir-sse2-dwords"}
         capture_choices = {"tf-capture": {"entry", "exit"}, "dse-check": {"off"},
                            "runtime-log": {"summary", "roots"} if diagnostic_roots else {"summary"}}
         capture_budgets = {"tf-max-capture-bytes": (1, 1024 * 1024 * 1024),
                            "ir-trace-capacity": (2, 512 * 1024)}
-        capture_seen = set()
+        capture_seen, observed_seen = set(), set()
         for option in extra:
             if not isinstance(option, str):
                 raise Phase1RuntimeError("per-run analysis options must be strings")
             key, separator, value = option.partition("=")
-            if not separator or key not in allowed | capture_choices.keys() | capture_budgets.keys():
+            if not separator or key not in allowed | observed_ir | capture_choices.keys() | capture_budgets.keys():
                 raise Phase1RuntimeError(f"not an allowed per-run analysis option: {option}")
+            if key in observed_ir:
+                if not ir or value not in {"on", "off"} or key in observed_seen:
+                    raise Phase1RuntimeError(f"invalid per-run observed IR option: {option}")
+                observed_seen.add(key)
             if key in capture_choices or key in capture_budgets:
                 if key in capture_seen:
                     raise Phase1RuntimeError(f"duplicate per-run capture option: {key}")

@@ -44,6 +44,51 @@ typedef enum {
     IR_REPLAY_OUT_OF_MEMORY
 } IrReplayBuildStatus;
 
+typedef struct {
+    uint64_t first_seq;
+    uint32_t count, accessed_writes;
+    uint32_t pc, selector, base, address, gdt_high_before, gdt_high_after;
+} IrReplayMovGs;
+
+typedef struct {
+    uint64_t first_seq;
+    uint32_t count, pc, tid, first_address, last_address;
+} IrReplaySetTidAddress;
+
+typedef struct {
+    uint64_t first_seq, low, high;
+    uint32_t loads, stores, first_pc;
+    uint8_t xmm, size, bytes[MAX_INSN_BYTES];
+} IrReplayMovq;
+
+typedef struct {
+    uint64_t first_seq, first_immediate_seq;
+    uint32_t count, pc, address, before, after, eflags_after;
+    uint32_t immediate_count, first_immediate_pc;
+    uint8_t size, bytes[MAX_INSN_BYTES];
+} IrReplayLockOr32;
+
+typedef struct {
+    uint64_t first_seq, requested, before, after;
+    uint32_t count, pc, address;
+} IrReplaySigprocmask;
+
+typedef struct {
+    uint64_t first_seq, thread_mask;
+    uint32_t count, pc, address, signal, last_handler;
+    uint32_t before[DSE_SIGACTION_WORDS], after[DSE_SIGACTION_WORDS];
+} IrReplaySigaction;
+
+typedef struct {
+    uint64_t read_seq, close_seq, read_bytes;
+    uint32_t read_count, read_pc, read_address, read_requested, read_returned, close_pc;
+} IrReplayStdio;
+
+typedef struct {
+    uint64_t first_seq;
+    uint32_t first_pc, movd_count, punpckldq_count;
+} IrReplaySse2Dwords;
+
 enum {
     IR_REPLAY_IDENTITY = 1U << 0,
     IR_REPLAY_MODE = 1U << 1,
@@ -73,11 +118,35 @@ typedef struct {
     uint32_t modeled_mprotect;
     IrEnvironmentStats files;
     uint32_t modeled_readlink, readlink_bytes, executable_snapshot_bytes;
+    uint64_t boundary_executable_open_seq, boundary_executable_mmap_seq;
+    uint32_t boundary_executable_fd;
+    DseMemfdBoundary boundary_memfd;
+    uint32_t modeled_set_thread_area;
+    uint64_t first_set_thread_area_seq;
+    uint32_t tls_syscall_pc, tls_desc_address, tls_gdt_base, tls_slot, tls_base;
+    IrReplayMovGs mov_gs;
+    IrReplaySetTidAddress set_tid_address;
+    IrReplayMovq movq;
+    IrReplayLockOr32 lock_or32;
+    IrReplaySigprocmask sigprocmask;
+    IrReplaySigaction sigaction;
+    IrReplayStdio stdio;
+    IrReplaySse2Dwords sse2_dwords;
     uint32_t modeled_stdin_reads, stdin_bytes;
     const char *environment_reason; /* Static reason; never an owned pointer. */
     bool syscall_present;
     DseSyscallObservation stopped_syscall;
 } IrReplayBuildInfo;
+
+typedef struct {
+    uint64_t head_seq, resume_seq; /* Resume at the actual final ADD. */
+    uint32_t iterations;
+} IrReplayCountedLoop;
+
+/* MOV ECX, imm32; ADD r32, imm8; DEC ECX; JNZ back to ADD. Returns zero for
+ * unsupported shapes or counts. The collector still verifies the executed span. */
+uint32_t ir_replay_counted_loop_iterations(const TraceEntry *init, const TraceEntry *add,
+                                           const TraceEntry *dec, const TraceEntry *jnz);
 
 typedef struct {
     IrX86Options x86;
@@ -109,6 +178,24 @@ typedef struct {
     /* Explicit immutable /proc/self/exe provider; requires observed_files.
      * No arbitrary host path lookup or success inferred from an fd alone. */
     bool observed_proc_exe;
+    /* One checked read-only first-page view from an open before the window.
+     * Uses observed_files and the same immutable input key as the full provider. */
+    bool observed_proc_exe_boundary;
+    /* One zeroed MAP_SHARED page established by the first three syscalls,
+     * before a captured and independently checked complete write. */
+    bool observed_memfd_boundary;
+    /* Verified Linux-user i386 INT 80 allocation of an ordinary TLS slot.
+     * The syscall copies out the slot and installs its GDT words in guest RAM. */
+    bool observed_set_thread_area;
+    /* Register-source MOV GS using a verified ordinary i386 TLS descriptor. */
+    bool observed_mov_gs;
+    /* Linux-user i386 INT 80 registration with an observed positive TID.
+     * The address is thread state. The syscall has no immediate RAM effect. */
+    bool observed_set_tid_address;
+    bool observed_sigprocmask;
+    bool observed_sigaction;
+    /* Concrete read(0) copy-in and close(1) for observed regular files. */
+    bool observed_stdio;
     uint32_t max_executable_bytes;
     uint32_t max_file_objects, max_file_content_cells;
     /* Opt-in one immutable regular stdin source, at most four serialized
@@ -117,6 +204,9 @@ typedef struct {
      * bytes remain original MEM32 leaves; guest copy-in is never a new initial
      * RAM premise. No lseek, writes, pipes, sockets or mixed syscall models. */
     const IrReplayStdinSource *stdin_source;
+    /* One collector-validated, count-initialized loop. Omit the earlier
+     * iterations from ReplayInput and keep the final ADD, DEC and JNZ. */
+    IrReplayCountedLoop counted_loop;
 } IrReplayOptions;
 
 typedef enum {
@@ -128,7 +218,11 @@ typedef enum {
     IR_REPLAY_WRITE_VALUE,
     IR_REPLAY_BRANCH_CONDITION,
     IR_REPLAY_TRANSFER_TARGET,
-    IR_REPLAY_TLS_BASE
+    IR_REPLAY_TLS_BASE,
+    IR_REPLAY_CLEAR_CHILD_TID,
+    IR_REPLAY_XMM_QWORD,
+    IR_REPLAY_SIGNAL_MASK,
+    IR_REPLAY_SIGNAL_ACTION
 } IrReplayObservationKind;
 
 typedef struct {

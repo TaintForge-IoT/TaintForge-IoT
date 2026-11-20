@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -224,6 +225,50 @@ static bool ir_plugin_options(int argc, char **argv) {
             if (!strcmp(value, "on")) options.replay.observed_proc_exe = true;
             else if (!strcmp(value, "off")) options.replay.observed_proc_exe = false;
             else goto invalid;
+        } else if (IR_OPTION("ir-observed-proc-exe-boundary")) {
+            if (!strcmp(value, "on")) options.replay.observed_proc_exe_boundary = true;
+            else if (!strcmp(value, "off")) options.replay.observed_proc_exe_boundary = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-memfd-boundary")) {
+            if (!strcmp(value, "on")) options.replay.observed_memfd_boundary = true;
+            else if (!strcmp(value, "off")) options.replay.observed_memfd_boundary = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-set-thread-area")) {
+            if (!strcmp(value, "on")) options.replay.observed_set_thread_area = true;
+            else if (!strcmp(value, "off")) options.replay.observed_set_thread_area = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-mov-gs")) {
+            if (!strcmp(value, "on")) options.replay.observed_mov_gs = true;
+            else if (!strcmp(value, "off")) options.replay.observed_mov_gs = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-set-tid-address")) {
+            if (!strcmp(value, "on")) options.replay.observed_set_tid_address = true;
+            else if (!strcmp(value, "off")) options.replay.observed_set_tid_address = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-sigprocmask")) {
+            if (!strcmp(value, "on")) options.replay.observed_sigprocmask = true;
+            else if (!strcmp(value, "off")) options.replay.observed_sigprocmask = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-sigaction")) {
+            if (!strcmp(value, "on")) options.replay.observed_sigaction = true;
+            else if (!strcmp(value, "off")) options.replay.observed_sigaction = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-observed-stdio")) {
+            if (!strcmp(value, "on")) options.replay.observed_stdio = true;
+            else if (!strcmp(value, "off")) options.replay.observed_stdio = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-xmm-movq")) {
+            if (!strcmp(value, "on")) options.replay.x86.movq_xmm_memory = true;
+            else if (!strcmp(value, "off")) options.replay.x86.movq_xmm_memory = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-sse2-dwords")) {
+            if (!strcmp(value, "on")) options.replay.x86.sse2_dwords = true;
+            else if (!strcmp(value, "off")) options.replay.x86.sse2_dwords = false;
+            else goto invalid;
+        } else if (IR_OPTION("ir-lock-or32")) {
+            if (!strcmp(value, "on")) options.replay.x86.lock_or32 = true;
+            else if (!strcmp(value, "off")) options.replay.x86.lock_or32 = false;
+            else goto invalid;
         } else if (IR_OPTION("ir-ssa")) {
             if (!strcmp(value, "on"))
                 options.trace_ssa = true;
@@ -316,6 +361,47 @@ static bool ir_plugin_options(int argc, char **argv) {
         fprintf(stderr, "[IR] proc-exe requires ir-observed-files=on and ir-flat-memory=on\n");
         return false;
     }
+    if (options.replay.observed_proc_exe_boundary &&
+        (!g_phase1.enabled || !options.replay.observed_files || !options.replay.x86.flat32_ram ||
+         options.replay.observed_proc_exe)) {
+        fprintf(stderr, "[IR] proc-exe boundary requires Phase 1, flat memory and observed files\n");
+        return false;
+    }
+    if (options.replay.observed_memfd_boundary &&
+        (!g_phase1.enabled || !options.replay.observed_files || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] memfd boundary requires Phase 1, flat memory and observed files\n");
+        return false;
+    }
+    if ((options.replay.observed_set_thread_area || options.replay.observed_mov_gs) &&
+        (!g_phase1.enabled || !options.replay.x86.tls32_ram)) {
+        fprintf(stderr, "[IR] observed TLS operations require Phase 1 and ir-tls32=on\n");
+        return false;
+    }
+    if (options.replay.observed_set_tid_address && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] set_tid_address requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_sigprocmask && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] rt_sigprocmask requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_sigaction && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] rt_sigaction requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.observed_stdio && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] observed stdio requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if ((options.replay.x86.movq_xmm_memory || options.replay.x86.sse2_dwords) &&
+        (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] SSE2 replay requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
+    if (options.replay.x86.lock_or32 && (!g_phase1.enabled || !options.replay.x86.flat32_ram)) {
+        fprintf(stderr, "[IR] LOCK OR requires Phase 1 and ir-flat-memory=on\n");
+        return false;
+    }
     if (!ir_runtime_init(&g_ir_runtime, &options))
         return false;
     if (g_ir_enabled) {
@@ -345,6 +431,7 @@ static size_t page_size = 4096;
 #define MAX_PENDING_IOV 1024U
 #define GUEST_MAP_ANONYMOUS 0x20U
 #define GUEST_MAP_FIXED 0x10U
+#define GUEST_MAP_PRIVATE 0x02U
 #define MAX_AUXV_ARGC (1U << 20)
 
 typedef enum {
@@ -376,6 +463,9 @@ typedef struct {
     uint64_t producer_write_pc, producer_write_seq;
     uint32_t producer_write_generation, producer_vcpu;
     uint64_t mapping_epoch, guest_store_generation, producer_writer_mapping_epoch;
+    bool private_anonymous_mmap;
+    uint64_t mapping_owner, mapping_begin, mapping_end, protection_epoch;
+    uint64_t protection_seq;
     /* Kind zero is deliberately anonymous/initial for zero-initialized pages.
      * File identity is observational metadata, not an assertion that a mapping
      * is immutable or that its current COW bytes still equal the file. */
@@ -390,7 +480,7 @@ typedef struct {
     uint64_t base, bytes, seq, epoch, pc;
     uint32_t code_generation;
     bool base_set, committed;
-    const char *status;
+    const char *status, *layout;
 } ProgramCapture;
 
 static void page_destroy(void *pointer) {
@@ -434,6 +524,8 @@ typedef struct {
     uint32_t entry_size;
     uint64_t code_page;
     uint8_t *code_page_bytes;
+    uint64_t call_continuation, caller_mapping_epoch, return_trace_seq;
+    uint64_t same_page_successor_id;
     ProgramCapture capture;
 } oep_cand_t;
 
@@ -441,6 +533,7 @@ static oep_cand_t *g_selected_candidate;
 static uint64_t g_candidate_count;
 /* Mapping lifetimes and STORE ordinals are separate from code generations. */
 static uint64_t g_stage_syscall_ordinal, g_stage_guest_store_ordinal;
+static uint64_t g_payload_mapping_floor;
 static bool g_stage_mapping_identity;
 static bool g_stage_file_mapping_profile;
 static uint64_t g_stage_self_fd_epoch[64];
@@ -460,6 +553,8 @@ typedef struct {
     page_t *store_pages[256];
 } StageMemfd;
 static StageMemfd g_stage_memfd_files[32];
+static DseMemfdBoundary g_memfd_boundary;
+static const uint8_t zero_memfd_page[DSE_MEMFD_BOUNDARY_PAGE_BYTES];
 static struct {
     bool active, supported;
     int64_t number;
@@ -523,8 +618,12 @@ static struct qemu_plugin_register *g_eflags_handle = NULL;
 static bool g_eflags_handle_valid;
 static struct qemu_plugin_register *g_es_state_handle;
 static struct qemu_plugin_register *g_brk_state_handle;
+static struct qemu_plugin_register *g_sigmask_handle;
+static struct qemu_plugin_register *g_sigaction_handle;
+static struct qemu_plugin_register *g_tls_gdt_handle;
 static bool g_es_state_handle_valid;
 static struct qemu_plugin_register *g_tls_handle[DSE_TLS_SEGMENTS][2];
+static struct qemu_plugin_register *g_xmm_handle[IR_X86_XMM_COUNT];
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
 static bool g_reg_read_error_reported[REG_COUNT];
@@ -679,7 +778,7 @@ static bool g_layer_has_cand = false;
 static GList *oep_cands = NULL;
 static GHashTable *unmapped_pages = NULL; //for munmaped pages
 
-//addtional info for last indirect jump
+/* Pending transfer to the next observed instruction. */
 static __thread uint64_t prev_jump_site = 0;
 static __thread uint64_t prev_jump_seq_id = 0;
 static __thread int prev_target_reg = REG_INVALID;
@@ -689,6 +788,7 @@ static __thread uint64_t prev_mem_target_value = 0;
 static __thread bool prev_mem_target_valid = false;
 static __thread bool prev_target_tainted = false;
 static __thread bool prev_jump_direct = false;
+static __thread const InsnExecCtx *prev_call_or_jcc;
 
 typedef struct {
     uint64_t pc;
@@ -932,6 +1032,8 @@ static struct {
     struct stat identity;
     uint8_t *bytes;
     uint32_t size;
+    uint64_t open_seq, open_boundary, descriptor_epoch;
+    uint32_t fd;
 } g_proc_executable;
 
 static bool proc_executable_same(const struct stat *a,const struct stat *b) {
@@ -945,18 +1047,21 @@ static void proc_executable_reset(void) {
     memset(&g_proc_executable,0,sizeof(g_proc_executable));
 }
 static void proc_executable_init(void) {
-    if (g_proc_executable.attempted || !g_ir_runtime.options.replay.observed_proc_exe ||
-        !g_main_image_path) return;
+    bool boundary = g_ir_runtime.options.replay.observed_proc_exe_boundary;
+    if (g_proc_executable.attempted ||
+        (!g_ir_runtime.options.replay.observed_proc_exe && !boundary) || !g_main_image_path) return;
     g_proc_executable.attempted=true;
     if (strlen(g_main_image_path)>=DSE_SYSCALL_PATH_BYTES) return;
     FILE *f=fopen(g_main_image_path,"rb");
     if (!f) return;
     struct stat before,after;
-    bool ok=fstat(fileno(f),&before)==0 && S_ISREG(before.st_mode) && before.st_size>=0 &&
-        (uint64_t)before.st_size<=DSE_EXECUTABLE_SNAPSHOT_BYTES;
-    size_t size=ok?(size_t)before.st_size:0;
+    bool ok=fstat(fileno(f),&before)==0 && S_ISREG(before.st_mode) && before.st_size>=0;
+    if (ok)
+        ok = boundary ? (uint64_t)before.st_size >= DSE_PROC_EXE_PAGE_BYTES :
+                        (uint64_t)before.st_size <= DSE_EXECUTABLE_SNAPSHOT_BYTES;
+    size_t size=ok?(boundary?DSE_PROC_EXE_PAGE_BYTES:(size_t)before.st_size):0;
     uint8_t *bytes=ok?g_try_malloc(size?size:1):NULL;
-    ok=ok && bytes && fread(bytes,1,size,f)==size && fgetc(f)==EOF && !ferror(f) &&
+    ok=ok && bytes && fread(bytes,1,size,f)==size && (boundary || fgetc(f)==EOF) && !ferror(f) &&
         fstat(fileno(f),&after)==0 && proc_executable_same(&before,&after);
     if (fclose(f)) ok=false;
     if (!ok) {g_free(bytes);return;}
@@ -1029,6 +1134,8 @@ typedef struct {
     int32_t fd;
     uint64_t offset;
     uint64_t syscall_ordinal;
+    uint64_t stage_owner;
+    uint64_t trace_seq;
 } pending_mmap_t;
 
 static __thread pending_mmap_t g_pending_mmap;
@@ -2069,8 +2176,12 @@ static void dse_init_reg_handles(void) {
     g_eflags_handle_valid = false;
     g_es_state_handle = NULL;
     g_brk_state_handle = NULL;
+    g_sigmask_handle = NULL;
+    g_sigaction_handle = NULL;
+    g_tls_gdt_handle = NULL;
     g_es_state_handle_valid = false;
     memset(g_tls_handle, 0, sizeof(g_tls_handle));
+    memset(g_xmm_handle, 0, sizeof(g_xmm_handle));
     GArray *regs = qemu_plugin_get_registers();
     if (!regs) {
         fprintf(stderr, "[REG] failed to enumerate QEMU registers\n");
@@ -2091,6 +2202,15 @@ static void dse_init_reg_handles(void) {
         static const char *tls_names[DSE_TLS_SEGMENTS][2] = {{"fs_base", "fs"}, {"gs_base", "gs"}};
         if (descriptor->name && !strcmp(descriptor->name, "tf_brk_state_v1"))
             g_brk_state_handle = descriptor->handle;
+        if (descriptor->name && !strcmp(descriptor->name, "tf_i386_sigmask_v1"))
+            g_sigmask_handle = descriptor->handle;
+        if (descriptor->name && !strcmp(descriptor->name, "tf_i386_sigint_action_v1"))
+            g_sigaction_handle = descriptor->handle;
+        if (descriptor->name && !strcmp(descriptor->name, "tf_i386_tls_gdt_v1"))
+            g_tls_gdt_handle = descriptor->handle;
+        const char *name = descriptor->name;
+        if (name && g_str_has_prefix(name, "xmm") && name[3] >= '0' && name[3] <= '7' && !name[4])
+            g_xmm_handle[name[3] - '0'] = descriptor->handle;
         if (descriptor->name && !strcmp(descriptor->name, "tf_es_state_v1")) {
             g_es_state_handle = descriptor->handle;
             g_es_state_handle_valid = true;
@@ -2258,6 +2378,167 @@ static void dse_read_brk_state(InsnAux *aux, bool post) {
     uint32_t words[4];
     bool ok = dse_read_brk_words(words);
     dse_aux_syscall_brk_state(aux, words, ok, post);
+}
+
+static bool dse_read_register_words(struct qemu_plugin_register *handle,
+                                    uint32_t *words, unsigned count) {
+    if (!handle)
+        return false;
+    size_t size = count * sizeof(*words);
+    GByteArray *bytes = g_byte_array_sized_new(size);
+    bool valid = tf_qemu_read_register_exact(handle, bytes, size);
+    if (valid) {
+        memcpy(words, bytes->data, size);
+        for (unsigned i = 0; i < count; ++i)
+            words[i] = GUINT32_FROM_LE(words[i]);
+    }
+    g_byte_array_free(bytes, TRUE);
+    return valid;
+}
+
+static DseSigmaskSnapshot dse_read_sigmask(void) {
+    DseSigmaskSnapshot snapshot = {0};
+    uint32_t words[4];
+    if (dse_read_register_words(g_sigmask_handle, words, G_N_ELEMENTS(words)) &&
+        words[0] == DSE_SIGMASK_STATE_MAGIC && words[1] <= 1) {
+        snapshot.observed = true;
+        snapshot.no_pending = words[1] != 0;
+        snapshot.mask = (uint64_t)words[2] | (uint64_t)words[3] << 32;
+    }
+    return snapshot;
+}
+
+static void dse_read_sigprocmask(InsnAux *aux, bool post) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 175 || !g_ir_runtime.options.replay.observed_sigprocmask ||
+        s->args[0] != DSE_I386_SIG_UNBLOCK || !s->args[1] || s->args[2] ||
+        s->args[3] != sizeof(s->sigmask_set))
+        return;
+    if (post) {
+        if (s->returned && s->sigmask_before.observed)
+            s->sigmask_after = dse_read_sigmask();
+    } else {
+        uint64_t raw;
+        uint32_t address = s->args[1];
+        s->sigmask_before = dse_read_sigmask();
+        if ((uint64_t)address + sizeof(raw) <= (UINT64_C(1) << 32) &&
+            guest_read_bytes(address, (uint8_t *)&raw, sizeof(raw))) {
+            s->sigmask_set = GUINT64_FROM_LE(raw);
+            s->sigmask_set_valid = true;
+        }
+    }
+}
+
+static bool dse_read_guest_words(uint32_t address, uint32_t *words, unsigned count) {
+    uint8_t raw[DSE_TLS_SLOTS * 8U];
+    unsigned size = count * sizeof(*words);
+    if (size > sizeof(raw) || (uint64_t)address + size > (UINT64_C(1) << 32) ||
+        !guest_read_bytes(address, raw, size))
+        return false;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t word;
+        memcpy(&word, raw + i * sizeof(word), sizeof(word));
+        words[i] = GUINT32_FROM_LE(word);
+    }
+    return true;
+}
+
+static DseSigactionSnapshot dse_read_sigint_action(void) {
+    DseSigactionSnapshot snapshot = {0};
+    uint32_t words[8];
+    if (dse_read_register_words(g_sigaction_handle, words, G_N_ELEMENTS(words)) &&
+        words[0] == DSE_SIGACTION_STATE_MAGIC && words[1] == DSE_I386_SIGINT && words[7] == 0) {
+        memcpy(snapshot.words, &words[2], sizeof(snapshot.words));
+        snapshot.observed = true;
+    }
+    return snapshot;
+}
+
+static void dse_read_sigaction(InsnAux *aux, bool post) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 174 || !g_ir_runtime.options.replay.observed_sigaction ||
+        s->args[0] != DSE_I386_SIGINT || !s->args[1] || s->args[2] ||
+        s->args[3] != sizeof(s->sigmask_before.mask))
+        return;
+    if (post) {
+        if (s->returned && s->sigaction_before.observed) {
+            s->sigaction_after = dse_read_sigint_action();
+            s->sigmask_after = dse_read_sigmask();
+        }
+    } else {
+        s->sigaction_before = dse_read_sigint_action();
+        s->sigmask_before = dse_read_sigmask();
+        s->sigaction_input.observed = dse_read_guest_words(s->args[1], s->sigaction_input.words,
+                                                          DSE_SIGACTION_WORDS);
+    }
+}
+
+static uint32_t dse_read_tls_gdt_base(void) {
+    if (!g_tls_gdt_handle)
+        return 0;
+    uint32_t base = 0;
+    GByteArray *bytes = g_byte_array_new();
+    if (tf_qemu_read_register_exact(g_tls_gdt_handle, bytes, sizeof(base)))
+        memcpy(&base, bytes->data, sizeof(base));
+    g_byte_array_free(bytes, TRUE);
+    base = GUINT32_FROM_LE(base);
+    return (base & 4095U) ? 0 : base;
+}
+
+static void dse_read_tls_install(InsnAux *aux, bool post) {
+    DseSyscallObservation *s = aux ? aux->syscall : NULL;
+    if (!s || s->number != 243 || !g_ir_runtime.options.replay.observed_set_thread_area)
+        return;
+    DseTlsSnapshot *snapshot = post ? &s->tls_after : &s->tls_before;
+    uint32_t gdt = dse_read_tls_gdt_base();
+    snapshot->gdt_base = gdt;
+    if (!gdt || !dse_read_guest_words(s->args[0], snapshot->user_desc, 4))
+        return;
+    for (unsigned i = 0; i < DSE_TLS_SLOTS; ++i)
+        if (!dse_read_guest_words(gdt + (DSE_TLS_FIRST_SLOT + i) * 8U, snapshot->slot[i], 2))
+            return;
+    for (unsigned i = 0; i < DSE_TLS_SEGMENTS; ++i)
+        if (!dse_read_tls(i, &snapshot->base[i], &snapshot->selector[i]) ||
+            snapshot->selector[i] > UINT16_MAX)
+            return;
+    snapshot->valid = true;
+}
+
+static void dse_read_gs_load(InsnAux *aux, const TraceEntry *entry, bool post) {
+    if (!g_ir_enabled || !is_i386 || !g_ir_runtime.options.replay.observed_mov_gs || !entry)
+        return;
+    RegId source = dse_x86_mov_gs_source(entry);
+    if (source == REG_INVALID || !(aux->reg_value_valid_mask & (1U << source)))
+        return;
+    uint32_t offset = dse_x86_tls_gdt_offset((uint16_t)aux->reg_vals[source]);
+    if (!offset || (post && !aux->gs_load.before_valid))
+        return;
+    uint32_t gdt = dse_read_tls_gdt_base();
+    if (!gdt)
+        return;
+    if (post) {
+        aux->gs_load.after_valid = gdt == aux->gs_load.gdt_base &&
+            dse_read_guest_words(gdt + offset, aux->gs_load.after, 2);
+    } else {
+        aux->gs_load.gdt_base = gdt;
+        aux->gs_load.before_valid = dse_read_guest_words(gdt + offset, aux->gs_load.before, 2);
+    }
+}
+
+static void dse_read_xmm_after(InsnAux *aux) {
+    DseXmmObservation *observation = &aux->xmm_after;
+    unsigned xmm = observation->slot - 1U;
+    if (!aux->execution_complete || xmm >= IR_X86_XMM_COUNT || !g_xmm_handle[xmm])
+        return;
+    uint64_t words[2];
+    GByteArray *bytes = g_byte_array_sized_new(sizeof(words));
+    if (tf_qemu_read_register_exact(g_xmm_handle[xmm], bytes, sizeof(words))) {
+        memcpy(words, bytes->data, sizeof(words));
+        observation->low = GUINT64_FROM_LE(words[0]);
+        observation->high = GUINT64_FROM_LE(words[1]);
+        observation->valid = true;
+    }
+    g_byte_array_free(bytes, TRUE);
 }
 
 static uint32_t dse_read_register_snapshot(uint64_t values[REG_COUNT]) {
@@ -2904,6 +3185,46 @@ static bool stage_self_fd(int32_t fd) {
     return fd >= 3 && fd < 64 && g_stage_self_fd_epoch[fd] != 0;
 }
 
+/* Only operations that preserve this descriptor lifetime are admitted.
+ * Anything else revokes the certificate until another verified self-open. */
+static void proc_executable_syscall(int64_t number, uint32_t first) {
+    if (!g_proc_executable.open_seq) return;
+    switch (number) {
+    case 4: case 6: case 19: case 93:
+        if (first == g_proc_executable.fd) g_proc_executable.open_seq = 0;
+        break;
+    case 45: case 85: case 90: case 91: case 125: case 144: case 192: case 356:
+        break;
+    default:
+        g_proc_executable.open_seq = 0;
+        break;
+    }
+}
+
+static void proc_executable_track_open(const TraceEntry *entry, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (dse_aux_open_executable_issue(entry, aux) || !stage_self_fd((int32_t)s->result) ||
+        g_stage_self_fd_epoch[s->result] != g_stage_syscall_ordinal ||
+        !proc_executable_current()) return;
+    g_proc_executable.fd = s->result;
+    g_proc_executable.open_seq = s->seq_id;
+    g_proc_executable.open_boundary = s->boundary_id;
+    g_proc_executable.descriptor_epoch = g_stage_syscall_ordinal;
+}
+
+static void proc_executable_capture_mmap(InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (!g_proc_executable.open_seq || !dse_aux_executable_mmap_shape(s) ||
+        s->args[4] != g_proc_executable.fd || !stage_self_fd((int32_t)s->args[4]) ||
+        g_stage_self_fd_epoch[s->args[4]] != g_proc_executable.descriptor_epoch ||
+        g_proc_executable.size < DSE_PROC_EXE_PAGE_BYTES || !proc_executable_current()) return;
+    uint8_t page[DSE_PROC_EXE_PAGE_BYTES];
+    if (guest_read_bytes(s->result, page, sizeof(page)) &&
+        !memcmp(page, g_proc_executable.bytes, sizeof(page)))
+        (void)dse_aux_syscall_executable_mmap(g_aux, aux, g_main_image_object_id,
+            g_proc_executable.open_seq, g_proc_executable.open_boundary, page);
+}
+
 static void stage_bind_open_descriptor(int32_t fd, const char *path, uint32_t flags,
                                        uint64_t ordinal) {
     if (fd < 0 || fd >= 64)
@@ -2927,6 +3248,65 @@ static unsigned stage_memfd_file(int32_t fd) {
         return 0;
     unsigned file = g_stage_memfd_file[fd];
     return file && file < 32 && g_stage_memfd_files[file].valid ? file : 0;
+}
+
+/* The certificate is deliberately limited to a fresh file and the first
+ * three syscall boundaries: create, resize and the single shared view. */
+static void memfd_boundary_prepare(const TraceEntry *entry, const InsnAux *aux) {
+    const DseSyscallObservation *s = aux->syscall;
+    if (!s || !s->boundary_ordered || s->boundary_id != g_stage_syscall_ordinal) return;
+    if (s->boundary_id == 1 && s->number == 356 &&
+        (s->args[1] == 16 || s->args[1] == 17) && !dse_aux_memfd_issue(entry, aux) &&
+        stage_memfd_file((int32_t)s->result) && g_stage_memfd_fd_epoch[s->result] == 1) {
+        g_memfd_boundary = (DseMemfdBoundary){
+            .create_seq = s->seq_id, .fd = s->result, .flags = s->args[1]};
+    } else if (g_memfd_boundary.create_seq && s->boundary_id == 2 && s->number == 93 &&
+               s->args[0] == g_memfd_boundary.fd && !s->result &&
+               s->args[1] && s->args[1] <= DSE_MEMFD_BOUNDARY_PAGE_BYTES &&
+               !dse_aux_ftruncate_issue(entry, aux)) {
+        g_memfd_boundary.resize_seq = s->seq_id;
+        g_memfd_boundary.size = s->args[1];
+    } else if (g_memfd_boundary.resize_seq && s->boundary_id == 3 &&
+               (s->number == 90 || s->number == 192)) {
+        uint32_t map[6];
+        if (dse_aux_ir_mmap_issue(entry, aux, map) || map[0] || map[1] != g_memfd_boundary.size ||
+            map[2] != 3 || map[3] != 1 || map[4] != g_memfd_boundary.fd || map[5] || !s->result) return;
+        g_memfd_boundary.mmap_seq = s->seq_id;
+        g_memfd_boundary.address = s->result;
+    }
+}
+
+static void memfd_boundary_before_write(InsnAux *aux) {
+    DseSyscallObservation *s = aux->syscall;
+    const DseMemfdBoundary *seed = &g_memfd_boundary;
+    if (!seed->mmap_seq || s->boundary_id != DSE_MEMFD_BOUNDARY_WRITE_ORDINAL ||
+        g_stage_syscall_ordinal != s->boundary_id || !s->write_valid ||
+        s->args[0] != seed->fd || s->args[2] != seed->size ||
+        page_size != DSE_MEMFD_BOUNDARY_PAGE_BYTES) return;
+    uint64_t end = (uint64_t)seed->address + DSE_MEMFD_BOUNDARY_PAGE_BYTES;
+    uint64_t source_end = (uint64_t)s->args[1] + seed->size;
+    if (source_end > (UINT64_C(1) << 32) || (s->args[1] < end && seed->address < source_end)) return;
+    unsigned file = stage_memfd_file((int32_t)seed->fd);
+    const page_t *page = pages ? g_hash_table_lookup(pages, (gpointer)(uintptr_t)seed->address) : NULL;
+    if (!file || !page || page->mapping_epoch != 3 || page->descriptor_epoch != 1 ||
+        page->backing_kind != file + 2 || !page->backing_shared || page->backing_offset ||
+        page->prot != 3 || page->write_count || g_stage_memfd_files[file].tail_dirty ||
+        g_stage_memfd_files[file].size != seed->size || g_stage_memfd_cursor[seed->fd]) return;
+    uint8_t observed[DSE_MEMFD_BOUNDARY_PAGE_BYTES];
+    if (!guest_read_bytes(seed->address, observed, sizeof(observed)) ||
+        memcmp(observed, zero_memfd_page, sizeof(observed))) return;
+    s->memfd_boundary = *seed;
+    s->memfd_boundary.write_seq = s->seq_id;
+}
+
+static void memfd_boundary_after_write(DseSyscallObservation *s) {
+    DseMemfdBoundary *seed = &s->memfd_boundary;
+    if (!seed->write_seq || s->invalid || !s->returned || s->result != seed->size ||
+        !s->write_values || s->write_size != seed->size) return;
+    uint8_t observed[DSE_MEMFD_BOUNDARY_PAGE_BYTES];
+    seed->verified = guest_read_bytes(seed->address, observed, sizeof(observed)) &&
+        !memcmp(observed, s->write_values, seed->size) &&
+        !memcmp(observed + seed->size, zero_memfd_page, sizeof(observed) - seed->size);
 }
 
 static bool stage_memfd_live_mapping(unsigned file) {
@@ -3340,12 +3720,15 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         }
     }
     bool fixed = (pending->flags & GUEST_MAP_FIXED) != 0;
+    bool private_anonymous = false;
     if (pending->syscall_num == 90 || pending->syscall_num == 192) {
         if (!pending->syscall_ordinal) {
             tf_phase1_profile_lost(&g_phase1, "mapping_syscall_identity_missing");
             return;
         }
         g_stage_mapping_identity = true;
+        private_anonymous = (pending->flags & (GUEST_MAP_ANONYMOUS | 3U)) ==
+                            (GUEST_MAP_ANONYMOUS | GUEST_MAP_PRIVATE);
     }
     stage_invalidate_mapping_range(page_start, mapped_size);
     uint32_t remap_generation = 0;
@@ -3364,6 +3747,12 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
             g_hash_table_insert(pages, key, page);
         }
         page->mapping_epoch = pending->syscall_ordinal;
+        page->private_anonymous_mmap = private_anonymous;
+        if (private_anonymous && pending->prot == 3 && pending->stage_owner) {
+            page->mapping_owner = pending->stage_owner;
+            page->mapping_begin = page_start;
+            page->mapping_end = page_last + page_size;
+        }
         stage_mapping_backing(page, pending, addr - page_start);
         if (fixed || ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key))) {
             if (pending->prot & 0x4)
@@ -3421,6 +3810,11 @@ static void apply_pending_mprotect(const pending_mmap_t *pending) {
         page_t *page = g_hash_table_lookup(pages, key);
         if (page) {
             page->prot = prot;
+            page->protection_epoch = pending->stage_owner &&
+                pending->stage_owner == page->mapping_owner &&
+                page->mapping_begin == page_start && page->mapping_end == page_end
+                ? pending->syscall_ordinal : 0;
+            page->protection_seq = page->protection_epoch ? pending->trace_seq : 0;
         } else {
             page = g_new0(page_t, 1);
             page->prot = prot;
@@ -3654,6 +4048,21 @@ static oep_cand_t *stage_owner_for_instruction(const InsnExecCtx *instruction,
         memcmp(current, instruction->instr_bytes, instruction->size))
         return NULL;
     return owner;
+}
+
+static uint64_t stage_mapping_syscall_owner(unsigned int vcpu) {
+    if (!g_phase1.capture_at_entry || !is_i386 || !g_trace || !g_active_candidate ||
+        g_active_candidate->stale || g_active_candidate->epoch != g_phase1.epoch)
+        return 0;
+    const TraceEntry *entry = trace_find_seq(g_trace, g_phase1.trace_seq, NULL);
+    if (!entry || entry->pc != g_phase1.pc || entry->size != 2 ||
+        entry->instr_bytes[0] != 0xcd || entry->instr_bytes[1] != 0x80)
+        return 0;
+    InsnExecCtx ctx = {.pc = entry->pc, .size = entry->size,
+                      .code_generation = entry->code_generation};
+    memcpy(ctx.instr_bytes, entry->instr_bytes, entry->size);
+    const oep_cand_t *owner = stage_owner_for_instruction(&ctx, g_phase1.trace_seq, vcpu);
+    return owner ? owner->candidate_id : 0;
 }
 
 /* A tail may unmap the executable page that entered it, restore registers
@@ -3948,6 +4357,7 @@ static double g_oep_confidence = 0.0;
 static GString *g_oep_scoring = NULL;
 static bool image_captured = false;
 static const char *g_capture_status = "not_attempted";
+static const char *g_capture_layout = "tracked_program_pages";
 static GString *g_capture_gaps;
 static uint64_t g_capture_bytes, g_capture_seq, g_capture_epoch, g_capture_pc;
 static uint32_t g_capture_generation;
@@ -4098,6 +4508,10 @@ static bool cand_rank_better(const oep_cand_t *a, const oep_cand_t *b) {
     if (a_in_main != b_in_main) {
         return a_in_main;
     }
+    bool a_returned_helper = a->same_page_successor_id != 0;
+    bool b_returned_helper = b->same_page_successor_id != 0;
+    if (a_returned_helper != b_returned_helper)
+        return !a_returned_helper;
 
     return cand_score_better(a, b);
 }
@@ -4344,20 +4758,196 @@ static bool read_auxv_from_stack(void) {
     return true;
 }
 
-//is page in boundaries
+static bool page_overlaps_main(uint64_t addr) {
+    return g_main_known && addr < g_main_hi &&
+           (addr >= g_main_lo || g_main_lo - addr < page_size);
+}
+
 static bool page_is_program(uint64_t addr, const page_t *p) {
     if (addr_in_lib(addr))
         return false;
     if (!g_main_known)
         return true;
-    if (addr < g_main_hi && (addr >= g_main_lo || g_main_lo - addr < page_size))
+    if (page_overlaps_main(addr))
         return true;
     if (p && (p->exec_seen || p->exec_after_write || p->dyn_exec))
         return true;
     return false;
 }
 
-static void capture_image(ProgramCapture *capture, uint64_t max_bytes) {
+static bool page_is_payload_mapping(uint64_t addr, const page_t *page) {
+    return page && page->private_anonymous_mmap && page->mapping_epoch > g_payload_mapping_floor &&
+           !page_overlaps_main(addr) && !addr_in_lib(addr);
+}
+
+static bool page_store_coverage(const page_t *page, size_t begin, size_t end) {
+    if (!page->wbitmap)
+        return false;
+    for (size_t byte = begin; byte < end; byte++) {
+        if (!(page->wbitmap[byte >> 3] & (1u << (byte & 7))))
+            return false;
+    }
+    return true;
+}
+
+static bool payload_loads_mapped(const TfElfImage *image) {
+    const uint64_t mask = ~((uint64_t)page_size - 1);
+    for (size_t i = 0; i < image->load_count; i++) {
+        const TfElfLoad *load = &image->loads[i];
+        const int prot = ((load->flags & 4) >> 2) | (load->flags & 2) | ((load->flags & 1) << 2);
+        for (uint64_t addr = load->address & mask; addr < load->address + load->memory_size;
+             addr += page_size) {
+            const page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
+            if (!page_is_payload_mapping(addr, page) || page->prot != prot)
+                return false;
+            /* File bytes were copied by the loader. The zero-fill tail only
+             * needs a live mapping and is captured with its actual bytes. */
+            uint64_t begin = MAX(addr, load->address);
+            uint64_t end = MIN(addr + page_size, load->address + load->file_size);
+            if (begin < end && !page_store_coverage(page, begin - addr, end - addr))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool find_payload_image(const GList *keys, uint64_t entry, TfElfImage *image,
+                               bool *header_seen) {
+    if (!entry || !is_i386 || page_size != TF_ELF_I386_PAGE_SIZE)
+        return false;
+    uint64_t entry_page = entry & ~((uint64_t)page_size - 1);
+    if (!page_is_payload_mapping(entry_page, g_hash_table_lookup(pages, (gpointer)(uintptr_t)entry_page)))
+        return false;
+
+    bool found = false;
+    for (const GList *key = keys; key; key = key->next) {
+        uint64_t addr = (uint64_t)(uintptr_t)key->data;
+        const page_t *page = g_hash_table_lookup(pages, key->data);
+        if (addr > entry_page)
+            break;
+        if (!page_is_payload_mapping(addr, page) || !(page->prot & 1) ||
+            !page_store_coverage(page, 0, 4))
+            continue;
+        uint8_t header[TF_ELF_I386_PAGE_SIZE];
+        TfElfImage observed;
+        if (!guest_read_bytes(addr, header, sizeof(header)) || memcmp(header, "\177ELF", 4))
+            continue;
+        *header_seen = true;
+        if (!tf_elf_i386_payload(header, addr, entry, &observed) || !payload_loads_mapped(&observed))
+            continue;
+        if (found)
+            return false; /* More than one matching live header. */
+        *image = observed;
+        found = true;
+    }
+    return found;
+}
+
+/* Require data provenance from the packed main ELF for each initialized
+ * interval. Address taint and unknown labels cannot establish this origin. */
+static bool payload_store_origin(uint64_t begin, uint64_t end) {
+    for (uint64_t addr = begin; addr < end; ++addr) {
+        ProvLabelView label;
+        ProvRootSetView roots;
+        if (!prov_label_get(g_prov_registry, shadow_load_label(g_shadow, addr), &label) ||
+            !(label.complete_mask & PROV_COMPLETE_DATA) ||
+            !prov_root_set_get(g_prov_registry, label.data_roots, &roots) || roots.count != 1)
+            return false;
+        ProvRootKey root;
+        if (!prov_root_get(g_prov_registry, roots.roots[0], &root) ||
+            root.kind != PROV_ROOT_RESOURCE_BYTE || root.source_id != g_main_image_resource_id)
+            return false;
+    }
+    return true;
+}
+
+static bool headerless_mapping(uint64_t begin, int prot, const oep_cand_t *child,
+                               uint64_t previous_protection, uint64_t limit,
+                               const page_t **mapping) {
+    const page_t *first = g_hash_table_lookup(pages, (gpointer)(uintptr_t)begin);
+    if (!first || first->mapping_begin != begin || first->mapping_end <= begin ||
+        first->mapping_end > limit || first->mapping_epoch <= previous_protection ||
+        first->protection_epoch <= first->mapping_epoch ||
+        !first->protection_seq || first->protection_seq >= child->transfer_seq)
+        return false;
+
+    bool initialized = false, zero_tail = false;
+    for (uint64_t addr = begin; addr < first->mapping_end; addr += page_size) {
+        const page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
+        if (!page_is_payload_mapping(addr, page) || page->prot != prot ||
+            page->mapping_epoch != first->mapping_epoch || page->mapping_begin != begin ||
+            page->mapping_end != first->mapping_end || page->mapping_owner != child->parent_candidate_id ||
+            page->protection_epoch != first->protection_epoch || page->protection_seq != first->protection_seq)
+            return false;
+
+        if (!page->written && !page->wbitmap) {
+            /* Only a zero-filled tail of the same writable mmap can supply BSS. */
+            uint8_t bytes[TF_ELF_I386_PAGE_SIZE];
+            static const uint8_t zeros[TF_ELF_I386_PAGE_SIZE];
+            if (prot != 3 || !initialized || !guest_read_bytes(addr, bytes, sizeof(bytes)) ||
+                memcmp(bytes, zeros, sizeof(bytes)))
+                return false;
+            zero_tail = true;
+            continue;
+        }
+        if (zero_tail || !page->wbitmap || !page->producer_valid ||
+            page->producer_candidate_id != child->parent_candidate_id ||
+            page->producer_writer_mapping_epoch != child->parent_mapping_epoch ||
+            page->producer_vcpu != child->vcpu || page->producer_write_seq >= page->protection_seq ||
+            page->producer_begin < addr || page->producer_end > addr + page_size ||
+            page->producer_begin >= page->producer_end)
+            return false;
+        size_t lo = page->producer_begin - addr, hi = page->producer_end - addr;
+        for (size_t byte = 0; byte < page_size; ++byte) {
+            bool written = page->wbitmap[byte >> 3] & (1u << (byte & 7));
+            if (written != (lo <= byte && byte < hi))
+                return false;
+        }
+        if (!payload_store_origin(page->producer_begin, page->producer_end))
+            return false;
+        initialized = true;
+    }
+    *mapping = first;
+    return initialized;
+}
+
+/* Bounded layout observed for a separately loaded RX/R/RW static image.
+ * Without PHDRs there is no generic way to identify all of its mappings. */
+static bool find_headerless_payload(const oep_cand_t *child, uint64_t *start, uint64_t *end) {
+    if (!child || !child->parent_candidate_id || !is_i386 ||
+        page_size != TF_ELF_I386_PAGE_SIZE || !g_active_candidate ||
+        g_active_candidate->candidate_id != child->parent_candidate_id ||
+        g_active_candidate->stale || g_active_candidate->epoch != child->epoch ||
+        !g_shadow || !g_prov_registry || g_main_image_resource_id == PROV_RESOURCE_ID_INVALID)
+        return false;
+    const page_t *entry = g_hash_table_lookup(pages, (gpointer)(uintptr_t)child->code_page);
+    if (!entry || entry->mapping_epoch != child->mapping_epoch ||
+        entry->mapping_begin > child->code_page)
+        return false;
+    uint64_t begin = entry->mapping_begin;
+    uint64_t limit = MIN(begin + 1024 * 1024, UINT64_C(1) << 32);
+    const page_t *rx, *r, *rw;
+    if (!headerless_mapping(begin, 5, child, g_active_candidate->mapping_epoch, limit, &rx) ||
+        !headerless_mapping(rx->mapping_end, 1, child, rx->protection_epoch, limit, &r) ||
+        !headerless_mapping(r->mapping_end, 3, child, r->protection_epoch, limit, &rw))
+        return false;
+    *start = begin;
+    *end = rw->mapping_end;
+    return true;
+}
+
+static bool payload_contains_page(const TfElfImage *image, uint64_t addr) {
+    if (addr < image->lo || addr >= image->hi)
+        return false;
+    for (size_t i = 0; i < image->load_count; i++) {
+        const TfElfLoad *load = &image->loads[i];
+        if (addr < load->address + load->memory_size && load->address < addr + page_size)
+            return true;
+    }
+    return false;
+}
+
+static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep_cand_t *candidate) {
     if (g_phase1.capture_at_entry && !g_main_known) {
         capture->status = "unsupported";
         tf_phase1_event(&g_phase1, "capture_unavailable", "unsupported", "main_image_unverified",
@@ -4377,6 +4967,19 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes) {
         return;
     }
     GList *keys = g_list_sort(g_hash_table_get_keys(pages), compare_keys);
+    TfElfImage payload;
+    bool header_seen = false;
+    bool payload_found = find_payload_image(keys, candidate ? candidate->addr : 0, &payload, &header_seen);
+    uint64_t inferred_start = 0, inferred_end = 0;
+    if (payload_found) {
+        capture->layout = "mapped_elf_headers";
+        fprintf(stderr, "[ELF-IMAGE] capture static payload base=0x%" PRIx64
+                " entry=0x%" PRIx64 " loads=%zu\n", payload.lo, candidate->addr, payload.load_count);
+    } else if (!header_seen && find_headerless_payload(candidate, &inferred_start, &inferred_end)) {
+        capture->layout = "observed_stage_rx_r_rw";
+    } else {
+        capture->layout = "tracked_program_pages";
+    }
     if (!g_main_known)
         fprintf(stderr, "[WINDOW] UNKNOWN: dump retains observed non-library pages\n");
     g_static_binary = (lib_deps == NULL);
@@ -4396,7 +4999,12 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes) {
     for (GList *k = keys; k; k = k->next) {
         uint64_t address = (uint64_t)(uintptr_t)k->data;
         page_t *page = g_hash_table_lookup(pages, k->data);
-        if (!page || !page_is_program(address, page))
+        if (!page)
+            continue;
+        bool included = payload_found ? payload_contains_page(&payload, address) :
+                        inferred_end ? inferred_start <= address && address < inferred_end :
+                        page_is_program(address, page);
+        if (!included)
             continue;
         GByteArray *data = g_byte_array_new();
         const char *gap = NULL;
@@ -4488,7 +5096,7 @@ static void capture_candidate(oep_cand_t *candidate) {
     }
     capture->path = g_strdup_printf("%s.candidate-%" PRIu64, g_phase1.dump_path,
                                     candidate->candidate_id);
-    capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes));
+    capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes), candidate);
     if (capture->committed)
         g_candidate_capture_bytes += capture->bytes;
     char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
@@ -4516,6 +5124,7 @@ static void adopt_capture(ProgramCapture *capture) {
     g_capture_epoch = capture->epoch;
     g_capture_pc = capture->pc;
     g_capture_generation = capture->code_generation;
+    g_capture_layout = capture->layout;
 }
 
 static void do_dump_impl(uint64_t oep) {
@@ -4532,7 +5141,7 @@ static void do_dump_impl(uint64_t oep) {
     }
     if (!g_phase1.capture_at_entry) {
         ProgramCapture capture = {.path = g_strdup(g_phase1.dump_path)};
-        capture_image(&capture, g_phase1.max_dump_bytes);
+        capture_image(&capture, g_phase1.max_dump_bytes, NULL);
         adopt_capture(&capture);
         capture_clear(&capture);
         return;
@@ -4585,6 +5194,7 @@ static void write_report(void) {
             g_capture_gaps ? g_capture_gaps->str : "[]");
     fprintf(f_json,
             "  \"capture_method\":\"%s\",\n"
+            "  \"capture_layout\":\"%s\",\n"
             "  \"capture_candidate_id\":%" PRIu64 ",\n"
             "  \"candidate_capture_bytes\":%" PRIu64 ",\n"
             "  \"dse_check_enabled\":%s,\n"
@@ -4592,6 +5202,7 @@ static void write_report(void) {
             "  \"main_image_verified\":%s,\n"
             "  \"trace_capacity\":%u,\n",
             g_phase1.capture_at_entry ? "candidate_entry_before_instruction" : "finalization",
+            g_capture_layout,
             g_phase1.capture_at_entry && g_selected_candidate
                 ? g_selected_candidate->candidate_id : UINT64_C(0),
             g_candidate_capture_bytes, g_dse_check_enabled ? "true" : "false",
@@ -5243,6 +5854,7 @@ static void phase1_release_owned(void) {
         for (unsigned i = 0; i < 256; ++i)
             g_clear_pointer(&g_stage_memfd_files[file].store_pages[i], page_destroy);
     memset(g_stage_memfd_files, 0, sizeof(g_stage_memfd_files));
+    g_memfd_boundary = (DseMemfdBoundary){0};
 
     //fd
     g_clear_pointer(&pending_open_path, g_free);
@@ -5360,16 +5972,25 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     phase1_release_owned();
 }
 
-static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
+static page_t *stage_page_for_pc(uint64_t pc) {
+    uint64_t address = pc & ~((uint64_t)page_size - 1U);
+    return g_hash_table_lookup(pages, (gpointer)(uintptr_t)address);
+}
+
+static uint64_t stage_mapping_epoch_for_pc(uint64_t pc) {
+    const page_t *page = stage_page_for_pc(pc);
+    return page ? page->mapping_epoch : 0;
+}
+
+static bool insn_is_unpacked(uint64_t vaddr, size_t size, bool require_write) {
     for (size_t i = 0; i < size; i++) {
         uint64_t addr = vaddr + i;
-        uint64_t page_addr = addr & ~(page_size - 1);
-        page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
+        const page_t *page = stage_page_for_pc(addr);
 
         if (!page || !(page->prot & 0x4))
             continue;
 
-        if (page->dyn_exec)
+        if (page->dyn_exec && !require_write)
             return true;
 
         if (page->wbitmap) {
@@ -5379,6 +6000,63 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
         }
     }
     return false;
+}
+
+static const TraceEntry *stage_fallthrough_source(const page_t *page, uint64_t pc,
+                                                  uint32_t size, uint64_t seq, uint32_t vcpu) {
+    if (!is_i386 || !page || page->exec_seen || page->candidate_seen || seq < 2 ||
+        !stage_entry_covered(page, pc, size) || page->producer_write_seq >= seq ||
+        page->producer_write_generation != page->gen_written)
+        return NULL;
+    const TraceEntry *prior = trace_find_seq(g_trace, seq - 1, NULL);
+    if (!prior || prior->vcpu_index != vcpu || !prior->size ||
+        !guest_pc_equal(prior->pc + prior->size, pc))
+        return NULL;
+    const InsnDesc *desc = trace_insn_desc_get(g_trace, prior->insn_desc_id);
+    const InsnMeta *meta = meta_lookup_id(prior->meta_id);
+    if (!desc || desc->effects.branch_kind != TRACE_BRANCH_NONE || !meta ||
+        (meta->family == DTA_FAMILY_UNSUPPORTED && meta->insn_id != X86_INS_NOP) ||
+        insn_is_unpacked(prior->pc, prior->size, true))
+        return NULL;
+    return prior;
+}
+
+static void stage_note_call_return(uint64_t pc, uint64_t seq, uint32_t vcpu) {
+    oep_cand_t *candidate = g_active_candidate;
+    if (!candidate || !candidate->call_continuation || candidate->return_trace_seq ||
+        candidate->vcpu != vcpu || candidate->epoch != g_phase1.epoch ||
+        !cand_selection_eligible(candidate) || prev_jump_owner_id != candidate->candidate_id ||
+        !prev_mem_target_valid || !guest_pc_equal(pc, candidate->call_continuation))
+        return;
+    const TraceEntry *prior = trace_find_seq(g_trace, prev_jump_seq_id, NULL);
+    const InsnDesc *desc = prior ? trace_insn_desc_get(g_trace, prior->insn_desc_id) : NULL;
+    if (desc && desc->effects.branch_kind == TRACE_BRANCH_RETURN &&
+        stage_mapping_epoch_for_pc(pc) == candidate->caller_mapping_epoch)
+        candidate->return_trace_seq = seq;
+}
+
+/* A returned helper and a later direct jump from its caller page provide two
+ * observed entries into one mapping generation. */
+static oep_cand_t *stage_same_page_helper(const page_t *page, uint64_t pc,
+                                         uint32_t size, uint32_t vcpu) {
+    oep_cand_t *helper = g_active_candidate;
+    uint64_t page_mask = ~((uint64_t)page_size - 1U);
+    if (!is_i386 || !page || !helper || !helper->return_trace_seq ||
+        helper->return_trace_seq > prev_jump_seq_id || helper->vcpu != vcpu ||
+        helper->epoch != g_phase1.epoch || !cand_selection_eligible(helper) ||
+        helper->code_page != (pc & page_mask) || page->candidate_seq != helper->observed_seq ||
+        page->mapping_epoch != helper->mapping_epoch || page->gen_written != helper->code_generation ||
+        !stage_entry_covered(page, pc, size) || page->producer_write_seq >= helper->observed_seq ||
+        page->producer_write_generation != page->gen_written ||
+        (pc < helper->addr + helper->entry_size && helper->addr < pc + size) ||
+        (prev_jump_site & page_mask) != (helper->jump_site & page_mask) ||
+        stage_mapping_epoch_for_pc(prev_jump_site) != helper->caller_mapping_epoch)
+        return NULL;
+    const TraceEntry *prior = trace_find_seq(g_trace, prev_jump_seq_id, NULL);
+    if (!prior || prior->vcpu_index != vcpu || prior->pc != prev_jump_site ||
+        insn_is_unpacked(prior->pc, prior->size, true))
+        return NULL;
+    return helper;
 }
 
 static bool capture_sparse_auxiliary(void) {
@@ -5447,7 +6125,20 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         dse_aux_syscall_post_flags(previous_aux, current_eflags,
                                    current_eflags_valid && g_x86_flags_verified);
         dse_read_brk_state(previous_aux, true);
+        dse_read_tls_install(previous_aux, true);
+        dse_read_sigprocmask(previous_aux, true);
+        dse_read_sigaction(previous_aux, true);
+        if (previous_aux->gs_load.before_valid)
+            dse_read_gs_load(previous_aux, trace_find_seq(g_trace, previous_aux_seq_id, NULL), true);
+        if (previous_aux->xmm_after.slot)
+            dse_read_xmm_after(previous_aux);
         dse_aux_syscall_seal_order(g_aux, previous_aux);
+        if (g_ir_runtime.options.replay.observed_memfd_boundary && g_stage_syscall_ordinal <= 3 &&
+            previous_aux->syscall)
+            memfd_boundary_prepare(trace_find_seq(g_trace, previous_aux_seq_id, NULL), previous_aux);
+        if (g_ir_runtime.options.replay.observed_proc_exe_boundary && previous_aux->syscall &&
+            previous_aux->syscall->number == 5)
+            proc_executable_track_open(trace_find_seq(g_trace, previous_aux_seq_id, NULL), previous_aux);
         if (previous_aux->syscall && previous_aux->syscall->number == 45 &&
             !dse_aux_brk_issue(trace_find_seq(g_trace, previous_aux_seq_id, NULL), previous_aux)) {
             const DseSyscallObservation *brk = previous_aux->syscall;
@@ -5643,6 +6334,15 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 dse_aux_carry_x86_df(&aux, stored_entry, g_trace, previous_aux);
             if (g_ir_enabled && is_i386 && g_ir_runtime.options.replay.x86.tls32_ram)
                 dse_read_tls_snapshot(&aux);
+            dse_read_gs_load(&aux, stored_entry, false);
+            unsigned xmm;
+            const IrX86Options *x86 = &g_ir_runtime.options.replay.x86;
+            if (g_ir_enabled && is_i386 &&
+                ((x86->movq_xmm_memory &&
+                  ir_x86_movq_memory(stored_entry->instr_bytes, stored_entry->size, &xmm) == IR_X86_MOVQ_LOAD) ||
+                 (x86->sse2_dwords &&
+                  ir_x86_sse2_dword_form(stored_entry->instr_bytes, stored_entry->size, &xmm) != IR_X86_SSE2_DWORD_NONE)))
+                aux.xmm_after.slot = (uint8_t)(xmm + 1U);
             {
                 TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_AUX_RECORD);
                 for (int reg = 0; reg < REG_COUNT; reg++) {
@@ -5696,16 +6396,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         prev_mem_target_valid = false;
         prev_target_tainted = false;
         prev_jump_direct = false;
+        prev_call_or_jcc = NULL;
         prev_jump_owner_id = 0;
         return;
     }
     //detect mov to upacked code
-    bool now_unpacked = insn_is_unpacked(vaddr, meta->size);
-    page_t *cur_pg = NULL;
-    if (now_unpacked) {
-        uint64_t page_addr = vaddr & ~(page_size - 1);
-        cur_pg = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
-    }
+    bool now_unpacked = insn_is_unpacked(vaddr, meta->size, false);
+    page_t *cur_pg = now_unpacked ? stage_page_for_pc(vaddr) : NULL;
 
     bool prev_jump_matches = prev_jump_pending && prev_jump_seq_id &&
                              prev_jump_seq_id != UINT64_MAX &&
@@ -5713,12 +6410,43 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     if (prev_jump_matches && prev_mem_target_valid) {
         prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
     }
+    if (prev_jump_matches)
+        stage_note_call_return(vaddr, current_trace_seq_id, cpu_index);
 
     bool cleanup_entry = stage_cleanup_entry(exec_ctx, cur_pg, current_trace_seq_id,
                                               cpu_index, prev_jump_matches);
     bool new_layer = cleanup_entry || stage_is_new_entry(cur_pg, vaddr, meta->size,
                                         current_trace_seq_id, now_unpacked,
                                         prev_jump_matches);
+    /* A CALL/Jcc entry must overlap a guest write in the current mapping. */
+    if (new_layer && prev_call_or_jcc && !insn_is_unpacked(vaddr, meta->size, true))
+        new_layer = false;
+    oep_cand_t *parent = NULL;
+    if (new_layer && !cleanup_entry) {
+        if (prev_call_or_jcc) {
+            /* Resolve ownership only for an admitted entry. Instruction contexts
+             * are retained until the plugin releases its callbacks. */
+            oep_cand_t *owner = stage_owner_for_instruction(prev_call_or_jcc, prev_jump_seq_id,
+                                                            cpu_index);
+            prev_jump_owner_id = owner ? owner->candidate_id : 0;
+        }
+        parent = stage_candidate_parent(cur_pg, vaddr, meta->size, current_trace_seq_id, cpu_index);
+        /* A transfer within written code needs a producer edge to identify a
+         * new unpacking stage. This excludes calls within a restored image. */
+        if (prev_call_or_jcc && !parent &&
+            insn_is_unpacked(prev_call_or_jcc->pc, prev_call_or_jcc->size, true))
+            new_layer = false;
+    }
+    const TraceEntry *fallthrough = NULL;
+    oep_cand_t *returned_helper = NULL;
+    if (!new_layer && cur_pg) {
+        if (!prev_jump_matches)
+            fallthrough = stage_fallthrough_source(cur_pg, vaddr, meta->size,
+                                                   current_trace_seq_id, cpu_index);
+        else if (prev_jump_direct && !prev_call_or_jcc)
+            returned_helper = stage_same_page_helper(cur_pg, vaddr, meta->size, cpu_index);
+        new_layer = fallthrough || returned_helper;
+    }
     if (cur_pg)
         cur_pg->exec_seen = true;
 
@@ -5727,8 +6455,6 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         return;
     }
     if (new_layer) {
-        oep_cand_t *parent = cleanup_entry ? NULL :
-            stage_candidate_parent(cur_pg, vaddr, meta->size, current_trace_seq_id, cpu_index);
         oep_cand_t *candidate = g_new0(oep_cand_t, 1);
         candidate->addr = vaddr;
         candidate->has_prologue = cand_has_prologue(vaddr);
@@ -5758,8 +6484,13 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->epoch = g_phase1.epoch;
         candidate->vcpu = cpu_index;
         candidate->entry_size = meta->size;
-        candidate->transfer_seq = prev_jump_seq_id;
+        candidate->transfer_seq = prev_jump_matches ? prev_jump_seq_id : 0;
         candidate->code_page = vaddr & ~((uint64_t)page_size - 1U);
+        if (prev_call_or_jcc && prev_jump_matches && prev_call_or_jcc->meta->insn_id == X86_INS_CALL &&
+            !insn_is_unpacked(prev_call_or_jcc->pc, prev_call_or_jcc->size, true)) {
+            candidate->call_continuation = (uint32_t)(prev_call_or_jcc->pc + prev_call_or_jcc->size);
+            candidate->caller_mapping_epoch = stage_mapping_epoch_for_pc(candidate->jump_site);
+        }
         /* The bounded causal policy supports ordinary 4 KiB i386 pages. A
          * missing snapshot leaves producer ownership unknown; it never turns
          * a later observation into a semantic proof. */
@@ -5786,6 +6517,27 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
 
         phase1_candidate_event("oep_candidate_observed", candidate, false);
         capture_candidate(candidate);
+        if (fallthrough) {
+            char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
+                ",\"source_pc\":%" PRIu64 ",\"source_trace_seq\":%" PRIu64
+                ",\"write_trace_seq\":%" PRIu64 ",\"address\":%" PRIu64 "}",
+                candidate->candidate_id, fallthrough->pc, fallthrough->seq_id,
+                cur_pg->producer_write_seq, vaddr);
+            tf_phase1_event(&g_phase1, "oep_fallthrough_entry_observed", "observed", NULL, payload);
+            g_free(payload);
+        }
+        if (returned_helper) {
+            returned_helper->same_page_successor_id = candidate->candidate_id;
+            char *payload = g_strdup_printf("{\"helper_candidate_id\":%" PRIu64
+                ",\"candidate_id\":%" PRIu64 ",\"return_trace_seq\":%" PRIu64
+                ",\"transfer_trace_seq\":%" PRIu64 ",\"address\":%" PRIu64 "}",
+                returned_helper->candidate_id, candidate->candidate_id, returned_helper->return_trace_seq,
+                prev_jump_seq_id, vaddr);
+            tf_phase1_event(&g_phase1, "oep_same_page_reentry_observed", "observed", NULL, payload);
+            g_free(payload);
+            if (g_selected_candidate == returned_helper)
+                stage_retract_selection("observed_same_page_entry_after_return");
+        }
         if (!g_dse_check_enabled)
             candidate->dse.reason = DSE_REASON_DISABLED;
         if (g_dse_check_enabled && prev_jump_matches) {
@@ -5855,6 +6607,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     prev_mem_target_valid = false;
     prev_target_tainted = false;
     prev_jump_direct = false;
+    prev_call_or_jcc = NULL;
     prev_jump_owner_id = 0;
     //if we are too long in unpacked code without proceeding further - we end the cycle
     if (now_unpacked && !oep_found && g_last_cand_icount &&
@@ -5928,15 +6681,26 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
                 prev_mem_target_valid = false;
             }
         }
-    } else if (meta->insn_id == X86_INS_JMP && meta->direct_target_valid) {
-        oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id, cpu_index);
-        prev_jump_site = vaddr;
-        prev_jump_seq_id = current_trace_seq_id;
-        prev_jump_pending = true;
-        prev_mem_target_value = meta->direct_target;
-        prev_mem_target_valid = true;
-        prev_jump_direct = true;
-        prev_jump_owner_id = owner ? owner->candidate_id : 0;
+    } else if (meta->direct_target_valid) {
+        bool direct_jmp = meta->insn_id == X86_INS_JMP;
+        bool call_or_jcc = is_i386 && (meta->insn_id == X86_INS_CALL ||
+            (meta->is_conditional_branch &&
+             !guest_pc_equal(meta->direct_target, vaddr + meta->size)));
+        if (direct_jmp || call_or_jcc) {
+            prev_jump_site = vaddr;
+            prev_jump_seq_id = current_trace_seq_id;
+            prev_jump_pending = true;
+            prev_mem_target_value = meta->direct_target;
+            prev_mem_target_valid = true;
+            prev_jump_direct = true;
+            if (call_or_jcc) {
+                prev_call_or_jcc = exec_ctx;
+            } else {
+                oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id,
+                                                                cpu_index);
+                prev_jump_owner_id = owner ? owner->candidate_id : 0;
+            }
+        }
     }
     //got
     if (meta->is_indirect_branch && meta->branch_target_reg == REG_INVALID &&
@@ -6042,6 +6806,67 @@ static void apply_pending_fd_success(int64_t syscall_num, int64_t syscall_ret) {
     }
 }
 
+/* Linux-user forwards these descriptors to the host. Independently sample
+ * the input bytes without moving the file offset. The return callback must
+ * see the same file, the exact offset change and the same bytes in guest RAM. */
+static void stdio_observe_entry(DseSyscallObservation *s) {
+    bool reading = s->number == 3 && s->args[0] == STDIN_FILENO;
+    bool closing = s->number == 6 && s->args[0] == STDOUT_FILENO;
+    if (!reading && !closing)
+        return;
+    int saved_errno = errno;
+    int fd = (int)s->args[0];
+    struct stat st;
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0 && (flags & O_ACCMODE) == (reading ? O_RDONLY : O_WRONLY) &&
+        fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0) {
+        DseStdioObservation *io = &s->stdio;
+        io->device = (uint64_t)st.st_dev;
+        io->inode = (uint64_t)st.st_ino;
+        io->file_size = (uint64_t)st.st_size;
+        if (closing) {
+            io->before_valid = true;
+        } else {
+            off_t offset = lseek(fd, 0, SEEK_CUR);
+            uint32_t requested = s->args[2];
+            if (offset >= 0 && offset <= st.st_size && requested && requested <= INT32_MAX &&
+                s->args[1] && (uint64_t)s->args[1] + requested <= (UINT64_C(1) << 32)) {
+                uint64_t remaining = (uint64_t)(st.st_size - offset);
+                uint64_t length = remaining < requested ? remaining : requested;
+                if (length <= sizeof(io->bytes) &&
+                    (!length || pread(fd, io->bytes, length, offset) == (ssize_t)length)) {
+                    io->length = (uint32_t)length;
+                    io->offset = (uint64_t)offset;
+                    io->before_valid = true;
+                }
+            }
+        }
+    }
+    errno = saved_errno;
+}
+
+static void stdio_observe_return(DseSyscallObservation *s) {
+    DseStdioObservation *io = &s->stdio;
+    if (!io->before_valid || !s->returned || s->invalid)
+        return;
+    int saved_errno = errno;
+    int fd = (int)s->args[0];
+    if (s->number == 6) {
+        io->after_valid = s->result == 0 && fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+    } else if (s->result == io->length) {
+        struct stat st;
+        uint8_t reply[DSE_STDIO_MAX_BYTES];
+        off_t offset = lseek(fd, 0, SEEK_CUR);
+        io->after_valid = offset >= 0 && (uint64_t)offset == io->offset + io->length &&
+            fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+            (uint64_t)st.st_dev == io->device && (uint64_t)st.st_ino == io->inode &&
+            (uint64_t)st.st_size == io->file_size &&
+            (!io->length || (guest_read_bytes(s->args[1], reply, io->length) &&
+                             memcmp(io->bytes, reply, io->length) == 0));
+    }
+    errno = saved_errno;
+}
+
 static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1,
                               uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
                               uint64_t a7, uint64_t a8) {
@@ -6057,6 +6882,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         return;
     }
     ++g_stage_syscall_ordinal;
+    proc_executable_syscall(num, (uint32_t)a1);
     /* Read-only self-open and a tracked close do not modify guest code. A
      * narrow exact pathname check includes its NUL without over-reading. */
     bool safe_msync = stage_preserve_msync_owner(num, a1, a2, a3);
@@ -6124,6 +6950,14 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
                 state->syscall_seq_id = entry->seq_id;
                 if (num == 45)
                     dse_aux_syscall_brk_state(aux, state->brk_entry_words, state->brk_entry_valid, false);
+                if (num == 243)
+                    dse_read_tls_install(aux, false);
+                if (num == 175)
+                    dse_read_sigprocmask(aux, false);
+                if (num == 174)
+                    dse_read_sigaction(aux, false);
+                if (g_ir_runtime.options.replay.observed_stdio)
+                    stdio_observe_entry(aux->syscall);
                 if (num == 4) {
                     uint32_t size = (uint32_t)a3;
                     uint8_t *bytes = size && size <= DSE_SYSCALL_WRITE_BYTES ? g_try_malloc(size) : NULL;
@@ -6131,6 +6965,8 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
                         (uint64_t)(uint32_t)a2 + size <= (UINT64_C(1) << 32) &&
                         guest_read_bytes((uint32_t)a2, bytes, size));
                     (void)dse_aux_syscall_write(g_aux, aux, read ? bytes : NULL, size);
+                    if (g_ir_runtime.options.replay.observed_memfd_boundary)
+                        memfd_boundary_before_write(aux);
                     g_free(bytes);
                 }
                 if (num == 90) {
@@ -6140,7 +6976,9 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
                     (void)dse_aux_syscall_mmap_args(aux, read ? bytes : NULL,
                                                    read ? sizeof(bytes) : 0);
                 }
-                if ((num == 5 || num == 85) && g_ir_runtime.options.replay.observed_proc_exe) {
+                bool full_executable = g_ir_runtime.options.replay.observed_proc_exe;
+                if ((full_executable && (num == 5 || num == 85)) ||
+                    (num == 5 && g_ir_runtime.options.replay.observed_proc_exe_boundary)) {
                     uint8_t path[DSE_SYSCALL_PATH_BYTES];size_t size=0;
                     for (size_t i=0;i<sizeof(path);++i) {
                         uint64_t address=(uint64_t)(uint32_t)a1+i;
@@ -6526,6 +7364,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         g_pending_mmap.active = true;
         g_pending_mmap.syscall_num = num;
         g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
+        g_pending_mmap.stage_owner = stage_mapping_syscall_owner(vcpu_idx);
         g_pending_mmap.requested_addr = (uint32_t)a1;
         g_pending_mmap.size = (uint32_t)a2;
         g_pending_mmap.prot = (int)a3;
@@ -6541,6 +7380,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
             g_pending_mmap.active = true;
             g_pending_mmap.syscall_num = num;
             g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
+            g_pending_mmap.stage_owner = stage_mapping_syscall_owner(vcpu_idx);
             g_pending_mmap.requested_addr = args[0];
             g_pending_mmap.size = args[1];
             g_pending_mmap.prot = (int)args[2];
@@ -6557,6 +7397,10 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
         g_pending_mmap.active = true;
         g_pending_mmap.syscall_num = num;
         g_pending_mmap.syscall_ordinal = g_stage_syscall_ordinal;
+        if (num == 125) {
+            g_pending_mmap.stage_owner = stage_mapping_syscall_owner(vcpu_idx);
+            g_pending_mmap.trace_seq = g_phase1.trace_seq;
+        }
         g_pending_mmap.requested_addr = (uint32_t)a1;
         g_pending_mmap.size = (uint32_t)a2;
         g_pending_mmap.prot = (num == 91) ? 0 : (int)(uint32_t)a3;
@@ -6645,6 +7489,12 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
             } else if (aux && aux->syscall) {
                 aux->syscall->invalid = true;
             }
+            if (aux && aux->syscall && g_ir_runtime.options.replay.observed_stdio)
+                stdio_observe_return(aux->syscall);
+            if (aux && num == 192 && g_ir_runtime.options.replay.observed_proc_exe_boundary)
+                proc_executable_capture_mmap(aux);
+            if (aux && aux->syscall && num == 4 && g_ir_runtime.options.replay.observed_memfd_boundary)
+                memfd_boundary_after_write(aux->syscall);
             if (aux && aux->syscall && aux->syscall->file && (num==5 || num==85)) {
                 if (!proc_executable_current()) aux->syscall->file->source_valid=false;
                 if (num==85) {
@@ -6670,6 +7520,10 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
     stage_pending_mutable_return(num, ret);
     stage_pending_msync_return(num, ret);
     const bool syscall_failed = syscall_ret_is_error(ret);
+    /* The page table does not model i386 mremap. Only fresh mmap lifetimes
+     * can identify a separate payload after a successful remap. */
+    if (!syscall_failed && is_i386 && num == 163)
+        g_payload_mapping_floor = g_stage_syscall_ordinal;
     if (syscall_failed) {
         if (is_i386 && num == 6 && g_pending_fd.active &&
             g_pending_fd.kind == PENDING_FD_CLOSE) {

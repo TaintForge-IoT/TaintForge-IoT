@@ -105,10 +105,11 @@ static inline OepFixture of_fixture(unsigned kind) {
         seqs[count++] = of_emit(&f, pc, nop, 1, a, pc + 1);
         ++pc; out.target_address = 8;
     } else if (kind == OF_UNSUPPORTED) {
-        const uint8_t divide[] = {0xf7, 0xf1};
-        seqs[count++] = of_emit(&f, pc, divide, 2, a, pc + 2);
-        a.reg_vals[DTA_REG_RAX] = ~a.reg_vals[DTA_REG_RAX];
-        pc += 2; out.target_address = 0xfffffff7;
+        /* FNINIT resets the unmodeled x87 state and preserves EAX. */
+        const uint8_t fninit[] = {0xdb, 0xe3};
+        seqs[count++] = of_emit(&f, pc, fninit, sizeof(fninit), a, pc + sizeof(fninit));
+        pc += sizeof(fninit);
+        out.target_address = a.reg_vals[DTA_REG_RAX];
     } else if (kind == OF_SYSCALL) {
         const uint8_t call[] = {0xcd, 0x80};
         a.reg_vals[DTA_REG_RAX] = 5; a.reg_vals[DTA_REG_RBX] = 0x2000;

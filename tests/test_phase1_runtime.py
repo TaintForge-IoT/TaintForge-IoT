@@ -71,6 +71,15 @@ class Phase1RuntimeTests(unittest.TestCase):
         with self.assertRaises(Phase1RuntimeError):
             Phase1Run(self.runtime, "bad,id", "attempt", "analysis", self.root)
 
+    def test_observed_ir_options_require_explicit_values(self):
+        options = ("ir-observed-stdio=on", "ir-sse2-dwords=off")
+        argument = self.run.plugin_argument(extra=options)
+        self.assertTrue(set(options) <= set(argument.split(",")))
+        for ir, extras in ((False, options), (True, ("ir-observed-stdio=yes",)),
+                           (True, ("ir-observed-stdio=on", "ir-observed-stdio=off"))):
+            with self.subTest(ir=ir, extras=extras), self.assertRaises(Phase1RuntimeError):
+                self.run.plugin_argument(ir=ir, extra=extras)
+
     def test_event_reorder_identity_and_truncation(self):
         for change in ("reorder", "identity", "truncate", "no_finish"):
             with self.subTest(change=change):

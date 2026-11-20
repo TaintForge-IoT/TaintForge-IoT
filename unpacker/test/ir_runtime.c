@@ -406,6 +406,74 @@ bool ir_runtime_report_json(FILE *f, const IrRuntimeReport *p) {
         fputs("null", f);
     fprintf(f,",\"modeled_readlink\":%u,\"readlink_bytes\":%u,\"executable_snapshot_bytes\":%u,\"external_opens\":%u",
         p->build.modeled_readlink,p->build.readlink_bytes,p->build.executable_snapshot_bytes,p->build.files.external_opens);
+    fprintf(f, ",\"boundary_executable\":{\"open_seq\":%" PRIu64 ",\"mmap_seq\":%" PRIu64 ",\"fd\":%u}",
+            p->build.boundary_executable_open_seq, p->build.boundary_executable_mmap_seq,
+            p->build.boundary_executable_fd);
+    const DseMemfdBoundary *memfd = &p->build.boundary_memfd;
+    fprintf(f, ",\"boundary_memfd\":{\"create_seq\":%" PRIu64 ",\"resize_seq\":%" PRIu64
+            ",\"mmap_seq\":%" PRIu64 ",\"write_seq\":%" PRIu64 ",\"fd\":%u,\"size\":%u,\"address\":%u}",
+            memfd->create_seq, memfd->resize_seq, memfd->mmap_seq, memfd->write_seq,
+            memfd->fd, memfd->size, memfd->address);
+    fprintf(f, ",\"set_thread_area\":{\"modeled\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"user_desc\":%u,\"gdt_base\":%u,\"slot\":%u,\"base\":%u}",
+            p->build.modeled_set_thread_area, p->build.first_set_thread_area_seq,
+            p->build.tls_syscall_pc, p->build.tls_desc_address, p->build.tls_gdt_base,
+            p->build.tls_slot, p->build.tls_base);
+    const IrReplayMovGs *gs = &p->build.mov_gs;
+    fprintf(f, ",\"mov_gs\":{\"count\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"selector\":%u,\"base\":%u,\"address\":%u,"
+            "\"gdt_high_before\":%u,\"gdt_high_after\":%u,\"accessed_writes\":%u}",
+            gs->count, gs->first_seq, gs->pc, gs->selector, gs->base, gs->address,
+            gs->gdt_high_before, gs->gdt_high_after, gs->accessed_writes);
+    const IrReplaySetTidAddress *tid = &p->build.set_tid_address;
+    fprintf(f, ",\"set_tid_address\":{\"count\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"tid\":%u,\"first_address\":%u,\"last_address\":%u}",
+            tid->count, tid->first_seq, tid->pc, tid->tid, tid->first_address, tid->last_address);
+    const IrReplayMovq *movq = &p->build.movq;
+    fprintf(f, ",\"movq\":{\"loads\":%u,\"stores\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"xmm\":%u,\"low\":%" PRIu64 ",\"high\":%" PRIu64 ",\"bytes\":\"",
+            movq->loads, movq->stores, movq->first_seq, movq->first_pc, movq->xmm, movq->low, movq->high);
+    for (unsigned i = 0; i < movq->size; ++i)
+        fprintf(f, "%02x", movq->bytes[i]);
+    fputs("\"}", f);
+    const IrReplayLockOr32 *lock = &p->build.lock_or32;
+    fprintf(f, ",\"lock_or32\":{\"count\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"address\":%u,\"before\":%u,\"after\":%u,\"eflags_after\":%u"
+            ",\"immediate_count\":%u,\"first_immediate_seq\":%" PRIu64
+            ",\"first_immediate_pc\":%u,\"bytes\":\"",
+            lock->count, lock->first_seq, lock->pc, lock->address, lock->before, lock->after,
+            lock->eflags_after, lock->immediate_count, lock->first_immediate_seq, lock->first_immediate_pc);
+    for (unsigned i = 0; i < lock->size; ++i)
+        fprintf(f, "%02x", lock->bytes[i]);
+    fputs("\"}", f);
+    const IrReplaySigprocmask *sigmask = &p->build.sigprocmask;
+    fprintf(f, ",\"rt_sigprocmask\":{\"count\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"address\":%u,\"requested\":%" PRIu64
+            ",\"before\":%" PRIu64 ",\"after\":%" PRIu64 "}",
+            sigmask->count, sigmask->first_seq, sigmask->pc, sigmask->address, sigmask->requested,
+            sigmask->before, sigmask->after);
+    const IrReplaySigaction *sigaction = &p->build.sigaction;
+    fprintf(f, ",\"rt_sigaction\":{\"count\":%u,\"first_seq\":%" PRIu64
+            ",\"pc\":%u,\"address\":%u,\"signal\":%u,\"thread_mask\":%" PRIu64
+            ",\"last_handler\":%u,\"before\":[",
+            sigaction->count, sigaction->first_seq, sigaction->pc, sigaction->address,
+            sigaction->signal, sigaction->thread_mask, sigaction->last_handler);
+    for (unsigned i = 0; i < DSE_SIGACTION_WORDS; ++i)
+        fprintf(f, "%s%u", i ? "," : "", sigaction->before[i]);
+    fputs("],\"after\":[", f);
+    for (unsigned i = 0; i < DSE_SIGACTION_WORDS; ++i)
+        fprintf(f, "%s%u", i ? "," : "", sigaction->after[i]);
+    fputs("]}", f);
+    const IrReplayStdio *io = &p->build.stdio;
+    fprintf(f, ",\"stdio\":{\"read_count\":%u,\"read_seq\":%" PRIu64 ",\"read_pc\":%u,"
+            "\"read_address\":%u,\"read_requested\":%u,\"read_returned\":%u,\"read_bytes\":%" PRIu64
+            ",\"close_seq\":%" PRIu64 ",\"close_pc\":%u}",
+            io->read_count, io->read_seq, io->read_pc, io->read_address, io->read_requested,
+            io->read_returned, io->read_bytes, io->close_seq, io->close_pc);
+    const IrReplaySse2Dwords *dwords = &p->build.sse2_dwords;
+    fprintf(f, ",\"sse2_dwords\":{\"first_seq\":%" PRIu64 ",\"first_pc\":%u,"
+            "\"movd_count\":%u,\"punpckldq_count\":%u}",
+            dwords->first_seq, dwords->first_pc, dwords->movd_count, dwords->punpckldq_count);
     const IrEnvironmentStats *files=&p->build.files;
     fprintf(f,",\"files\":{\"created\":%u,\"live\":%u,\"descriptors\":%u,\"resizes\":%u,"
               "\"closes\":%u,\"mappings\":%u,\"mappings_live\":%u,\"replacements\":%u,"
@@ -441,6 +509,7 @@ bool ir_runtime_report_json(FILE *f, const IrRuntimeReport *p) {
         "\"unknown_observations\":%u,\"skipped_undefined\":%u,\"candidate_status\":\"%s\","
         "\"candidate_actual\":%" PRIu64 ",\"candidate_known_mask\":%" PRIu64 ","
         "\"eval_status\":%u,\"eval_status_name\":\"%s\",\"eval_reasons\":%u,\"eval_steps\":%" PRIu64
+        ",\"eval_stop_seq\":%" PRIu64
         ",\"memory_queries\":%" PRIu64 ","
         "\"ir_instructions\":%u,\"ir_values\":%u,\"ir_blocks\":%u,\"observations\":%u,"
         "\"capture_bytes\":%zu,\"replay_allocated_bytes\":%zu,\"evaluator_allocated_bytes\":%zu,"
@@ -451,7 +520,8 @@ bool ir_runtime_report_json(FILE *f, const IrRuntimeReport *p) {
         ir_runtime_status_name(p->check.candidate_status), p->check.candidate_actual.value,
         p->check.candidate_actual.known_mask, p->check.execution.status,
         p->check_attempted ? eval_name(p->check.execution.status) : "not_run",
-        p->check.execution.reasons, p->check.execution.steps, p->check.execution.memory_queries,
+        p->check.execution.reasons, p->check.execution.steps, p->check.execution.origin.seq_id,
+        p->check.execution.memory_queries,
         p->ir_instructions, p->ir_values, p->ir_blocks, p->observations, p->capture_bytes,
         p->replay_bytes, p->check.evaluator_bytes, p->capture_us, p->build_us, p->check_us,
         p->total_us);
@@ -498,7 +568,11 @@ bool ir_runtime_summary_json(FILE *f, const IrRuntime *r) {
         ","
         "\"lifted_steps\":%" PRIu64 ",\"total_us\":%" PRIu64 ",\"peak_capture_bytes\":%zu,"
         "\"peak_replay_allocated_bytes\":%zu,\"peak_evaluator_allocated_bytes\":%zu,"
-        "\"window_limit\":%u,\"check_limit\":%u,\"capture_limit_bytes\":%zu,\"flat32_ram\":%s,\"tls32_ram\":%s,\"observed_munmap\":%s,\"observed_mprotect\":%s,\"observed_files\":%s}\n",
+        "\"window_limit\":%u,\"check_limit\":%u,\"capture_limit_bytes\":%zu,\"flat32_ram\":%s,\"tls32_ram\":%s,\"observed_munmap\":%s,\"observed_mprotect\":%s,\"observed_files\":%s,"
+        "\"observed_proc_exe_boundary\":%s,\"observed_memfd_boundary\":%s,"
+        "\"observed_set_thread_area\":%s,\"observed_mov_gs\":%s,"
+        "\"observed_set_tid_address\":%s,\"xmm_movq\":%s,\"lock_or32\":%s,"
+        "\"observed_sigprocmask\":%s,\"observed_sigaction\":%s,\"observed_stdio\":%s,\"sse2_dwords\":%s}\n",
         r->checks, r->matches, r->mismatches, r->unknown, r->errors, r->skipped_budget,
         r->selected_steps, r->lifted_steps, r->total_us, r->peak_capture_bytes,
         r->peak_replay_bytes, r->peak_evaluator_bytes, r->options.window_steps,
@@ -507,6 +581,17 @@ bool ir_runtime_summary_json(FILE *f, const IrRuntime *r) {
         r->options.replay.x86.tls32_ram ? "true" : "false",
         r->options.replay.observed_munmap ? "true" : "false",
         r->options.replay.observed_mprotect ? "true" : "false",
-        r->options.replay.observed_files ? "true" : "false");
+        r->options.replay.observed_files ? "true" : "false",
+        r->options.replay.observed_proc_exe_boundary ? "true" : "false",
+        r->options.replay.observed_memfd_boundary ? "true" : "false",
+        r->options.replay.observed_set_thread_area ? "true" : "false",
+        r->options.replay.observed_mov_gs ? "true" : "false",
+        r->options.replay.observed_set_tid_address ? "true" : "false",
+        r->options.replay.x86.movq_xmm_memory ? "true" : "false",
+        r->options.replay.x86.lock_or32 ? "true" : "false",
+        r->options.replay.observed_sigprocmask ? "true" : "false",
+        r->options.replay.observed_sigaction ? "true" : "false",
+        r->options.replay.observed_stdio ? "true" : "false",
+        r->options.replay.x86.sse2_dwords ? "true" : "false");
     return !ferror(f);
 }

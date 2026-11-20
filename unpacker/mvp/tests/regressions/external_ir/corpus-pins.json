@@ -1,0 +1,91 @@
+{
+  "cases": [
+    {
+      "case": {
+        "argv": [
+          "-d"
+        ],
+        "files": {},
+        "id": "decompress-00",
+        "output_files": [],
+        "stdin_base64": "H4sIAAAAAAAC/wMAAAAAAAAAAAA="
+      },
+      "m22_capture_seq": 2448549,
+      "m22_case_returncode": 0,
+      "m22_case_stdout_bytes": 0,
+      "m22_case_stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "m22_entry": 134517783,
+      "original": {
+        "bytes": 128768,
+        "path": "corpus/minigzip/original.elf",
+        "sha256": "b1cea452cff66d150441914b66d302215ce3874796ef0502b019e5e29d6565ea"
+      },
+      "packed": {
+        "bytes": 68488,
+        "path": "corpus/minigzip/packed.upx",
+        "sha256": "32be85c9599e141d4ca3c417d927330080eebdc1657ecd229db1d4476eeb5414"
+      },
+      "packing": "default",
+      "program": "minigzip"
+    },
+    {
+      "case": {
+        "argv": [
+          "-c"
+        ],
+        "files": {},
+        "id": "compress-00",
+        "output_files": [],
+        "stdin_base64": ""
+      },
+      "m22_capture_seq": 2746027,
+      "m22_case_returncode": 0,
+      "m22_case_stdout_bytes": 14,
+      "m22_case_stdout_sha256": "d3dda84eb03b9738d118eb2be78e246106900493c0ae07819ad60815134a8058",
+      "m22_entry": 134519617,
+      "original": {
+        "bytes": 143884,
+        "path": "corpus/bzip2/original.elf",
+        "sha256": "049045e48f11abcec8111819bde95fbd0f6d3eca1d7c0c8e978586f6411c4075"
+      },
+      "packed": {
+        "bytes": 68116,
+        "path": "corpus/bzip2/packed.upx",
+        "sha256": "5d2336891df75dc8f4b69b23fc532e508db7736d6ea94598ef22e647fb8814de"
+      },
+      "packing": "default",
+      "program": "bzip2"
+    },
+    {
+      "case": {
+        "argv": [
+          "-e",
+          "print(17*19+3)"
+        ],
+        "files": {},
+        "id": "script-00",
+        "output_files": [],
+        "stdin_base64": ""
+      },
+      "m22_capture_seq": 7022734,
+      "m22_case_returncode": 0,
+      "m22_case_stdout_bytes": 4,
+      "m22_case_stdout_sha256": "053d13be01c62c12cf00285bd279d058f6bd8c3307b6937f55f1729b513ddf92",
+      "m22_entry": 134517145,
+      "original": {
+        "bytes": 349600,
+        "path": "corpus/lua/original.elf",
+        "sha256": "6f3a56b9e59f2c25791591ca89c84ba3f4f346ab4586d293db6adc89fbc53fbd"
+      },
+      "packed": {
+        "bytes": 178512,
+        "path": "corpus/lua/packed.upx",
+        "sha256": "18bcc70bcb08e77091b8643603f6948422f696af7a2b1804334ee13a394f30bc"
+      },
+      "packing": "default",
+      "program": "lua"
+    }
+  ],
+  "schema": 1,
+  "source_m22_evidence_sha256": "a6bfe9fee7aec731cc34f0aef72ba77e3d5cff4db2de973406aabe9b0d6288de"
+}

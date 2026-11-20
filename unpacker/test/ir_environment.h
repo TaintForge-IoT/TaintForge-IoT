@@ -30,6 +30,7 @@ const char *ir_environment_issue(const IrEnvironment *environment);
 bool ir_environment_budget(const IrEnvironment *environment);
 size_t ir_environment_bytes(const IrEnvironment *environment);
 bool ir_environment_has_files(const IrEnvironment *environment);
+bool ir_environment_file_present(IrEnvironment *environment, uint32_t fd);
 bool ir_environment_has_state(const IrEnvironment *environment);
 bool ir_environment_mapped(const IrEnvironment *environment, uint32_t address);
 /* First accepted event establishes the boundary; subsequent syscall boundaries

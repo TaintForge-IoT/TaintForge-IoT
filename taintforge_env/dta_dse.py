@@ -92,8 +92,10 @@ def _map_occurrence(request, native, parsed, *, candidate=False):
 
 def _same_prefix(observed, solved):
     def route(report):
+        start = report['trace'][0]['instruction']['seq']
         return [(row['instruction']['pc'], row['instruction']['bytes'], row['instruction']['vcpu'],
-                 row['next_pc'], row['branch_outcome']) for row in report['trace']]
+                 row['next_pc'], row['branch_outcome'], row['instruction']['seq'] - start)
+                for row in report['trace']]
     def calls(report):
         ordinal = {row['instruction']['seq']: index for index, row in enumerate(report['trace'])}
         return [(ordinal[row['seq']], row['number'], row['args'], row['result']) for row in report['syscalls']]

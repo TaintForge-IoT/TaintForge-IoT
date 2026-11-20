@@ -127,6 +127,7 @@ size_t ir_environment_bytes(const IrEnvironment *e) {
     return e?sizeof(*e)+(size_t)e->stats.live_content_cells*(sizeof(void*)*4U):0;
 }
 bool ir_environment_has_files(const IrEnvironment *e) { return e && e->stats.files_live; }
+bool ir_environment_file_present(IrEnvironment *e, uint32_t fd) { return e && by_fd(e, fd); }
 bool ir_environment_has_state(const IrEnvironment *e) {
     return e && (e->stats.files_live || e->stats.mappings_live || e->stats.brk_initialized);
 }
@@ -214,7 +215,7 @@ bool ir_environment_close(IrEnvironment *e,uint32_t fd) {
 }
 bool ir_environment_map(IrEnvironment *e,IrBlockId b,IrOrigin o,uint32_t fd,uint32_t base,
                          uint32_t length,uint32_t offset,uint32_t flags,uint32_t permissions) {
-    bool anonymous=flags==0x32, fixed=(flags&0x10U)!=0;
+    bool anonymous=flags==0x22 || flags==0x32, fixed=(flags&0x10U)!=0;
     File *f=anonymous?NULL:by_fd(e,fd);
     if(!anonymous && !f) return reject(e,"mmap_file_object_missing",false);
     unsigned kind=flags&3U;
@@ -223,7 +224,7 @@ bool ir_environment_map(IrEnvironment *e,IrBlockId b,IrOrigin o,uint32_t fd,uint
     uint64_t end=(uint64_t)base+(((uint64_t)length+4095U)&~UINT64_C(4095));
     if(!length || (base&4095U) || (offset&4095U) || end>(UINT64_C(1)<<32) ||
        (f && (uint64_t)offset+length>f->size) ||
-       (flags!=1 && flags!=2 && flags!=0x11 && flags!=0x12 && flags!=0x32) ||
+       (flags!=1 && flags!=2 && flags!=0x11 && flags!=0x12 && !anonymous) ||
        (anonymous && (offset || fd!=UINT32_MAX)) ||
        (permissions&~7U) || (permissions && !(permissions&1U)))
         return reject(e,"mmap_file_range_or_flags",false);

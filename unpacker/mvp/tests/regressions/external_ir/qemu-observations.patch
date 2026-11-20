@@ -1,0 +1,337 @@
+diff --git a/accel/tcg/atomic_template.h b/accel/tcg/atomic_template.h
+index f7924078f77d42edb4b491787969715e717e0989..5b96e3898c2a25bd98fad9450e4e0edc159fefd0 100644
+--- a/accel/tcg/atomic_template.h
++++ b/accel/tcg/atomic_template.h
+@@ -178,11 +178,29 @@ GEN_ATOMIC_HELPER(fetch_or)
+ GEN_ATOMIC_HELPER(fetch_xor)
+ GEN_ATOMIC_HELPER(add_fetch)
+ GEN_ATOMIC_HELPER(and_fetch)
++#if DATA_SIZE != 4
+ GEN_ATOMIC_HELPER(or_fetch)
++#endif
+ GEN_ATOMIC_HELPER(xor_fetch)
+
+ #undef GEN_ATOMIC_HELPER
+
++#if DATA_SIZE == 4
++ABI_TYPE ATOMIC_NAME(or_fetch)(CPUArchState *env, vaddr addr, ABI_TYPE val,
++                               MemOpIdx oi, uintptr_t retaddr)
++{
++    DATA_TYPE *haddr = atomic_mmu_lookup(env_cpu(env), addr, oi,
++                                         DATA_SIZE, retaddr);
++    /* Both callback values must come from this single atomic update. */
++    DATA_TYPE old = qatomic_fetch_or(haddr, val);
++    DATA_TYPE new = old | val;
++
++    ATOMIC_MMU_CLEANUP;
++    atomic_trace_rmw_post(env, addr, old, 0, new, 0, oi);
++    return new;
++}
++#endif
++
+ /*
+  * These helpers are, as a whole, full barriers.  Within the helper,
+  * the leading barrier is explicit and the trailing barrier is within
+@@ -337,11 +355,28 @@ GEN_ATOMIC_HELPER(fetch_and)
+ GEN_ATOMIC_HELPER(fetch_or)
+ GEN_ATOMIC_HELPER(fetch_xor)
+ GEN_ATOMIC_HELPER(and_fetch)
++#if DATA_SIZE != 4
+ GEN_ATOMIC_HELPER(or_fetch)
++#endif
+ GEN_ATOMIC_HELPER(xor_fetch)
+
+ #undef GEN_ATOMIC_HELPER
+
++#if DATA_SIZE == 4
++ABI_TYPE ATOMIC_NAME(or_fetch)(CPUArchState *env, vaddr addr, ABI_TYPE val,
++                               MemOpIdx oi, uintptr_t retaddr)
++{
++    DATA_TYPE *haddr = atomic_mmu_lookup(env_cpu(env), addr, oi,
++                                         DATA_SIZE, retaddr);
++    DATA_TYPE old = BSWAP(qatomic_fetch_or(haddr, BSWAP(val)));
++    DATA_TYPE new = old | val;
++
++    ATOMIC_MMU_CLEANUP;
++    atomic_trace_rmw_post(env, addr, old, 0, new, 0, oi);
++    return new;
++}
++#endif
++
+ /* These helpers are, as a whole, full barriers.  Within the helper,
+  * the leading barrier is explicit and the trailing barrier is within
+  * cmpxchg primitive.
+diff --git a/gdbstub/gdb-xml/i386-32bit-linux.xml b/gdbstub/gdb-xml/i386-32bit-linux.xml
+index 5ffe5616e631e64da0f8c4597a19097eb50ca6c4..95350c7e56ee30d0b729401bfb6c556c317a87cc 100644
+--- a/gdbstub/gdb-xml/i386-32bit-linux.xml
++++ b/gdbstub/gdb-xml/i386-32bit-linux.xml
+@@ -8,4 +8,9 @@
+ <!DOCTYPE feature SYSTEM "gdb-target.dtd">
+ <feature name="org.gnu.gdb.i386.linux">
+   <reg name="orig_eax" bitsize="32" type="int"/>
++  <reg name="tf_brk_state_v1" bitsize="128" type="uint128" save-restore="no"/>
++  <reg name="tf_i386_tls_gdt_v1" bitsize="32" type="int32" save-restore="no"/>
++  <reg name="tf_i386_sigmask_v1" bitsize="128" type="uint128" save-restore="no"/>
++  <vector id="tf_sigint_action_words" type="uint32" count="8"/>
++  <reg name="tf_i386_sigint_action_v1" bitsize="256" type="tf_sigint_action_words" save-restore="no"/>
+ </feature>
+diff --git a/linux-user/qemu.h b/linux-user/qemu.h
+index 7f98fb26072637305b97519fb44a9d40b3ce648e..9bc2466d797a78c0aafcae017b5c89767126b90f 100644
+--- a/linux-user/qemu.h
++++ b/linux-user/qemu.h
+@@ -172,6 +172,7 @@ struct TaskState {
+ };
+
+ abi_long do_brk(abi_ulong new_brk);
++bool target_brk_snapshot(abi_ulong *initial, abi_ulong *current);
+ int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *pathname,
+                     int flags, mode_t mode, bool safe);
+ ssize_t do_guest_readlink(const char *pathname, char *buf, size_t bufsiz);
+diff --git a/linux-user/signal-common.h b/linux-user/signal-common.h
+index 8a44714251add2f00fcefbbf901d60d7a81c116f..929210fd85cd90911fd83d8fe12a5875b2f5795d 100644
+--- a/linux-user/signal-common.h
++++ b/linux-user/signal-common.h
+@@ -22,6 +22,10 @@
+
+ #include "special-errno.h"
+
++#if defined(TARGET_I386) && !defined(TARGET_X86_64)
++void target_sigint_action_snapshot(uint32_t words[5]);
++#endif
++
+ /* Fallback addresses into sigtramp page. */
+ extern abi_ulong default_sigreturn;
+ extern abi_ulong default_rt_sigreturn;
+diff --git a/linux-user/signal.c b/linux-user/signal.c
+index f0a22577e505a3f233dffd7fd107a3621ddf6b7b..61176bac5a0b1647eba53ab4e3b073b645386449 100644
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -44,6 +44,19 @@ QEMU_BUILD_BUG_ON(sizeof(target_siginfo_t) > MAX_SIGINFO_LENGTH);
+
+ static struct target_sigaction sigact_table[TARGET_NSIG];
+
++#if defined(TARGET_I386) && !defined(TARGET_X86_64)
++void target_sigint_action_snapshot(uint32_t words[5])
++{
++    const struct target_sigaction *act = &sigact_table[TARGET_SIGINT - 1];
++
++    words[0] = act->_sa_handler;
++    words[1] = act->sa_flags;
++    words[2] = act->sa_restorer;
++    words[3] = tswapal(act->sa_mask.sig[0]);
++    words[4] = tswapal(act->sa_mask.sig[1]);
++}
++#endif
++
+ static void host_signal_handler(int host_signum, siginfo_t *info,
+                                 void *puc);
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 09997fb45f2aecd30a7f51618f09344fbc09ef5b..e2c4a92b54112ffe1b459fd415ad1551be3642e2 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -852,11 +852,20 @@ static inline int host_to_target_sock_type(int host_type)
+ }
+
+ static abi_ulong target_brk, initial_target_brk;
++static bool brk_state_unverified;
++
++bool target_brk_snapshot(abi_ulong *initial, abi_ulong *current)
++{
++    *initial = initial_target_brk;
++    *current = qatomic_read(&target_brk);
++    return !qatomic_read(&brk_state_unverified);
++}
+
+ void target_set_brk(abi_ulong new_brk)
+ {
+-    target_brk = TARGET_PAGE_ALIGN(new_brk);
+-    initial_target_brk = target_brk;
++    initial_target_brk = TARGET_PAGE_ALIGN(new_brk);
++    qatomic_set(&target_brk, initial_target_brk);
++    qatomic_set(&brk_state_unverified, false);
+ }
+
+ /* do_brk() must return target values and target errnos. */
+@@ -870,24 +879,34 @@ abi_long do_brk(abi_ulong brk_val)
+
+     /* do not allow to shrink below initial brk value */
+     if (brk_val < initial_target_brk) {
+-        return target_brk;
++        return qatomic_read(&target_brk);
+     }
+
+     new_brk = TARGET_PAGE_ALIGN(brk_val);
+-    old_brk = TARGET_PAGE_ALIGN(target_brk);
++    old_brk = TARGET_PAGE_ALIGN(qatomic_read(&target_brk));
++
++    /*
++     * Replay cannot infer a mapping transition from a wrapped break.
++     * Keep the guest result and invalidate the observation.
++     */
++    if (new_brk < brk_val) {
++        qatomic_set(&brk_state_unverified, true);
++    }
+
+     /* new and old target_brk might be on the same page */
+     if (new_brk == old_brk) {
+-        target_brk = brk_val;
+-        return target_brk;
++        qatomic_set(&target_brk, brk_val);
++        return qatomic_read(&target_brk);
+     }
+
+     /* Release heap if necessary */
+     if (new_brk < old_brk) {
+-        target_munmap(new_brk, old_brk - new_brk);
++        if (target_munmap(new_brk, old_brk - new_brk) != 0) {
++            qatomic_set(&brk_state_unverified, true);
++        }
+
+-        target_brk = brk_val;
+-        return target_brk;
++        qatomic_set(&target_brk, brk_val);
++        return qatomic_read(&target_brk);
+     }
+
+     mapped_addr = target_mmap(old_brk, new_brk - old_brk,
+@@ -896,8 +915,8 @@ abi_long do_brk(abi_ulong brk_val)
+                               -1, 0);
+
+     if (mapped_addr == old_brk) {
+-        target_brk = brk_val;
+-        return target_brk;
++        qatomic_set(&target_brk, brk_val);
++        return qatomic_read(&target_brk);
+     }
+
+ #if defined(TARGET_ALPHA)
+@@ -906,7 +925,7 @@ abi_long do_brk(abi_ulong brk_val)
+     return -TARGET_ENOMEM;
+ #endif
+     /* For everything else, return the previous break. */
+-    return target_brk;
++    return qatomic_read(&target_brk);
+ }
+
+ #if defined(TARGET_NR_select) || defined(TARGET_NR__newselect) || \
+diff --git a/plugins/api.c b/plugins/api.c
+index 0c348a789b2ecde4f845a2baa0e1f2ee09b40dfd..98f7ac9536f4beb42a6de92e96bac6819a60d600 100644
+--- a/plugins/api.c
++++ b/plugins/api.c
+@@ -440,6 +440,9 @@ static GArray *create_register_handles(GArray *gdbstub_regs)
+             || g_strcmp0(desc.name, pswa_str) == 0
+             || g_strcmp0(desc.name, iaoq_str) == 0
+             || g_strcmp0(desc.name, rpc_str) == 0
++            || g_strcmp0(desc.name, "tf_brk_state_v1") == 0
++            || g_strcmp0(desc.name, "tf_i386_sigmask_v1") == 0
++            || g_strcmp0(desc.name, "tf_i386_sigint_action_v1") == 0
+            ) {
+             desc.is_readonly = true;
+             plugin_ro_bit = 1;
+diff --git a/target/i386/gdbstub.c b/target/i386/gdbstub.c
+index e636ca0f4ae702f394c44944d870e11a088acce0..2c13b7e15a209eff286f07e48bf76ae1524b0050 100644
+--- a/target/i386/gdbstub.c
++++ b/target/i386/gdbstub.c
+@@ -24,6 +24,8 @@
+ #include "gdbstub/helpers.h"
+ #ifdef CONFIG_LINUX_USER
+ #include "linux-user/qemu.h"
++#include "linux-user/user-internals.h"
++#include "linux-user/signal-common.h"
+ #endif
+
+ #ifdef TARGET_X86_64
+@@ -412,6 +414,33 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
+ #ifdef CONFIG_LINUX_USER
+
+ #define IDX_ORIG_AX 0
++#define IDX_TF_BRK_STATE 1
++#define IDX_TF_TLS_GDT 2
++#define IDX_TF_SIGMASK 3
++#define IDX_TF_SIGINT_ACTION 4
++
++#ifndef TARGET_X86_64
++static bool x86_sigmask_no_pending(const TaskState *ts)
++{
++    sigset_t pending;
++
++    if (ts->in_sigsuspend || qatomic_read(&ts->signal_pending) ||
++        qatomic_read(&ts->sync_signal.pending) || sigpending(&pending)) {
++        return false;
++    }
++    for (int sig = 1; sig < _NSIG; ++sig) {
++        if (sigismember(&pending, sig) == 1) {
++            return false;
++        }
++    }
++    for (int i = 0; i < TARGET_NSIG; ++i) {
++        if (qatomic_read(&ts->sigtab[i].pending)) {
++            return false;
++        }
++    }
++    return !qatomic_read(&ts->signal_pending);
++}
++#endif
+
+ static int x86_cpu_gdb_read_linux_register(CPUState *cs, GByteArray *mem_buf,
+                                            int n)
+@@ -422,6 +451,58 @@ static int x86_cpu_gdb_read_linux_register(CPUState *cs, GByteArray *mem_buf,
+     switch (n) {
+     case IDX_ORIG_AX:
+         return gdb_get_reg(env, mem_buf, get_task_state(cs)->orig_ax);
++#ifndef TARGET_X86_64
++    case IDX_TF_BRK_STATE: {
++        abi_ulong initial, current;
++        bool valid = target_brk_snapshot(&initial, &current);
++        uint32_t words[] = {valid ? 0x42520101 : 0, initial, current, 0};
++        int bytes = 0;
++
++        for (unsigned i = 0; i < ARRAY_SIZE(words); ++i) {
++            bytes += gdb_get_reg32(mem_buf, words[i]);
++        }
++        return bytes;
++    }
++    case IDX_TF_TLS_GDT:
++        /* Linux-user places the i386 GDT in ordinary guest RAM. */
++        return gdb_get_reg32(mem_buf,
++            env->gdt.limit == TARGET_GDT_ENTRIES * sizeof(uint64_t) - 1 ?
++            env->gdt.base : 0);
++    case IDX_TF_SIGMASK: {
++        TaskState *ts = get_task_state(cs);
++        target_sigset_t mask = { 0 };
++        bool available = ts && cs == thread_cpu;
++        uint32_t words[4] = { 0 };
++        int bytes = 0;
++
++        if (available) {
++            /* Use the guest's requested mask, not the host thread mask. */
++            host_to_target_sigset_internal(&mask, &ts->signal_mask);
++            words[0] = 0x534d0101;
++            words[1] = x86_sigmask_no_pending(ts);
++            words[2] = mask.sig[0];
++            words[3] = mask.sig[1];
++        }
++        for (unsigned i = 0; i < ARRAY_SIZE(words); ++i) {
++            bytes += gdb_get_reg32(mem_buf, words[i]);
++        }
++        return bytes;
++    }
++    case IDX_TF_SIGINT_ACTION: {
++        uint32_t words[8] = { 0 };
++        int bytes = 0;
++
++        if (get_task_state(cs) && cs == thread_cpu) {
++            words[0] = 0x53410101;
++            words[1] = TARGET_SIGINT;
++            target_sigint_action_snapshot(&words[2]);
++        }
++        for (unsigned i = 0; i < ARRAY_SIZE(words); ++i) {
++            bytes += gdb_get_reg32(mem_buf, words[i]);
++        }
++        return bytes;
++    }
++#endif
+     }
+     return 0;
+ }

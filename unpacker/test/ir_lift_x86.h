@@ -18,6 +18,8 @@
 #define IR_X86_MEMORY_KEY UINT64_C(0x300)
 #define IR_X86_TLS_COUNT 2U /* FS, GS */
 #define IR_X86_TLS_KEY_BASE UINT64_C(0x500)
+#define IR_X86_XMM_COUNT 8U
+#define IR_X86_XMM_KEY_BASE UINT64_C(0x600)
 #define IR_X86_REPEAT_API 1
 #define IR_X86_MAX_UNMAPPED_RANGES 16U
 #define IR_X86_MAX_PROTECTED_RANGES 16U
@@ -34,6 +36,7 @@ typedef struct {
     IrStateId flags[IR_X86_FLAG_COUNT];
     IrStateId memory;
     IrStateId tls_base[IR_X86_TLS_COUNT];
+    IrStateId xmm[IR_X86_XMM_COUNT][2]; /* Low and high qwords. */
 } IrX86State;
 
 typedef struct {
@@ -46,7 +49,29 @@ typedef struct {
      * segments with 4 GiB limits. Bases come from separate BV32 state.
      * Requires flat32_ram; does not model descriptor changes or faults. */
     bool tls32_ram;
+    bool movq_xmm_memory;
+    /* Legacy SSE2 MOVD to XMM and register-to-register PUNPCKLDQ. */
+    bool sse2_dwords;
+    /* F0 09 /r and F0 83 /1 ib with a memory destination in serialized RAM. */
+    bool lock_or32;
 } IrX86Options;
+
+typedef enum {
+    IR_X86_MOVQ_NONE,
+    IR_X86_MOVQ_LOAD,
+    IR_X86_MOVQ_STORE
+} IrX86MovqForm;
+
+/* Recognize the unprefixed addressing forms of legacy SSE2 MOVQ. */
+IrX86MovqForm ir_x86_movq_memory(const uint8_t *bytes, size_t size, unsigned *xmm);
+typedef enum {
+    IR_X86_SSE2_DWORD_NONE,
+    IR_X86_SSE2_MOVD,
+    IR_X86_SSE2_PUNPCKLDQ
+} IrX86Sse2DwordForm;
+
+IrX86Sse2DwordForm ir_x86_sse2_dword_form(const uint8_t *bytes, size_t size, unsigned *dst);
+bool ir_x86_is_lock_or32(const InsnDesc *d);
 
 typedef enum {
     IR_X86_LIFT_OK,

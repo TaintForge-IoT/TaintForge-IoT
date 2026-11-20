@@ -48,7 +48,11 @@ static void rejected_evidence(FILE *report) {
         CHECK(!r.candidate_attempted && !r.alternative_attempted);
         CHECK(!r.candidate.inputs && !r.alternative.inputs);
         if (cases[i] == OF_GAP) CHECK(r.replay_build.issues & IR_REPLAY_GAP);
-        if (cases[i] == OF_UNSUPPORTED) CHECK(r.replay_build.issues & IR_REPLAY_UNSUPPORTED);
+        if (cases[i] == OF_UNSUPPORTED) {
+            CHECK(r.replay_build.issues & IR_REPLAY_UNSUPPORTED);
+            CHECK(r.replay_build.stopped_seq == q.first_seq);
+            CHECK(r.phase && strcmp(r.phase, "build") == 0);
+        }
         if (cases[i] == OF_SYSCALL) CHECK(r.replay_build.issues & IR_REPLAY_SYSCALL_MODEL);
         CHECK(ir_oep_report_json(report, &r));
         ir_oep_result_destroy(&r); replay_input_destroy(f.input);
@@ -73,7 +77,7 @@ static void rejected_evidence(FILE *report) {
         ir_oep_result_destroy(&r);
     }
     replay_input_destroy(f.input);
-    puts("PASS: gaps, unsupported DIV/open, bad baseline/branch evidence, flag trust, explicit input policy, request identity and input-domain rejection");
+    puts("PASS: gaps, unsupported FNINIT and open syscall, bad baseline/branch evidence, flag trust, explicit input policy, request identity and input-domain rejection");
 }
 
 static void budgets(FILE *report) {

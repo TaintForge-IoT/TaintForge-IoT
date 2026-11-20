@@ -1,5 +1,6 @@
 #include "elf_image.h"
 
+#include <elf.h>
 #include <string.h>
 
 static uint64_t number(const uint8_t *p, unsigned size, bool big_endian) {
@@ -11,6 +12,18 @@ static uint64_t number(const uint8_t *p, unsigned size, bool big_endian) {
 
 static bool contains(uint64_t start, uint64_t length, uint64_t offset, uint64_t size) {
     return offset >= start && offset - start <= length && size <= length - (offset - start);
+}
+
+static bool overlaps_load_pages(const TfElfImage *image, uint64_t address, uint64_t size,
+                                 uint64_t page_size) {
+    const uint64_t mask = ~(page_size - 1);
+    for (size_t i = 0; i < image->load_count; i++) {
+        const TfElfLoad *other = &image->loads[i];
+        if ((address & mask) <= ((other->address + other->memory_size - 1) & mask) &&
+            (other->address & mask) <= ((address + size - 1) & mask))
+            return true;
+    }
+    return false;
 }
 
 TfElfStatus tf_elf_image_resolve(TfElfRead file_read, void *file_context, uint64_t file_size,
@@ -85,13 +98,8 @@ TfElfStatus tf_elf_image_resolve(TfElfRead file_read, void *file_context, uint64
             continue;
         if (filesz > seed_budget - image.file_bytes)
             return TF_ELF_BUDGET;
-        for (size_t j = 0; j < image.load_count; j++) {
-            const TfElfLoad *other = &image.loads[j];
-            uint64_t mask = ~(aux->page_size - 1);
-            if ((address & mask) <= ((other->address + other->memory_size - 1) & mask) &&
-                (other->address & mask) <= ((address + memsz - 1) & mask))
-                return TF_ELF_OVERLAPPING_LOADS;
-        }
+        if (overlaps_load_pages(&image, address, memsz, aux->page_size))
+            return TF_ELF_OVERLAPPING_LOADS;
         image.loads[image.load_count++] = (TfElfLoad){address, memsz, offset, filesz, flags};
         image.file_bytes += filesz;
         if (address < image.lo)
@@ -118,6 +126,59 @@ TfElfStatus tf_elf_image_resolve(TfElfRead file_read, void *file_context, uint64
         return TF_ELF_IDENTITY_MISMATCH;
     *out = image;
     return TF_ELF_OK;
+}
+
+bool tf_elf_i386_payload(const uint8_t *page, uint64_t base, uint64_t entry, TfElfImage *out) {
+    const uint64_t page_size = TF_ELF_I386_PAGE_SIZE, limit = UINT64_C(1) << 32;
+    const uint64_t ehsize = sizeof(Elf32_Ehdr), phsize = sizeof(Elf32_Phdr);
+    if (base < 0x10000 || base >= limit || base % page_size ||
+        memcmp(page, ELFMAG, SELFMAG) || page[EI_CLASS] != ELFCLASS32 ||
+        page[EI_DATA] != ELFDATA2LSB || page[EI_VERSION] != EV_CURRENT ||
+        number(page + 16, 2, false) != ET_EXEC || number(page + 18, 2, false) != EM_386 ||
+        number(page + 20, 4, false) != EV_CURRENT || number(page + 24, 4, false) != entry ||
+        number(page + 40, 2, false) != ehsize || number(page + 42, 2, false) != phsize)
+        return false;
+
+    const uint64_t phoff = number(page + 28, 4, false), count = number(page + 44, 2, false);
+    if (!count || count > TF_ELF_MAX_LOADS || phoff < ehsize ||
+        !contains(0, page_size, phoff, count * phsize))
+        return false;
+
+    TfElfImage image = {.entry = entry, .lo = UINT64_MAX};
+    bool header_mapped = false, entry_mapped = false;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint8_t *ph = page + phoff + i * phsize;
+        const uint64_t kind = number(ph, 4, false);
+        if (kind == PT_DYNAMIC || kind == PT_INTERP)
+            return false;
+        if (kind != PT_LOAD)
+            continue;
+        const uint64_t offset = number(ph + 4, 4, false), addr = number(ph + 8, 4, false);
+        const uint64_t filesz = number(ph + 16, 4, false), memsz = number(ph + 20, 4, false);
+        const uint32_t flags = (uint32_t)number(ph + 24, 4, false);
+        const uint64_t align = number(ph + 28, 4, false);
+        if (filesz > memsz || offset + filesz > limit || addr + memsz > limit ||
+            flags & ~(PF_R | PF_W | PF_X) || addr % page_size != offset % page_size ||
+            (align > 1 && ((align & (align - 1)) || addr % align != offset % align)))
+            return false;
+        if (!memsz)
+            continue;
+        if (addr < base || !(flags & PF_R) || overlaps_load_pages(&image, addr, memsz, page_size))
+            return false;
+
+        header_mapped |= addr == base && offset == 0 && phoff + count * phsize <= filesz;
+        entry_mapped |= (flags & PF_X) && contains(addr, filesz, entry, 1);
+        image.loads[image.load_count++] = (TfElfLoad){addr, memsz, offset, filesz, flags};
+        image.file_bytes += filesz;
+        if (addr < image.lo)
+            image.lo = addr;
+        if (addr + memsz > image.hi)
+            image.hi = addr + memsz;
+    }
+    if (!header_mapped || !entry_mapped)
+        return false;
+    *out = image;
+    return true;
 }
 
 const char *tf_elf_status_name(TfElfStatus status) {
