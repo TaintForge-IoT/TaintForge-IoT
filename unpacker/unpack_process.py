@@ -127,6 +127,21 @@ def _rss(pid):
     return 0
 
 
+def _live_group(pgid):
+    """The leader is held waitable so its PID/PGID cannot be recycled."""
+    live = []
+    for entry in Path('/proc').iterdir():
+        if entry.name.isdecimal():
+            try:
+                # comm is parenthesized and may itself contain spaces and ')'.
+                fields = (entry / 'stat').read_bytes().rsplit(b') ', 1)[1].split()
+                if int(fields[2]) == pgid and fields[0] not in (b'Z', b'X'):
+                    live.append(int(entry.name))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+    return live
+
+
 def _limits(timeout, file_limit):
     for which, soft, hard in ((resource.RLIMIT_CORE, 0, 0),
             (resource.RLIMIT_FSIZE, file_limit, file_limit),
@@ -140,7 +155,7 @@ def _limits(timeout, file_limit):
 
 
 def run_process(command, case, directory, *, timeout=10, file_limit=1024**2,
-                rss_limit_mib=2048, environment=None, extended_timeout=False):
+                rss_limit_mib=2048, environment=None, extended_timeout=False, wait_for_group=False):
     case = validate_cases([case])[0]
     require(type(command) is list and command and all(type(a) is str and '\0' not in a for a in command),
             'INVALID_COMMAND', 'Require an explicit command argument list')
@@ -170,7 +185,7 @@ def run_process(command, case, directory, *, timeout=10, file_limit=1024**2,
         'cwd': str(directory), 'timeout_seconds': timeout, 'file_limit_bytes': file_limit,
         'rss_limit_mib': rss_limit_mib, 'address_space_bytes': 8 * 1024**3,
         'close_fds': True, 'fresh_session': True, 'process_group_cleanup': True,
-        'parent_death_guard': parent_death,
+        'parent_death_guard': parent_death, 'wait_for_process_group': wait_for_group,
         'guest_isolation_established': False})
     clock, timed_out, rss_hit, peak = time.monotonic(), False, False, 0
     usage = None
@@ -186,11 +201,20 @@ def run_process(command, case, directory, *, timeout=10, file_limit=1024**2,
             preexec_fn=lambda: _prepare_child(parent_pid, timeout, file_limit))
         try:
             while True:
-                peak = max(peak, _rss(child.pid))
-                waited, status, measured = os.wait4(child.pid, os.WNOHANG)
-                if waited:
-                    child.returncode, usage = os.waitstatus_to_exitcode(status), measured
-                    break
+                if wait_for_group:
+                    # A final fork may race a /proc scan. Observe leader exit
+                    # first and keep it waitable until the group is drained.
+                    exited = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    live = _live_group(child.pid)
+                    peak = max(peak, sum(_rss(pid) for pid in live))
+                    if exited and not live:
+                        break
+                else:
+                    peak = max(peak, _rss(child.pid))
+                    waited, status, measured = os.wait4(child.pid, os.WNOHANG)
+                    if waited:
+                        child.returncode, usage = os.waitstatus_to_exitcode(status), measured
+                        break
                 timed_out |= time.monotonic() - clock >= timeout
                 rss_hit |= peak > rss_limit_mib * 1024
                 if timed_out or rss_hit:
@@ -198,7 +222,10 @@ def run_process(command, case, directory, *, timeout=10, file_limit=1024**2,
                 time.sleep(0.01)
         finally:
             kill_group(child)
-            if child.returncode is None:
+            if wait_for_group and child.returncode is None:
+                _, status, usage = os.wait4(child.pid, 0)
+                child.returncode = os.waitstatus_to_exitcode(status)
+            elif child.returncode is None:
                 child.wait(timeout=5)
     peak = max(peak, usage.ru_maxrss if usage else 0)
     outputs = {}
@@ -211,6 +238,8 @@ def run_process(command, case, directory, *, timeout=10, file_limit=1024**2,
         'max_rss_kib': peak, 'wall_seconds': time.monotonic() - clock,
         'parent_death_guard': parent_death,
         'output_files': outputs, 'output_limit_exceeded': False}
+    if wait_for_group:
+        result['root_pid'] = child.pid
     for stream in ('stdout', 'stderr'):
         item = _digest(directory / stream, file_limit)
         result[stream + '_sha256'], result[stream + '_bytes'] = item['sha256'], item['bytes']

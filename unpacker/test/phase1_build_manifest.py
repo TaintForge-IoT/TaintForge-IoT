@@ -62,6 +62,7 @@ def main() -> None:
         "source_revision": revision,
         "build_inputs": identity,
         "compiled_profile": {"architecture": "i386", "mode": "linux-user", "processes": 1, "threads": 1},
+        "optional_capture_profiles": ["linux-i386-one-fork-v1"],
         "requirements": {"qemu_linkage": "dynamic", "plugins": True, "plugin_api": int(api[1]), "flags_contract": "taintforge_x86_flags_v1_when_required"},
         "formats": {"events": 1, "report": 1, "capture_manifest": 1, "provenance_export": None,
                     "cooperative_retirement": 1 if int(api[1]) == 6 else None,

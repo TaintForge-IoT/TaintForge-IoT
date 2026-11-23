@@ -12,7 +12,7 @@
  * protection from a hostile guest remain execution-backend responsibilities. */
 typedef struct {
     bool enabled, storage_failed, profile_lost, finished, flags_required, analysis_incomplete;
-    bool capture_at_entry;
+    bool capture_at_entry, follow_fork;
     bool quiesced, retirement_enabled;
     char *session, *attempt, *instance;
     char *events_path, *manifest_path, *dump_path, *report_path, *ir_path;
@@ -33,6 +33,7 @@ typedef struct {
 bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv);
 bool tf_phase1_start(TfPhase1Io *io, const char *target, bool system, unsigned plugin_api,
                      bool flags, bool ir_enabled);
+bool tf_phase1_open_child(TfPhase1Io *io);
 bool tf_phase1_event(TfPhase1Io *io, const char *type, const char *status, const char *reason,
                      const char *payload);
 void tf_phase1_profile_lost(TfPhase1Io *io, const char *reason);

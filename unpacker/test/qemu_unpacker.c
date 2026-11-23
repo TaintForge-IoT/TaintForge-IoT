@@ -48,6 +48,14 @@ static TfPhase1Io g_phase1;
 static TfRetire g_retire = {.fd = -1};
 static qemu_plugin_id_t g_plugin_id;
 static bool g_released, g_exported;
+#define I386_SIGCHLD 17U
+#define I386_CLONE_CHILD_CLEARTID 0x00200000U
+#define I386_CLONE_CHILD_SETTID   0x01000000U
+static uint64_t g_fork_seq;
+static int64_t g_fork_syscall;
+static uint32_t g_fork_flags, g_fork_child_settid;
+static bool g_fork_done, g_fork_child, g_child_observation_pending;
+static bool g_unsupported_fork_mapping, g_fork_memory_unknown;
 static uint64_t g_released_pages, g_released_bitmaps, g_released_register_buffers;
 static uint64_t g_explicitly_wiped_bytes;
 
@@ -463,6 +471,7 @@ typedef struct {
     uint64_t write_count;
     uint64_t last_write;
     uint8_t *wbitmap;
+    uint8_t *inherited_writes; /* guest STORE bits present at child creation */
     uint32_t gen_written;
     bool exec_seen;
     bool candidate_seen;
@@ -506,6 +515,7 @@ static void page_destroy(void *pointer) {
         ++g_released_bitmaps;
         g_free(page->wbitmap);
     }
+    g_free(page->inherited_writes);
     tf_retire_wipe(page, sizeof(*page));
     g_explicitly_wiped_bytes += sizeof(*page);
     ++g_released_pages;
@@ -1993,6 +2003,28 @@ static bool seed_resource_byte_labels(uint64_t guest_address, uint64_t size,
     return true;
 }
 
+static void clear_store_bits(uint8_t *bitmap, unsigned first, unsigned count) {
+    if (bitmap)
+        for (unsigned bit = first; bit < first + count; ++bit)
+            bitmap[bit >> 3] &= (uint8_t)~(1U << (bit & 7U));
+}
+
+/* A guest read/clone-TID copy can replace bytes without an instruction
+ * STORE callback. Forget only bytes actually covered in this process. */
+static void fork_forget_kernel_store(uint64_t address, uint64_t count) {
+    while (count) {
+        unsigned first = address & (page_size - 1U);
+        unsigned chunk = MIN(count, page_size - first);
+        page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)(address - first));
+        if (page) {
+            clear_store_bits(page->wbitmap, first, chunk);
+            clear_store_bits(page->inherited_writes, first, chunk);
+        }
+        address += chunk;
+        count -= chunk;
+    }
+}
+
 static void apply_pending_input(int64_t syscall_num, int64_t syscall_ret) {
     if (!g_pending_input.active)
         return;
@@ -2021,6 +2053,8 @@ static void apply_pending_input(int64_t syscall_num, int64_t syscall_ret) {
         if (chunk == 0)
             continue;
         uint64_t destination = g_pending_input.iov[index].base;
+        if (g_phase1.follow_fork)
+            fork_forget_kernel_store(destination, chunk);
         if (!g_pending_input.taint_source) {
             shadow_untaint_range(g_shadow, destination, chunk);
         } else if (g_pending_input.source_identity_valid &&
@@ -3355,6 +3389,7 @@ static void stage_clear_page_store(page_t *page) {
     if (!page)
         return;
     g_clear_pointer(&page->wbitmap, g_free);
+    g_clear_pointer(&page->inherited_writes, g_free);
     page->written = page->exec_after_write = false;
     page->producer_valid = false;
     page->guest_store_generation = 0;
@@ -3662,6 +3697,7 @@ static void stage_mapping_backing(page_t *page, const pending_mmap_t *pending,
 
 static void stage_reset_mapping_page(page_t *page, int prot, uint64_t mapping_epoch) {
     g_free(page->wbitmap);
+    g_free(page->inherited_writes);
     memset(page, 0, sizeof(*page));
     page->prot = prot;
     page->mapping_epoch = mapping_epoch;
@@ -3706,7 +3742,8 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
             pending->offset + rounded <= ((g_stage_memfd_files[file].size + 4095) & ~UINT64_C(4095));
         if (!supported) {
             stage_clear_producers();
-            tf_phase1_profile_lost(&g_phase1, "shared_file_mapping_unsupported");
+            tf_phase1_profile_lost(&g_phase1, g_phase1.follow_fork ?
+                                  "unsupported_fork_memory_mapping" : "shared_file_mapping_unsupported");
             return;
         }
         g_stage_shared_file_profile = true;
@@ -4294,6 +4331,7 @@ static void stage_record_shared_store(page_t *source, uint64_t source_address, u
         if (alias->exec_seen || alias->exec_after_write)
             phase1_invalidate(base, generation, "shared_alias_write_to_executed_code");
         g_clear_pointer(&alias->wbitmap, g_free);
+        g_clear_pointer(&alias->inherited_writes, g_free);
         stage_project_file_store(alias, base);
         alias->exec_seen = false;
     }
@@ -4330,6 +4368,7 @@ static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *write
             uint32_t bit = offset + i;
             page->wbitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
         }
+        clear_store_bits(page->inherited_writes, offset, chunk);
         if (page->exec_seen || page->exec_after_write)
             phase1_invalidate(page_addr, write_generation, "write_to_executed_code");
         page->written = true;
@@ -5980,6 +6019,8 @@ static bool phase1_retire_at_boundary(uint64_t pc) {
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
     (void)id; (void)udata;
     if (g_released || (g_phase1.enabled && getpid() != g_phase1.owner)) return;
+    if (g_phase1.follow_fork && g_fork_seq && !g_fork_done)
+        tf_phase1_profile_lost(&g_phase1, "fork_return_missing");
     /* Reaching process exit without the requested retirement is not success. */
     if (g_retire.state != TF_RETIRE_OFF) tf_retire_abort(89, "retirement_boundary_not_reached");
     phase1_export(true);
@@ -5994,6 +6035,29 @@ static page_t *stage_page_for_pc(uint64_t pc) {
 static uint64_t stage_mapping_epoch_for_pc(uint64_t pc) {
     const page_t *page = stage_page_for_pc(pc);
     return page ? page->mapping_epoch : 0;
+}
+
+/* Count observed guest stores per byte in the candidate instruction. Kernel
+ * copy-ins are outside this metric. Individual children never merge bitmaps. */
+static void fork_entry_stores(const oep_cand_t *candidate) {
+    unsigned inherited = 0, local = 0;
+    for (unsigned i = 0; i < candidate->entry_size; ++i) {
+        uint64_t address = candidate->addr + i;
+        const page_t *page = stage_page_for_pc(address);
+        unsigned bit = address & (page_size - 1U);
+        uint8_t mask = (uint8_t)(1U << (bit & 7U));
+        if (page && page->wbitmap && (page->wbitmap[bit >> 3] & mask)) {
+            if (page->inherited_writes && (page->inherited_writes[bit >> 3] & mask))
+                ++inherited;
+            else
+                ++local;
+        }
+    }
+    char *data = g_strdup_printf("{\"candidate_id\":%" PRIu64 ",\"address\":%" PRIu64
+        ",\"entry_bytes\":%u,\"prefork_guest_store_bytes\":%u,\"child_guest_store_bytes\":%u}",
+        candidate->candidate_id, candidate->addr, (unsigned)candidate->entry_size, inherited, local);
+    tf_phase1_event(&g_phase1, "fork_entry_stores", "observed", NULL, data);
+    g_free(data);
 }
 
 static bool insn_is_unpacked(uint64_t vaddr, size_t size, bool require_write) {
@@ -6390,9 +6454,11 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     g_phase1.pc = vaddr;
     g_phase1.generation = dcfg_code_generation_for_pc(vaddr);
     g_phase1.vcpu = cpu_index;
-    if (g_icount == 1)
+    if (g_icount == 1 || g_child_observation_pending) {
+        g_child_observation_pending = false;
         tf_phase1_event(&g_phase1, "runtime_observation", "observed", NULL,
                         "{\"kind\":\"instruction_callback\",\"instruction_phase\":\"before\"}");
+    }
     if (g_ir_enabled) {
         if (g_ir_has_start && vaddr == g_ir_start_pc)
             vcpu_state->ir_start_seq = current_trace_seq_id;
@@ -6461,6 +6527,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
             returned_helper = stage_same_page_helper(cur_pg, vaddr, meta->size, cpu_index);
         new_layer = fallthrough || returned_helper;
     }
+    if (new_layer && g_fork_done && !insn_is_unpacked(vaddr, meta->size, true))
+        new_layer = false;
     if (cur_pg)
         cur_pg->exec_seen = true;
 
@@ -6530,6 +6598,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->dse.alternative_query = DSE_SOLVER_NOT_RUN;
 
         phase1_candidate_event("oep_candidate_observed", candidate, false);
+        if (g_fork_child)
+            fork_entry_stores(candidate);
         capture_candidate(candidate);
         if (fallthrough) {
             char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
@@ -7030,8 +7100,38 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
     }
     if (g_phase1.enabled && is_i386 &&
         (num == 2 || num == 11 || num == 120 || num == 190 || num == 358 || num == 435)) {
-        tf_phase1_profile_lost(&g_phase1, "process_or_thread_transition_requested");
-        return;
+        /* The i386 libc fork form uses clone with an inherited stack and
+         * optional child TID bookkeeping in the child's private memory. */
+        uint32_t tid_flags = I386_CLONE_CHILD_SETTID | I386_CLONE_CHILD_CLEARTID;
+        bool private_fork = num == 2 || (num == 120 && !(uint32_t)a2 &&
+            ((uint32_t)a1 & ~tid_flags) == I386_SIGCHLD);
+        if (!g_phase1.follow_fork || !private_fork || g_fork_done || g_candidate_count) {
+            const char *reason = !g_phase1.follow_fork || !private_fork ? "process_or_thread_transition_requested"
+                               : g_fork_done ? "second_fork_requested" : "fork_after_candidate";
+            tf_phase1_profile_lost(&g_phase1, reason);
+            return;
+        }
+        g_fork_syscall = num;
+        g_fork_flags = num == 120 ? (uint32_t)a1 : 0;
+        g_fork_child_settid = (g_fork_flags & I386_CLONE_CHILD_SETTID) ? (uint32_t)a5 : 0;
+        g_fork_seq = g_phase1.trace_seq;
+        if (!g_fork_seq)
+            tf_phase1_profile_lost(&g_phase1, "fork_instruction_not_observed");
+    }
+    if (g_phase1.follow_fork) {
+        if (num == 1 || num == 252) {
+            char *data = g_strdup_printf("{\"pid\":%ld,\"status\":%u}",
+                                         (long)getpid(), (unsigned)a1 & 255U);
+            tf_phase1_event(&g_phase1, "process_exit_requested", "observed", NULL, data);
+            g_free(data);
+        }
+        /* Discard/inheritance advice, mremap and SHMAT can change a private
+         * page independently of the copied bitmap. */
+        g_unsupported_fork_mapping = num == 163 || num == 397 ||
+            (num == 117 && (a1 & 0xffffU) == 21) ||
+            (num == 219 && (a3 == 4 || a3 == 8 || a3 == 9 || a3 == 10 || a3 == 18 || a3 == 24));
+        if (num == 57 || num == 66)
+            tf_phase1_profile_lost(&g_phase1, "process_group_change_requested");
     }
     pending_input_reset();
     pending_open_reset();
@@ -7476,8 +7576,70 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
     vcpu_tb_trans_impl(id, tb);
 }
 
+static bool fork_has_shared_pages(void) {
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, pages);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        const page_t *page = value;
+        if (page->backing_shared)
+            return true;
+    }
+    return false;
+}
+
+/* In linux-user an ordinary guest fork returns through this callback in both
+ * host processes. The copied collector and translation userdata stay valid. */
+static void fork_return(unsigned vcpu, int64_t ret) {
+    if (ret < 0) {
+        g_fork_seq = 0;
+        return;
+    }
+    pid_t parent = g_phase1.owner;
+    pid_t child = ret ? (pid_t)ret : getpid();
+    g_fork_done = true;
+    if (g_fork_memory_unknown || fork_has_shared_pages()) {
+        if (ret > 0)
+            tf_phase1_profile_lost(&g_phase1, "unsupported_fork_memory_mapping");
+        return;
+    }
+    if (ret == 0) {
+        if (!tf_phase1_open_child(&g_phase1))
+            return;
+        g_fork_child = true;
+        g_child_observation_pending = true;
+        if (g_fork_child_settid) {
+            /* The kernel may have overwritten up to four guest bytes before
+             * the first child callback. Discard older STORE/taint evidence. */
+            unsigned count = MIN(UINT64_C(4), (UINT64_C(1) << 32) - g_fork_child_settid);
+            shadow_untaint_range(g_shadow, g_fork_child_settid, count);
+            fork_forget_kernel_store(g_fork_child_settid, count);
+        }
+        GHashTableIter iter;
+        gpointer value;
+        g_hash_table_iter_init(&iter, pages);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            page_t *page = value;
+            if (page->wbitmap)
+                page->inherited_writes = g_memdup2(page->wbitmap, page_size / 8U);
+        }
+        tf_phase1_start(&g_phase1, "i386", false, QEMU_PLUGIN_VERSION, g_x86_flags_verified, false);
+    }
+    PluginVcpuState *state = plugin_vcpu_state_get(vcpu);
+    if (state)
+        reg_propagate_clear(&state->dta.regs, DTA_REG_RAX);
+    char *data = g_strdup_printf("{\"parent_pid\":%ld,\"child_pid\":%ld,\"fork_trace_seq\":%" PRIu64
+                                 ",\"syscall_nr\":%" PRId64 ",\"clone_flags\":%u}",
+                                 (long)parent, (long)child, g_fork_seq, g_fork_syscall, g_fork_flags);
+    tf_phase1_event(&g_phase1, ret ? "process_fork" : "process_fork_child", "observed", NULL, data);
+    g_free(data);
+}
+
 static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num,
                                   int64_t ret) {
+    if (g_phase1.follow_fork && num == g_fork_syscall && g_fork_seq &&
+        !g_fork_done && !g_phase1.profile_lost)
+        fork_return(vcpu_idx, ret);
     if (!phase1_admit())
         return;
     (void)id;
@@ -7534,6 +7696,19 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
     stage_pending_mutable_return(num, ret);
     stage_pending_msync_return(num, ret);
     const bool syscall_failed = syscall_ret_is_error(ret);
+    if (g_phase1.follow_fork && !syscall_failed) {
+        bool mmap_call = num == 90 || num == 192;
+        unsigned map_type = g_pending_mmap.flags & 0x0fU;
+        /* The ordinary unpacker can model a shared memfd in one process.
+         * Reject its sharing only while two address spaces can coexist. */
+        if (g_unsupported_fork_mapping ||
+            (mmap_call && (!g_pending_mmap.active || (map_type != 1 && map_type != GUEST_MAP_PRIVATE))))
+            g_fork_memory_unknown = true;
+        if (g_fork_done && (g_fork_memory_unknown || (mmap_call && map_type != GUEST_MAP_PRIVATE))) {
+            tf_phase1_profile_lost(&g_phase1, "unsupported_fork_memory_mapping");
+            return;
+        }
+    }
     /* The page table does not model i386 mremap. Only fresh mmap lifetimes
      * can identify a separate payload after a successful remap. */
     if (!syscall_failed && is_i386 && num == 163)
@@ -7760,6 +7935,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     if (is_i386) {
         fprintf(stderr, "[REG] x86 flag observation contract: %s\n",
                 g_x86_flags_verified ? "verified" : "unverified; EFLAGS unavailable to DSE/REP/IR");
+    }
+    if (g_phase1.follow_fork && (!g_phase1.capture_at_entry || trace_archive_enabled() ||
+                                g_concolic || g_phase1.retirement_enabled)) {
+        fprintf(stderr, "[PHASE1] follow-fork requires independent entry captures without IR/DSE/retirement\n");
+        goto fail;
     }
     if (!tf_phase1_start(&g_phase1, target, info->system_emulation, QEMU_PLUGIN_VERSION,
                          g_x86_flags_verified, g_ir_enabled))
