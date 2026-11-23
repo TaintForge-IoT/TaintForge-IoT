@@ -3,12 +3,19 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from unpacker import unpack
+from unpacker import unpack_process
 
 
 def read(path):
@@ -20,6 +27,74 @@ def events(path):
 
 
 class ForkSupervisor(unittest.TestCase):
+    def test_last_socket_release_can_follow_terminal_record(self):
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with receiver, sender:
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            for kind in ('S', 'X'):
+                sender.send(struct.pack('=ii', ord(kind), 0))
+            release = threading.Timer(0.05, sender.close)
+            release.start()
+            try:
+                exits = unpack_process._process_exits(receiver, os.getpid(), 0, time.monotonic() + 2)
+            finally:
+                release.join()
+            self.assertEqual(exits['parent']['returncode'], 0)
+
+    def test_parent_can_report_child_killed_before_its_first_callback(self):
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with receiver, sender:
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            sender.send(struct.pack('=ii', ord('S'), 0))
+            child = os.fork()
+            if child == 0:
+                signal.pause()
+                os._exit(1)
+            try:
+                fd = os.pidfd_open(child)
+                try:
+                    sender.sendmsg([struct.pack('=ii', ord('F'), child)],
+                                   [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('=i', fd))])
+                finally:
+                    os.close(fd)
+            finally:
+                os.kill(child, signal.SIGKILL)
+                os.waitpid(child, 0)
+            sender.send(struct.pack('=ii', ord('X'), 0))
+            sender.close()
+            exits = unpack_process._process_exits(receiver, os.getpid(), 0, time.monotonic() + 1)
+            self.assertEqual(exits['child'], {'pid': child, 'returncode': -9, 'signal': 9})
+
+    def test_zombie_with_hidden_exit_field_is_incomplete(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(7)
+        try:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+            # Simulate pidfs retaining the status only at reap, while procfs
+            # still exposes the zombie. An unreadable exit field can look zero.
+            def no_exit_info(fd, request, info):
+                struct.pack_into('=Q', info, 0, 0)
+
+            with patch.object(unpack_process.fcntl, 'ioctl', side_effect=no_exit_info):
+                self.assertEqual(unpack_process._child_returncode(-1, pid), 7)
+                with patch.object(os, 'readlink', side_effect=PermissionError):
+                    with self.assertRaises(unpack.UnpackError) as raised:
+                        unpack_process._child_returncode(-1, pid)
+                self.assertEqual(raised.exception.reason, 'INCOMPLETE_PROCESS_EXIT')
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_missing_observer_cannot_pass_as_single_process(self):
+        with tempfile.TemporaryDirectory() as work:
+            out = Path(work) / 'case'
+            result = unpack_process.run_fork_replay([shutil.which('true')], {'id': 'silent'}, out,
+                                                    plugin='unused', payload_role='parent')
+            self.assertEqual(result['returncode'], 0)
+            self.assertEqual(result['process_exit_error']['reason'], 'INCOMPLETE_PROCESS_EXIT')
+            self.assertFalse(unpack.compare_results([result]))
+            self.assertEqual(result, read(out / 'result.json'))
+
     def test_timeout_after_root_exit(self):
         with tempfile.TemporaryDirectory() as work:
             out = Path(work) / 'case'
@@ -45,7 +120,7 @@ class ForkCapture(unittest.TestCase):
         cls.qemu = Path(qemu).resolve(strict=True)
         cls.plugin = Path(plugin).resolve(strict=True) if plugin else unpack.build_plugin(include, cls.root / 'plugin')
 
-    def capture(self, *defines, follow=True, stdin_base64=''):
+    def capture(self, *defines, follow=True, stdin_base64='', cases=None):
         work = self.root / self._testMethodName
         work.mkdir()
         args = [part for value in defines for part in ('--defsym', value + '=1')]
@@ -58,7 +133,8 @@ class ForkCapture(unittest.TestCase):
                           if line.endswith(' T payload_entry'))
         self.out = work / 'out'
         return unpack.unpack_sample(guest, self.out, qemu=self.qemu, plugin=self.plugin,
-                                    cases=[{'id': 'fork', 'stdin_base64': stdin_base64}], timeout=10, follow_fork=follow)
+                                    cases=cases or [{'id': 'fork', 'stdin_base64': stdin_base64}],
+                                    timeout=10, follow_fork=follow)
 
     def check_child(self, summary, inherited, local):
         self.assertEqual(summary['status'], unpack.FORK_STATUS)
@@ -104,6 +180,39 @@ class ForkCapture(unittest.TestCase):
 
     def test_parent_exits_before_child_entry(self):
         self.check_child(self.capture('ROOT_FIRST'), 5, 0)
+
+    def check_masked_replay(self, value, expected, *defines):
+        cases = [{'id': 'capture'}, {'id': 'masked', 'stdin_base64': value}]
+        with self.assertRaises(unpack.UnpackError) as raised:
+            self.capture('REPLAY_STATUS', *defines, cases=cases)
+        self.assertEqual(raised.exception.reason, 'SELECTED_CASE_MISMATCH', str(raised.exception))
+        first, second = read(self.out / 'comparisons.json')
+        self.assertTrue(first['matched'])
+        self.assertFalse(second['matched'])
+        for packed, rebuilt in zip(second['executions']['packed'], second['executions']['rebuilt'], strict=True):
+            for field in ('returncode', 'stdout_sha256', 'stderr_sha256', 'output_files'):
+                self.assertEqual(packed[field], rebuilt[field])
+            self.assertEqual(packed['returncode'], 0)
+            self.assertEqual(packed['process_exits']['child']['returncode'], expected)
+            self.assertEqual(packed['process_exits']['child']['signal'], -expected if expected < 0 else None)
+            self.assertEqual(set(rebuilt['process_exits']), {'parent'})
+        self.assertEqual(len(second['executions']['rebuilt']), 2)
+
+    def test_reaped_child_nonzero_on_second_input(self):
+        self.check_masked_replay('Bw==', 7)
+
+    def test_child_signaled_on_second_input(self):
+        self.check_masked_replay('CQ==', -signal.SIGKILL)
+
+    def test_orphan_signaled_on_second_input(self):
+        self.check_masked_replay('CQ==', -signal.SIGKILL, 'ROOT_FIRST')
+
+    def test_missing_kernel_exit_evidence_is_incomplete(self):
+        with patch.object(unpack_process.fcntl, 'ioctl', side_effect=OSError('ioctl unavailable')):
+            with self.assertRaisesRegex(unpack.UnpackError, 'PIDFD_GET_INFO') as raised:
+                self.capture()
+        self.assertEqual(raised.exception.reason, 'INCOMPLETE_PROCESS_EXIT')
+        self.assertFalse(read(self.out / 'comparisons.json')[0]['matched'])
 
     def test_parent_postfork_write_is_private(self):
         with self.assertRaises(unpack.UnpackError) as raised:

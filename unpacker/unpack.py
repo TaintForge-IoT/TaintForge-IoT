@@ -29,10 +29,10 @@ from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1Runtim
 
 try:
     from .mvp import ct_elf
-    from .unpack_process import UnpackError, compare_results, run_process, save, validate_cases
+    from .unpack_process import UnpackError, compare_results, run_fork_replay, run_process, save, validate_cases
 except ImportError:
     from mvp import ct_elf
-    from unpack_process import UnpackError, compare_results, run_process, save, validate_cases
+    from unpack_process import UnpackError, compare_results, run_fork_replay, run_process, save, validate_cases
 
 
 STATUS = 'PASS_WITH_OBSERVED_IMAGE_AND_SELECTED_CASE_EQUIVALENCE'
@@ -419,17 +419,35 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
                 executions = []
                 row['executions'][name] = executions
                 for repeat in range(2):
-                    result = run_process([str(qemu), '-0', 'target.elf', str(path), *case['argv']],
-                        case, output / 'runs' / f'case-{index:03d}' / name / str(repeat),
-                        timeout=timeout, file_limit=1024**2, rss_limit_mib=rss_limit_mib,
-                        environment=environment, wait_for_group=follow_fork)
+                    command = [str(qemu), '-0', 'target.elf', str(path), *case['argv']]
+                    directory = output / 'runs' / f'case-{index:03d}' / name / str(repeat)
+                    limits = dict(timeout=timeout, file_limit=1024**2, rss_limit_mib=rss_limit_mib,
+                                  environment=environment)
+                    if follow_fork:
+                        role = family['selected_role'] if name == 'packed' else 'parent'
+                        result = run_fork_replay(command, case, directory, plugin=runtime.plugin,
+                                                 payload_role=role, **limits)
+                    else:
+                        result = run_process(command, case, directory, **limits)
                     executions.append(result)
                     results.append(result)
                     save(output / 'comparisons.json', comparisons)
-                    require(compare_results([result]), 'CASE_EXECUTION_FAILED',
-                            'Execution signaled, timed out or exceeded a resource budget on case ' + case['id'])
-            require(compare_results(results), 'SELECTED_CASE_MISMATCH',
-                    'Behavior or repetition determinism differs on case ' + case['id'])
+                    if not follow_fork or any(result[k] for k in ('timed_out', 'rss_limit_hit', 'output_limit_exceeded')):
+                        require(compare_results([result]), 'CASE_EXECUTION_FAILED',
+                                'Execution signaled, timed out or exceeded a resource budget on case ' + case['id'])
+                    if 'process_exit_error' in result:
+                        error = result['process_exit_error']
+                        raise UnpackError(error['reason'], f"{case['id']} ({name}): {error['detail']}")
+            stable = not follow_fork or all(compare_results(repeats, same_process_tree=True)
+                                            for repeats in row['executions'].values())
+            if not stable or not compare_results(results):
+                detail = 'Behavior or repetition determinism differs on case ' + case['id']
+                if follow_fork:
+                    for name, runs in row['executions'].items():
+                        outcomes = [{role: item['returncode'] for role, item in run['process_exits'].items()}
+                                    for run in runs]
+                        detail += f' | {name} exits {outcomes}'
+                raise UnpackError('SELECTED_CASE_MISMATCH', detail)
             row['matched'] = True
             save(output / 'comparisons.json', comparisons)
             print('unpack: matched ' + case['id'], flush=True)
@@ -463,6 +481,7 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
             scope='Observed selected candidate image and equivalence on the supplied finite case set under the selected trusted QEMU/plugin. No formal OEP theorem is established.')
         if family is not None:
             summary['process_capture'] = family
+            summary['comparison_fields'].append('process_exits')
         save(output / 'summary.json', summary)
         return summary
     except (UnpackError, ct_elf.CaptureError, Phase1RuntimeError, OSError, ValueError,

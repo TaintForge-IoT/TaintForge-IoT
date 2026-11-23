@@ -121,8 +121,10 @@ _start:
     int $0x80
     cmp %edi, %eax
     jne failed
+.ifndef REPLAY_STATUS
     cmpl $0, status
     jne failed
+.endif
 .ifdef BOTH
     movb $0xb8, payload_entry
     jmp payload_entry
@@ -165,6 +167,33 @@ child:
     mov $(template_end-template), %ecx
     cld
     rep movsb
+.endif
+.ifdef REPLAY_STATUS
+    /* Only the packed stub reads this byte. Keep stdout and the parent's
+     * return value identical to the rebuilt payload on all three paths. */
+    mov $3, %eax
+    xor %ebx, %ebx
+    mov $scratch, %ecx
+    mov $1, %edx
+    int $0x80
+    test %eax, %eax
+    jz replay_normal
+    mov $4, %eax
+    mov $1, %ebx
+    mov $message, %ecx
+    mov $(message_end-message), %edx
+    int $0x80
+    cmpb $7, scratch
+    mov $7, %ebx
+    je exit
+    mov $20, %eax
+    int $0x80
+    mov %eax, %ebx
+    mov $9, %ecx
+    mov $37, %eax
+    int $0x80
+    jmp failed
+replay_normal:
 .endif
 .ifdef READ_ENTRY_BYTE
     mov $3, %eax
