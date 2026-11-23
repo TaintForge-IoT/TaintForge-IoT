@@ -103,6 +103,10 @@ _start:
     js failed
     jz child
     mov %eax, %edi
+.ifdef SECOND_SIBLING
+    mov $2, %eax
+    int $0x80
+.endif
     /* Corrupt the parent's private copy. The child waits for EOF, so it
      * always executes after this store, independently of scheduling. */
     movb $0xcc, payload_entry

@@ -60,17 +60,25 @@ def parse_map(path, exit_code):
     info = path.lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size == RECORD_SIZE,
             'Invalid native coverage file')
-    data = path.read_bytes()
+    return parse_coverage_record(path.read_bytes(), exit_code)
+
+
+def parse_coverage_record(data, exit_code, *, tree=False, inherited_input=False):
+    require(len(data) == RECORD_SIZE, 'Invalid native coverage record length')
     magic, version, size, *fields = HEADER.unpack_from(data)
     started, finished, blocks, first, last, exit_seen, observed_exit, input_bytes, count, errors = fields
     require(magic == b'TFRCOV1\0' and version == 1 and size == MAP_SIZE,
             'Coverage format mismatch')
-    require(started == finished == exit_seen == 1 and errors == 0 and observed_exit == exit_code
-            and 0 <= exit_code <= 255 and input_bytes > 0 and blocks > 0
-            and 0 < first <= 0xffffffff and 0 < last <= 0xffffffff and count <= MAX_BRANCHES,
-            'No complete, normal guest execution with post-input coverage')
+    normal = 0 <= exit_code <= 255 and finished == exit_seen == 1 and observed_exit == exit_code
+    signaled = tree and exit_code < 0 and finished in (0, 1) and exit_seen == observed_exit == 0
     bitmap = data[HEADER.size:HEADER.size + MAP_SIZE]
-    require(any(bitmap), 'Empty native guest coverage')
+    active = bool(input_bytes or inherited_input)
+    if blocks:
+        valid_blocks = active and 0 < first <= 0xffffffff and 0 < last <= 0xffffffff and any(bitmap)
+    else:
+        valid_blocks = tree and first == last == count == 0 and not any(bitmap)
+    require((normal or signaled) and errors == 0 and started == int(active) and valid_blocks
+            and count <= MAX_BRANCHES, 'No complete guest execution with matching coverage')
     outcomes = set()
     addresses = set()
     offset = HEADER.size + MAP_SIZE
@@ -86,7 +94,7 @@ def parse_map(path, exit_code):
     return {'status': 'verified', 'scope': 'guest_tb_edges_after_first_input_read',
             'map_sha256': hashlib.sha256(bitmap).hexdigest(), 'blocks': blocks,
             'nonzero_slots': sum(bool(value) for value in bitmap), 'first_pc': first,
-            'last_pc': last, 'input_bytes_read': input_bytes, 'guest_exit': exit_code,
+            'last_pc': last, 'input_bytes_read': input_bytes, 'guest_exit': exit_code if normal else None,
             'branch_scope': 'observed_i386_rel8_rel32_conditional_successors',
             'branch_outcomes': sorted(outcomes)}, bitmap
 
@@ -301,6 +309,14 @@ def execute_case(root, data, out, active=None):
             active(None)
 
 
+def build_coverage_plugin(native):
+    header = PROJECT / 'experiments/execution_capsule_probe/vendor/qemu-plugin.h'
+    source = PROJECT / 'experiments/afl_rebuilt/coverage.c'
+    flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'glib-2.0'], text=True))
+    subprocess.run(['cc', '-std=c11', '-O2', '-g', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
+                    '-I' + str(header.parent), str(source), '-o', str(native), *flags], check=True)
+
+
 def prepare(root, binary, seeds, qemu, plugin, case_seconds=5):
     root = private_path(root)
     require(not root.exists(), 'Use a new campaign directory')
@@ -317,12 +333,8 @@ def prepare(root, binary, seeds, qemu, plugin, case_seconds=5):
         (root / name).mkdir(parents=True, exist_ok=True)
     for data in corpus:
         (root / 'seeds' / hashlib.sha256(data).hexdigest()).write_bytes(data)
-    header = PROJECT / 'experiments/execution_capsule_probe/vendor/qemu-plugin.h'
-    source = PROJECT / 'experiments/afl_rebuilt/coverage.c'
     native = root / 'build/plugin/rebuilt_coverage.so'
-    flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'glib-2.0'], text=True))
-    subprocess.run(['cc', '-std=c11', '-O2', '-g', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
-                    '-I' + str(header.parent), str(source), '-o', str(native), *flags], check=True)
+    build_coverage_plugin(native)
     bridge = root / 'build/tf-afl-bridge'
     subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
                     str(PROJECT / 'experiments/afl_file/bridge.c'), '-o', str(bridge)], check=True)
@@ -362,6 +374,11 @@ def receive(connection, count):
             raise ConnectionError('AFL child disconnected')
         data.extend(part)
     return bytes(data)
+
+
+def send_feedback(connection, bitmap, *, signal_number=0):
+    require(len(bitmap) == MAP_SIZE and 0 <= signal_number < signal.NSIG, 'Invalid AFL feedback')
+    connection.sendall(struct.pack('!4I', 0x54464131, int(bool(signal_number)), signal_number, MAP_SIZE) + bitmap)
 
 
 class Server:
@@ -454,7 +471,7 @@ class Server:
                             'scope': 'UNVERIFIED; not an AFL target crash'})
                     self.count += 1
                     try:
-                        connection.sendall(struct.pack('!4I', 0x54464131, 0, 0, MAP_SIZE) + bitmap)
+                        send_feedback(connection, bitmap)
                     except (BrokenPipeError, ConnectionResetError) as exc:
                         # AFL may terminate its child when its campaign timer expires.
                         # The caller must still verify AFL's own successful exit.

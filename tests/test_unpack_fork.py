@@ -268,6 +268,11 @@ class ForkCapture(unittest.TestCase):
             self.capture('SECOND_FORK')
         self.assertFalse((self.out / 'rebuilt.elf').exists())
 
+    def test_second_sibling_before_oep_is_reported(self):
+        with self.assertRaisesRegex(unpack.UnpackError, 'second_fork_requested'):
+            self.capture('SECOND_SIBLING')
+        self.assertFalse((self.out / 'rebuilt.elf').exists())
+
     def test_single_process_upx_memfd_with_original_oracle(self):
         corpus = Path(__file__).resolve().parents[1] / 'unpacker/mvp/corpus'
         out = self.root / self._testMethodName

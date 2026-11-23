@@ -326,24 +326,27 @@ def _exit_packets(channel, root_pid, deadline):
             kind, value = struct.unpack('=ii', packet)
             child_code = None
             if pidfd is not None:
-                require((kind == ord('F') and pid == root_pid and value > 0 and value != pid)
+                require((kind == ord('F') and value > 0 and value != pid)
                         or (kind == ord('C') and pid != root_pid and value == 0),
                         'INCOMPLETE_PROCESS_EXIT', 'Unexpected process descriptor')
                 child_code = _child_returncode(pidfd, value if kind == ord('F') else pid)
         yield pid, kind, value, child_code
 
 
-def _process_exits(channel, root_pid, root_code, deadline):
-    started, requested, children = set(), {}, []
+def _process_tree(channel, root_pid, root_code, deadline, max_processes):
+    started, requested, parents = set(), {}, {root_pid: None}
     kernel_codes = {root_pid: root_code}
     for count, (pid, kind, value, child_code) in enumerate(_exit_packets(channel, root_pid, deadline), 1):
-        require(count <= 5, 'INCOMPLETE_PROCESS_EXIT', 'Too many process observation packets')
+        require(count <= 3 * max_processes - 1, 'INCOMPLETE_PROCESS_EXIT', 'Too many process observation packets')
+        if kind == ord('L') and value == max_processes:
+            raise UnpackError('PROCESS_LIMIT', f'Tree replay reached the limit of {max_processes} processes')
         if kind == ord('!'):
             raise UnpackError('UNSUPPORTED_FORK_PROFILE', f'Unsupported process transition in replay (syscall {value})')
         if kind == (ord('S') if pid == root_pid else ord('C')) and value == 0 and pid not in started:
             started.add(pid)
-        elif kind == ord('F') and pid == root_pid and value > 0 and value != pid and not children:
-            children.append(value)
+        elif kind == ord('F') and value > 0 and value != pid and value not in parents:
+            require(len(parents) < max_processes, 'INCOMPLETE_PROCESS_EXIT', 'Unexpected extra child')
+            parents[value] = pid
         elif kind == ord('X') and pid not in requested and 0 <= value <= 255:
             requested[pid] = value
         else:
@@ -352,20 +355,33 @@ def _process_exits(channel, root_pid, root_code, deadline):
             child = value if kind == ord('F') else pid
             require(kernel_codes.setdefault(child, child_code) == child_code,
                     'INCOMPLETE_PROCESS_EXIT', 'Conflicting kernel child exit statuses')
-    expected = {root_pid, *children}
-    require(root_pid in started and started <= expected and requested.keys() <= expected,
-            'INCOMPLETE_PROCESS_EXIT', 'Fork and process identities disagree')
-    require(kernel_codes.keys() == expected, 'INCOMPLETE_PROCESS_EXIT', 'Missing child pidfd or kernel wait status')
-    exits = {}
-    for pid, code in kernel_codes.items():
+    require(root_pid in started and started <= parents.keys() and requested.keys() <= parents.keys()
+            and kernel_codes.keys() == parents.keys(), 'INCOMPLETE_PROCESS_EXIT',
+            'Missing fork relationship, process descriptor or kernel wait status')
+    rows = []
+    for pid, parent in parents.items():
+        current, visited = pid, set()
+        while current != root_pid:
+            require(current in parents and current not in visited,
+                    'INCOMPLETE_PROCESS_EXIT', 'Disconnected fork tree')
+            visited.add(current)
+            current = parents[current]
+        code = kernel_codes[pid]
         require(code < 0 or requested.get(pid) == code, 'INCOMPLETE_PROCESS_EXIT',
                 'Guest exit and kernel terminal status disagree for PID ' + str(pid))
-        exits['parent' if pid == root_pid else 'child'] = {
-            'pid': pid, 'returncode': code, 'signal': -code if code < 0 else None}
+        rows.append({'pid': pid, 'parent_pid': parent, 'returncode': code, 'signal': -code if code < 0 else None})
+    return rows
+
+
+def _process_exits(channel, root_pid, root_code, deadline):
+    exits = {}
+    for row in _process_tree(channel, root_pid, root_code, deadline, 2):
+        role = 'parent' if row.pop('parent_pid') is None else 'child'
+        exits[role] = row
     return exits
 
 
-def run_fork_replay(command, case, directory, *, plugin, payload_role, **limits):
+def run_observed_process(command, case, directory, *, plugin_option, max_processes=None, **limits):
     receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     with receiver, sender, ExitStack() as handles:
         receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
@@ -382,19 +398,28 @@ def run_fork_replay(command, case, directory, *, plugin, payload_role, **limits)
                     raise
             else:
                 handles.callback(os.close, fd)
-        command = [command[0], '-plugin', f'{plugin},tf-replay-exits={fd}', *command[1:]]
+        command = [command[0], '-plugin', f'{plugin_option}{fd}', *command[1:]]
         result = run_process(command, case, directory, wait_for_group=True, pass_fds=(fd,), **limits)
         handles.close()
         sender.close()
-        result['payload_role'] = payload_role
         deadline = time.monotonic() + max(0, limits.get('timeout', 10) - result['wall_seconds'])
         try:
-            result['process_exits'] = _process_exits(receiver, result['root_pid'], result['returncode'], deadline)
+            args = (receiver, result['root_pid'], result['returncode'], deadline)
+            if max_processes is None:
+                result['process_exits'] = _process_exits(*args)
+            else:
+                result['process_tree'] = _process_tree(*args, max_processes)
         except (OSError, UnpackError) as error:
             result['process_exit_error'] = dict(reason=getattr(error, 'reason', 'INCOMPLETE_PROCESS_EXIT'),
                                                 detail=str(error))
-        save(Path(directory) / 'result.json', result)
         return result
+
+
+def run_fork_replay(command, case, directory, *, plugin, payload_role, **limits):
+    result = run_observed_process(command, case, directory, plugin_option=f'{plugin},tf-replay-exits=', **limits)
+    result['payload_role'] = payload_role
+    save(Path(directory) / 'result.json', result)
+    return result
 
 
 def compare_results(results, *, same_process_tree=False):

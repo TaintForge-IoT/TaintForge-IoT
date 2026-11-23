@@ -31,6 +31,7 @@ static TfConcolic *g_concolic;
 #include "qemu_plugin_compat.h"
 #include "elf_image.h"
 #include "phase1_io.h"
+#include "process_event.h"
 #include "phase1_retire.h"
 #include "phase1_resources.h"
 
@@ -52,9 +53,6 @@ static TfPhase1Io g_phase1;
 static TfRetire g_retire = {.fd = -1};
 static qemu_plugin_id_t g_plugin_id;
 static bool g_released, g_exported;
-#define I386_SIGCHLD 17U
-#define I386_CLONE_CHILD_CLEARTID 0x00200000U
-#define I386_CLONE_CHILD_SETTID   0x01000000U
 static uint64_t g_fork_seq;
 static int64_t g_fork_syscall;
 static uint32_t g_fork_flags, g_fork_child_settid;
@@ -63,61 +61,11 @@ static bool g_unsupported_fork_mapping, g_fork_memory_unknown;
 static uint64_t g_released_pages, g_released_bitmaps, g_released_register_buffers;
 static uint64_t g_explicitly_wiped_bytes;
 
-static bool process_transition_i386(int64_t num) {
-    return num == 2 || num == 11 || num == 120 || num == 190 || num == 358 || num == 435;
-}
-
-static bool private_fork_i386(int64_t num, uint32_t flags, uint32_t stack) {
-    uint32_t tid_flags = I386_CLONE_CHILD_SETTID | I386_CLONE_CHILD_CLEARTID;
-    return num == 2 || (num == 120 && !stack && (flags & ~tid_flags) == I386_SIGCHLD);
-}
-
 /* Retain the child's actual wait status across a guest waitpid. Both sides
  * of fork can hand off its pidfd: the child may die before its first callback
  * or be automatically reaped before the parent callback. */
 static int replay_socket;
 static bool replay_forked;
-
-static bool replay_event(char kind, int32_t value, pid_t observe) {
-    int32_t packet[2] = {kind, value};
-    struct iovec vec = {.iov_base = packet, .iov_len = sizeof(packet)};
-    struct msghdr msg = {.msg_iov = &vec, .msg_iovlen = 1};
-    union { struct cmsghdr align; char buf[CMSG_SPACE(sizeof(int))]; } control = {0};
-    int pidfd = -1;
-#ifdef SYS_pidfd_open
-    if (observe > 0)
-        pidfd = syscall(SYS_pidfd_open, observe, 0);
-#endif
-    if (pidfd >= 0 && kind == 'F') {
-        /* With SIGCHLD ignored the numeric PID could already have been
-         * recycled. Only pass a pidfd for a child we can still wait on. */
-        siginfo_t info = {0};
-        int rc;
-        do {
-            rc = waitid(P_PID, (id_t)observe, &info, WEXITED | WNOHANG | WNOWAIT);
-        } while (rc < 0 && errno == EINTR);
-        if (rc < 0) {
-            close(pidfd);
-            pidfd = -1;
-        }
-    }
-    if (pidfd >= 0) {
-        msg.msg_control = control.buf;
-        msg.msg_controllen = sizeof(control.buf);
-        struct cmsghdr *header = CMSG_FIRSTHDR(&msg);
-        header->cmsg_level = SOL_SOCKET;
-        header->cmsg_type = SCM_RIGHTS;
-        header->cmsg_len = CMSG_LEN(sizeof(pidfd));
-        memcpy(CMSG_DATA(header), &pidfd, sizeof(pidfd));
-    }
-    ssize_t n;
-    do {
-        n = sendmsg(replay_socket, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
-    } while (n < 0 && errno == EINTR);
-    if (pidfd >= 0)
-        close(pidfd);
-    return n == sizeof(packet);
-}
 
 static void replay_syscall(qemu_plugin_id_t id, unsigned cpu, int64_t num,
                            uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -126,10 +74,10 @@ static void replay_syscall(qemu_plugin_id_t id, unsigned cpu, int64_t num,
     (void)a5; (void)a6; (void)a7; (void)a8;
     if (num == 57 || num == 66 || (process_transition_i386(num) &&
         (replay_forked || !private_fork_i386(num, a1, a2)))) {
-        replay_event('!', num, 0);
+        tf_process_event(replay_socket, '!', num, 0);
         _exit(125);
     }
-    if ((num == 1 || num == 252) && !replay_event('X', a1 & 255U, 0))
+    if ((num == 1 || num == 252) && !tf_process_event(replay_socket, 'X', a1 & 255U, 0))
         _exit(125);
 }
 
@@ -137,7 +85,7 @@ static void replay_syscall_ret(qemu_plugin_id_t id, unsigned cpu, int64_t num, i
     (void)id; (void)cpu;
     if ((num == 2 || num == 120) && ret >= 0) {
         replay_forked = true;
-        if (!replay_event(ret ? 'F' : 'C', ret, ret ? (pid_t)ret : getpid()))
+        if (!tf_process_event(replay_socket, ret ? 'F' : 'C', ret, ret ? (pid_t)ret : getpid()))
             _exit(125);
     }
 }
@@ -149,7 +97,7 @@ static int replay_install(qemu_plugin_id_t id, const qemu_info_t *info, const ch
         !info || !info->target_name || strcmp(info->target_name, "i386") || info->system_emulation)
         return -1;
     replay_socket = (int)fd;
-    if (!replay_event('S', 0, 0))
+    if (!tf_process_event(replay_socket, 'S', 0, 0))
         return -1;
     const TfQemuPluginCallbacks callbacks = {.syscall = replay_syscall, .syscall_ret = replay_syscall_ret};
     tf_qemu_register_callbacks(id, &callbacks);
