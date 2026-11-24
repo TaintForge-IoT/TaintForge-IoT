@@ -8,12 +8,14 @@ An optional original is first read after the observed image has been rebuilt.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -298,12 +300,30 @@ def validate_candidate_image(run, events, *, trace_archive=False):
 
 
 def _failure(error):
-    return dict(schema_version=1, status='FAIL', reason=getattr(error, 'reason', type(error).__name__),
-                errors=[str(error)], **SCOPE)
+    summary = dict(schema_version=1, status='FAIL', reason=getattr(error, 'reason', type(error).__name__),
+                   errors=[str(error)], **SCOPE)
+    if hasattr(error, 'mapping_diagnosis'):
+        summary['mapping_diagnosis'] = error.mapping_diagnosis
+    return summary
+
+
+def _mapping_failure(qemu, artifacts, hashes, case, output, executions, **options):
+    from unpacker.unpack_mapping import diagnose
+    folder = output / 'mapping-diagnosis'
+    try:
+        report = diagnose(qemu, artifacts['packed'], artifacts['rebuilt'], case, folder, executions,
+                          expected_hashes=hashes, **options)
+        receipt = dict(status=report['status'], case_id=case['id'], report='mapping-diagnosis/report.json')
+    except (OSError, subprocess.SubprocessError) as error:
+        receipt = dict(status='INCONCLUSIVE', case_id=case['id'], detail=str(error))
+    failure = UnpackError('CASE_EXECUTION_FAILED', f"Rebuilt SIGSEGV on {case['id']}. "
+                          f"Mapping diagnosis: {receipt['status']}.")
+    failure.mapping_diagnosis = receipt
+    return failure
 
 
 def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=120,
-                  rss_limit_mib=2048, capture_bytes=64 * 1024**2, follow_fork=False):
+                  rss_limit_mib=2048, capture_bytes=64 * 1024**2, follow_fork=False, diagnose_mappings=False):
     """Fresh capture/rebuild and selected-case differential runs; no OEP proof."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -337,6 +357,8 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
         sources.mkdir()
         source_files = (ROOT / 'unpack.py', ROOT / 'unpack_process.py',
                         ROOT / 'mvp/ct_elf.py', PROJECT / 'taintforge_env/phase1_runtime.py')
+        if diagnose_mappings:
+            source_files += (ROOT / 'unpack_mapping.py',)
         source_hashes = {}
         for path in source_files:
             name = str(path.relative_to(PROJECT))
@@ -418,21 +440,30 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
             for name, path in artifacts.items():
                 executions = []
                 row['executions'][name] = executions
+                execute = run_process
+                if follow_fork:
+                    role = family['selected_role'] if name == 'packed' else 'parent'
+                    execute = partial(run_fork_replay, plugin=runtime.plugin, payload_role=role)
                 for repeat in range(2):
                     command = [str(qemu), '-0', 'target.elf', str(path), *case['argv']]
                     directory = output / 'runs' / f'case-{index:03d}' / name / str(repeat)
                     limits = dict(timeout=timeout, file_limit=1024**2, rss_limit_mib=rss_limit_mib,
                                   environment=environment)
-                    if follow_fork:
-                        role = family['selected_role'] if name == 'packed' else 'parent'
-                        result = run_fork_replay(command, case, directory, plugin=runtime.plugin,
-                                                 payload_role=role, **limits)
-                    else:
-                        result = run_process(command, case, directory, **limits)
+                    result = execute(command, case, directory, **limits)
                     executions.append(result)
                     results.append(result)
                     save(output / 'comparisons.json', comparisons)
-                    if not follow_fork or any(result[k] for k in ('timed_out', 'rss_limit_hit', 'output_limit_exceeded')):
+                    limited = any(result[k] for k in ('timed_out', 'rss_limit_hit', 'output_limit_exceeded'))
+                    if (diagnose_mappings and name == 'rebuilt' and result['returncode'] == -signal.SIGSEGV
+                            and not limited and 'process_exit_error' not in result):
+                        error = _mapping_failure(qemu, artifacts, artifact_hashes, case, output,
+                            row['executions'], timeout=timeout, rss_limit_mib=rss_limit_mib,
+                            environment=environment, follow_fork=family is not None and family['fork'] is not None,
+                            replay_process=execute)
+                        row['mapping_diagnosis'] = error.mapping_diagnosis
+                        save(output / 'comparisons.json', comparisons)
+                        raise error
+                    if not follow_fork or limited:
                         require(compare_results([result]), 'CASE_EXECUTION_FAILED',
                                 'Execution signaled, timed out or exceeded a resource budget on case ' + case['id'])
                     if 'process_exit_error' in result:
@@ -504,6 +535,8 @@ def main(argv=None):
     parser.add_argument('--timeout', type=float, default=120)
     parser.add_argument('--rss-limit-mib', type=int, default=2048)
     parser.add_argument('--capture-bytes', type=int, default=64 * 1024**2)
+    parser.add_argument('--diagnose-mappings', action='store_true',
+                        help='On a rebuilt SIGSEGV, trace a missing private RW mapping and replay a diagnostic copy')
     args = parser.parse_args(argv)
     output = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix='unpack-new.', dir=ROOT)) / 'probe'
     if output.exists() or output.is_symlink():
@@ -518,6 +551,7 @@ def main(argv=None):
             build_base = Path(tempfile.mkdtemp(prefix='unpack-build.', dir=output.parent))
             plugin = build_plugin(args.qemu_include or os.environ.get('TF_QEMU_INCLUDE'), build_base / 'plugin')
         report = unpack_sample(args.packed, output, qemu=args.qemu, plugin=plugin,
+            diagnose_mappings=args.diagnose_mappings,
             cases=cases, oracle=args.oracle, timeout=args.timeout,
             rss_limit_mib=args.rss_limit_mib, capture_bytes=args.capture_bytes, follow_fork=args.follow_fork)
         print(report['status'])
