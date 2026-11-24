@@ -59,6 +59,77 @@ class NetworkLifecycleTests(unittest.TestCase):
             process_start_grace_seconds=0), executor=FakeExecutor(), process_supervisor=FakeSupervisor(),
             port_allocator=FakePortAllocator())
 
+    def exercise_signal_timeout(self, *, deliver_on, shutdown_ms, expect_failure=False):
+        owner = self.owner(shutdown_timeout_ms=shutdown_ms)
+        process = CapturedNetworkProcess([sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=PROJECT, stdout_path=self.logs / "stdout", stderr_path=self.logs / "stderr", runtime=owner)
+        self.processes.append(process)
+        backend = self.backend()
+        backend.runtime, backend.processes = owner, [process]
+        calls = []
+
+        def timed_out(command, *, timeout, **kwargs):
+            self.assertEqual(command[:2], ["sudo", "-n"])
+            sig = signal.Signals(int(command[4]))
+            self.assertEqual(command[-2:], ["--", f"-{process.process.pid}"])
+            calls.append((sig, timeout))
+            if sig == deliver_on:
+                os.killpg(process.process.pid, sig)
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        with patch.object(process, "command", ["sudo", "test-responder"]), \
+             patch("taintforge_env.network_process.subprocess.run", side_effect=timed_out):
+            if expect_failure:
+                with self.assertRaises(ControlledNetworkError) as failure:
+                    backend._stop_services()
+                self.assertIn("signal helper", str(failure.exception))
+                self.assertTrue(process._group_alive())
+                self.assertEqual(backend.processes, [process])
+            else:
+                backend._stop_services()
+                self.assertFalse(process._group_alive())
+                self.assertFalse(any(thread.is_alive() for thread in process.threads))
+                self.assertEqual(backend.processes, [])
+        return calls
+
+    def test_timed_out_term_helper_with_confirmed_group_exit(self):
+        calls = self.exercise_signal_timeout(deliver_on=signal.SIGTERM, shutdown_ms=5000)
+        self.assertEqual([sig for sig, _ in calls], [signal.SIGTERM])
+        self.assertGreater(calls[0][1], 0.2)
+        self.assertLess(calls[0][1], 3.0)
+
+    def test_timed_out_term_escalates_and_confirms_kill(self):
+        calls = self.exercise_signal_timeout(deliver_on=signal.SIGKILL, shutdown_ms=500)
+        self.assertEqual([sig for sig, _ in calls], [signal.SIGTERM, signal.SIGKILL])
+
+    def test_two_unconfirmed_helpers_leave_live_group_in_inventory(self):
+        calls = self.exercise_signal_timeout(deliver_on=None, shutdown_ms=200, expect_failure=True)
+        self.assertEqual([sig for sig, _ in calls], [signal.SIGTERM, signal.SIGKILL])
+
+    def test_timeout_without_group_identity_cannot_be_cleared_by_leader_exit(self):
+        process = CapturedNetworkProcess.__new__(CapturedNetworkProcess)
+        process.command, process.proc_pid, process.birth = ["sudo"], None, None
+        backend = self.backend()
+        backend.processes = [process]
+        timeout = subprocess.TimeoutExpired(["sudo", "-n", "kill"], 0.2)
+        with patch.object(process, "_signal", side_effect=timeout), patch.object(process, "wait", return_value=0):
+            with self.assertRaisesRegex(ControlledNetworkError, "timed out"):
+                backend._stop_services()
+        self.assertEqual(backend.processes, [process])
+
+    def test_signal_identity_error_is_fatal_after_wait(self):
+        process = CapturedNetworkProcess.__new__(CapturedNetworkProcess)
+        process.command, process.proc_pid, process.birth = ["sudo"], 31, "123"
+        process.runtime = self.owner()
+        backend = self.backend()
+        backend.processes = [process]
+        with patch("taintforge_env.network_process.process_start", return_value="456"), \
+             patch("taintforge_env.network_process.subprocess.run") as privileged, \
+             patch.object(process, "wait", return_value=0):
+            with self.assertRaisesRegex(ControlledNetworkError, "identity changed"):
+                backend._stop_services()
+        privileged.assert_not_called()
+
     def test_payload_alias_is_created_once_for_many_events(self):
         source = self.logs / "network_host"
         source.mkdir()

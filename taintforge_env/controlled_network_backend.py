@@ -857,31 +857,60 @@ class ControlledNetworkBackend:
         self._wait_for_services()
 
     def _stop_services(self) -> None:
+        from .network_process import CapturedNetworkProcess
+
         self._stopping = True
         timeout = self.runtime.limits.shutdown_timeout_ms / 1000 if self.runtime is not None else 5
         started = time.monotonic()
         graceful_deadline, deadline = started + timeout * 0.6, started + timeout
         errors = []
-        remaining = []
-        for process in reversed(self.processes):
-            try:
-                process.terminate()
-            except Exception as exc:
-                errors.append(f"terminate {process.command}: {exc}")
-        for process in reversed(self.processes):
+        uncertain = {}
+        remaining = set()
+
+        def signal_groups(processes, sig, until):
+            for index, process in enumerate(processes):
+                try:
+                    if isinstance(process, CapturedNetworkProcess):
+                        # Share the time left between helpers, keeping time for wait().
+                        left = len(processes) - index
+                        budget = max(0.001, (until - time.monotonic()) / (2 * left))
+                        issue = process.signal_for_cleanup(sig, timeout=budget)
+                        if issue is not None:
+                            uncertain[id(process)] = issue
+                    elif sig == signal.SIGTERM:
+                        process.terminate()
+                    else:
+                        process.kill()
+                except Exception as exc:
+                    if isinstance(exc, subprocess.TimeoutExpired):
+                        # The signal path could not defer this timeout for a group check.
+                        remaining.add(id(process))
+                    errors.append(f"{sig.name} {process.command}: {exc}")
+
+        def wait_failed(process, exc):
+            remaining.add(id(process))
+            detail = f"wait {process.command}: {exc}"
+            if id(process) in uncertain:
+                detail += f" (signal helper: {uncertain[id(process)]})"
+            errors.append(detail)
+
+        services = list(reversed(self.processes))
+        signal_groups(services, signal.SIGTERM, graceful_deadline)
+        survivors = []
+        for process in services:
             try:
                 process.wait(timeout=max(0.001, graceful_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                try:
-                    process.kill()
-                    process.wait(timeout=max(0.001, deadline - time.monotonic()))
-                except Exception as exc:
-                    remaining.append(process)
-                    errors.append(f"kill/wait {process.command}: {exc}")
+                survivors.append(process)
             except Exception as exc:
-                remaining.append(process)
-                errors.append(f"wait {process.command}: {exc}")
-        self.processes = list(reversed(remaining))
+                wait_failed(process, exc)
+        signal_groups(survivors, signal.SIGKILL, deadline)
+        for process in survivors:
+            try:
+                process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except Exception as exc:
+                wait_failed(process, exc)
+        self.processes = [process for process in self.processes if id(process) in remaining]
         if errors:
             raise ControlledNetworkError("; ".join(errors))
 

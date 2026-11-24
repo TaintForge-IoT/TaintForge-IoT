@@ -90,6 +90,18 @@ class CapturedNetworkProcess:
     def kill(self, *, timeout=None):
         self._signal(signal.SIGKILL, timeout=timeout)
 
+    def signal_for_cleanup(self, sig, *, timeout):
+        """Return an unconfirmed helper timeout for the caller's subsequent wait."""
+        try:
+            self._signal(sig, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # sudo may exit after kill(2) has already delivered the signal.
+            # Only defer this error when wait() can examine the owned group.
+            if self.proc_pid is None or self.birth is None:
+                raise
+            return exc
+        return None
+
     def wait(self, timeout=None):
         deadline = time.monotonic() + timeout if timeout is not None else None
         result = self.process.wait(timeout=timeout)
