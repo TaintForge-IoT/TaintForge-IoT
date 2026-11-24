@@ -150,7 +150,7 @@ class Phase1Run:
                        "ir-observed-mov-gs", "ir-observed-set-tid-address", "ir-xmm-movq",
                        "ir-lock-or32", "ir-observed-sigprocmask", "ir-observed-sigaction",
                        "ir-observed-stdio", "ir-sse2-dwords"}
-        capture_choices = {"tf-capture": {"entry", "exit"}, "dse-check": {"off"},
+        capture_choices = {"tf-follow-fork": {"on"}, "tf-capture": {"entry", "exit"}, "dse-check": {"off"},
                            "runtime-log": {"summary", "roots"} if diagnostic_roots else {"summary"}}
         capture_budgets = {"tf-max-capture-bytes": (1, 1024 * 1024 * 1024),
                            "ir-trace-capacity": (2, 512 * 1024)}
@@ -175,6 +175,13 @@ class Phase1Run:
                 minimum, maximum = capture_budgets[key]
                 if re.fullmatch(r"[0-9]{1,10}", value) is None or not minimum <= int(value) <= maximum:
                     raise Phase1RuntimeError(f"invalid per-run capture budget: {option}")
+        if "tf-follow-fork=on" in extra:
+            if (ir or "tf-capture=entry" not in extra or "dse-check=off" not in extra
+                    or len(self.analysis_instance_id) + len("-child") > 120):
+                raise Phase1RuntimeError("fork capture requires entry capture without IR/DSE and room for a child ID")
+            child = self.directory / "child"
+            if child.exists() or child.is_symlink():
+                raise Phase1RuntimeError(f"refusing reuse of child capture directory: {child}")
         options.extend(extra)
         if any("," in value or "\n" in value for value in options):
             raise Phase1RuntimeError("QEMU plugin arguments cannot contain commas or newlines")

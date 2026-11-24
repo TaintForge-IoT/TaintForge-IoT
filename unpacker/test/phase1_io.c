@@ -145,6 +145,51 @@ static bool number(const char *value, uint64_t *out, uint64_t maximum) {
     return true;
 }
 
+static bool open_events(TfPhase1Io *io) {
+    int fd = open(io->events_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return false;
+    io->events = fdopen(fd, "w");
+    if (!io->events)
+        close(fd);
+    return io->events != NULL;
+}
+
+/* Only the returning child calls this. All parent events were flushed before
+ * fork. An exclusive directory keeps the two processes' temporary dumps apart. */
+bool tf_phase1_open_child(TfPhase1Io *io) {
+    if (!io->follow_fork || !io->events || getpid() == io->owner)
+        return false;
+    FILE *parent_events = io->events;
+    io->events = NULL;
+    if (fclose(parent_events) != 0)
+        return false;
+    char *parent = g_path_get_dirname(io->events_path);
+    char *directory = g_build_filename(parent, "child", NULL);
+    g_free(parent);
+    if (mkdir(directory, 0700) != 0) {
+        g_free(directory);
+        return false;
+    }
+    char **paths[] = {&io->events_path, &io->manifest_path, &io->dump_path,
+                      &io->report_path, &io->ir_path};
+    for (size_t i = 0; i < G_N_ELEMENTS(paths); ++i) {
+        char *name = g_path_get_basename(*paths[i]);
+        g_free(*paths[i]);
+        *paths[i] = g_build_filename(directory, name, NULL);
+        g_free(name);
+    }
+    g_free(directory);
+    if (!open_events(io))
+        return false;
+    char *instance = g_strconcat(io->instance, "-child", NULL);
+    g_free(io->instance);
+    io->instance = instance;
+    io->event_seq = 0;
+    io->owner = getpid();
+    return true;
+}
+
 bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv) {
     memset(io, 0, sizeof(*io));
     io->owner = getpid();
@@ -180,7 +225,11 @@ bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv) {
             slot = &io->report_path;
         else if (OPTION("tf-ir-report"))
             slot = &io->ir_path;
-        else if (OPTION("tf-capture")) {
+        else if (OPTION("tf-follow-fork")) {
+            if (io->follow_fork || strcmp(value, "on"))
+                goto invalid;
+            io->follow_fork = true;
+        } else if (OPTION("tf-capture")) {
             if (strcmp(value, "entry") && strcmp(value, "exit"))
                 goto invalid;
             io->capture_at_entry = !strcmp(value, "entry");
@@ -218,7 +267,8 @@ bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv) {
         io->report_path = g_strdup("unpacked.json");
         return true;
     }
-    if (!valid_id(io->session) || !valid_id(io->attempt) || !valid_id(io->instance))
+    if (!valid_id(io->session) || !valid_id(io->attempt) || !valid_id(io->instance) ||
+        (io->follow_fork && strlen(io->instance) + strlen("-child") > 120))
         goto invalid;
     char *paths[] = {io->events_path, io->manifest_path, io->dump_path, io->report_path,
                      io->ir_path};
@@ -237,14 +287,8 @@ bool tf_phase1_configure(TfPhase1Io *io, int argc, char **argv) {
             if (!strcmp(paths[i], paths[j]))
                 goto invalid;
     }
-    int fd = open(io->events_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0)
+    if (!open_events(io))
         goto invalid;
-    io->events = fdopen(fd, "w");
-    if (!io->events) {
-        close(fd);
-        goto invalid;
-    }
     return true;
 invalid:
     fprintf(stderr,
@@ -306,16 +350,19 @@ bool tf_phase1_start(TfPhase1Io *io, const char *target, bool system, unsigned a
     char *qtarget = tf_json_string(target);
     char *payload = g_strdup_printf(
         "{\"build_id\":\"%s\",\"target\":%s,\"mode\":\"%s\",\"plugin_api\":%u,"
-        "\"profile\":\"linux-i386-single-thread-v1\",\"flags_contract\":\"%s\","
+        "\"profile\":\"%s\",\"flags_contract\":\"%s\","
         "\"ir_enabled\":%s,\"runtime_load\":\"observed\",\"register_observation\":\"pending\","
-        "\"max_guest_processes\":1,\"max_guest_threads\":1,\"event_schema\":1,\"report_schema\":1,"
+        "\"max_guest_processes\":%u,\"max_guest_threads\":%u,%s\"event_schema\":1,\"report_schema\":1,"
         "\"checkpoint\":\"unsupported\",\"external_memory_write\":\"unsupported\","
         "\"provenance_export\":\"unsupported\",\"analysis_detach\":\"%s\","
         "\"control_channel_protection\":\"unverified\",\"capture_scope\":\"tracked_program_pages\","
         "\"event_transport\":\"regular_file\",\"callback_storage_io\":\"synchronous\","
         "\"ir_match_scope\":\"selected_trace_window_only\",\"oep_policy\":\"heuristic_candidate\"}",
         TF_PHASE1_BUILD_ID, qtarget, system ? "system" : "linux-user", api,
+        io->follow_fork ? "linux-i386-one-fork-v1" : "linux-i386-single-thread-v1",
         flags ? "taintforge_x86_flags_v1" : "unverified", ir ? "true" : "false",
+        io->follow_fork ? 2U : 1U, io->follow_fork ? 2U : 1U,
+        io->follow_fork ? "\"max_threads_per_process\":1," : "",
         io->retirement_enabled ? "cooperative-controlled-v1" : "disabled");
     bool written = tf_phase1_event(io, "analysis_started", reason ? "unsupported" : "observing",
                                    reason, payload);

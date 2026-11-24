@@ -8,12 +8,14 @@ An optional original is first read after the observed image has been rebuilt.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -29,13 +31,14 @@ from taintforge_env.phase1_runtime import Phase1Run, Phase1Runtime, Phase1Runtim
 
 try:
     from .mvp import ct_elf
-    from .unpack_process import UnpackError, compare_results, run_process, save, validate_cases
+    from .unpack_process import UnpackError, compare_results, run_fork_replay, run_process, save, validate_cases
 except ImportError:
     from mvp import ct_elf
-    from unpack_process import UnpackError, compare_results, run_process, save, validate_cases
+    from unpack_process import UnpackError, compare_results, run_fork_replay, run_process, save, validate_cases
 
 
 STATUS = 'PASS_WITH_OBSERVED_IMAGE_AND_SELECTED_CASE_EQUIVALENCE'
+FORK_STATUS = 'PASS_WITH_PROCESS_SCOPED_IMAGE_AND_SELECTED_CASE_EQUIVALENCE'
 MAX_INPUT_ELF = 16 * 1024**2
 CAPTURE_EXTRAS = ('tf-capture=entry', 'tf-max-capture-bytes=67108864',
     'dse-check=off', 'ir-trace-capacity=4096', 'runtime-log=summary',
@@ -121,26 +124,39 @@ def build_plugin(qemu_include, output):
     return plugin
 
 
-def validate_capture(run):
-    """Bind a successful candidate-entry image to the selected runtime/run."""
+def _validate_stream(run, follow_fork=False):
+    """Check integrity even for a process which produced no candidate."""
     verification = run.verify()
+    events = run.events()
+    if follow_fork:
+        for event in events:
+            if event['event_type'] == 'profile_lost':
+                raise UnpackError('UNSUPPORTED_FORK_PROFILE', ', '.join(event['incomplete_reasons']))
+        require(events[-1]['data'].get('capture_status') == verification['capture_status']
+                and (verification['capture_status'] != 'not_available' or
+                     not any(e['event_type'] == 'oep_candidate_selected' for e in events)),
+                'INCOMPLETE_CAPTURE', 'Terminal event and capture availability disagree')
     require(verification.get('capture_status') != 'budget_exhausted',
             'CAPTURE_BUDGET_EXHAUSTED', 'Production candidate capture exhausted its byte budget')
+    statuses = ('success', 'not_available') if follow_fork else ('success',)
+    process_limit = 2 if follow_fork else 1
+    profile = 'linux-i386-one-fork-v1' if follow_fork else 'linux-i386-single-thread-v1'
     require(verification.get('runtime_observed') is True
             and verification.get('analysis_status') in ('observed', 'partial')
             and verification.get('stream_status') in ('completed', 'partial')
-            and verification.get('capture_status') == 'success',
+            and verification.get('capture_status') in statuses,
             'INCOMPLETE_CAPTURE', 'Runtime, event stream or selected capture is incomplete')
-    events = run.events()
     capabilities = events[0].get('data', {})
     require(capabilities.get('target') == 'i386' and capabilities.get('mode') == 'linux-user'
-            and capabilities.get('profile') == 'linux-i386-single-thread-v1'
+            and capabilities.get('profile') == profile
             and capabilities.get('ir_enabled') is False
             and type(capabilities.get('max_guest_processes')) is int
-            and capabilities['max_guest_processes'] == 1
+            and capabilities['max_guest_processes'] == process_limit
             and type(capabilities.get('max_guest_threads')) is int
-            and capabilities['max_guest_threads'] == 1,
-            'UNSUPPORTED_PROFILE', 'Require observed single-process/single-thread i386 Linux capture')
+            and capabilities['max_guest_threads'] == process_limit
+            and (not follow_fork or (type(capabilities.get('max_threads_per_process')) is int
+                                     and capabilities['max_threads_per_process'] == 1)),
+            'UNSUPPORTED_PROFILE', 'Capture runtime does not match the requested i386 Linux profile')
     require(not any(e.get('event_type') in ('profile_lost', 'data_loss') for e in events),
             'INCOMPLETE_CAPTURE', 'The supported execution profile or event stream was lost')
     analyses = [e.get('data', {}) for e in events if e.get('event_type') == 'analysis_summary']
@@ -150,8 +166,78 @@ def validate_capture(run):
             and all(type(analyses[0].get(k)) is int and analyses[0][k] == 0
                     for k in ('trace_dropped', 'trace_incomplete', 'ir_errors', 'ir_mismatches')),
             'INCOMPLETE_CAPTURE', 'Trace/shadow integrity or analysis error checks are incomplete')
+    return events, verification
+
+
+def validate_capture(run):
+    events, verification = _validate_stream(run)
     report, regions = validate_candidate_image(run, events)
     return report, regions, verification
+
+
+def select_fork_capture(parent, captured_process, receipt_path):
+    parent_events, parent_check = _validate_stream(parent, follow_fork=True)
+    streams = [('parent', parent, parent_events, parent_check)]
+    directory = parent.directory / 'child'
+    forks = [e for e in parent_events if e['event_type'] == 'process_fork']
+    require(len(forks) <= 1 and (bool(forks) == directory.is_dir()) and not directory.is_symlink(),
+            'INCOMPLETE_FORK', 'Child directory and parent fork record disagree')
+    fork = None
+    if forks:
+        child = Phase1Run(parent.runtime, parent.session_id, parent.attempt_id,
+                          parent.analysis_instance_id + '-child', directory)
+        child_events, child_check = _validate_stream(child, follow_fork=True)
+        births = [e for e in child_events if e['event_type'] == 'process_fork_child']
+        fork = forks[0]['data']
+        require(len(births) == 1 and births[0]['data'] == fork
+                and all(type(fork.get(k)) is int and fork[k] > 0
+                        for k in ('parent_pid', 'child_pid', 'fork_trace_seq'))
+                and fork['parent_pid'] == captured_process['root_pid'] and fork['parent_pid'] != fork['child_pid']
+                and type(fork.get('syscall_nr')) is int and type(fork.get('clone_flags')) is int
+                and ((fork['syscall_nr'] == 2 and fork['clone_flags'] == 0) or
+                     (fork['syscall_nr'] == 120 and (fork['clone_flags'] & ~0x01200000) == 17))
+                and fork['fork_trace_seq'] == births[0]['trace_seq'] == forks[0]['trace_seq']
+                and not any(e['event_type'] == 'process_fork' for e in child_events)
+                and any(e['event_type'] == 'runtime_observation' and
+                        e['trace_seq'] > fork['fork_trace_seq'] for e in child_events),
+                'INCOMPLETE_FORK', 'The two process streams do not identify the same fork')
+        streams.append(('child', child, child_events, child_check))
+    processes = {}
+    for role, _, events, check in streams:
+        pid = captured_process['root_pid'] if role == 'parent' else fork['child_pid']
+        exits = [e['data'] for e in events if e['event_type'] == 'process_exit_requested']
+        require(len(exits) == 1 and exits[0].get('pid') == pid
+                and type(exits[0].get('status')) is int and 0 <= exits[0]['status'] <= 255
+                and (role != 'parent' or exits[0]['status'] == captured_process['returncode']),
+                'INCOMPLETE_PROCESS_EXIT', 'Missing or inconsistent guest exit in ' + role)
+        processes[role] = dict(check, pid=pid, requested_exit_status=exits[0]['status'])
+    receipt = dict(selected_role=None, fork=fork, capture_budget_scope='per_process',
+                   entry_store_scope='observed_guest_instruction_stores',
+                   cross_process_input_provenance='unverified', processes=processes)
+    save(receipt_path, receipt)
+    available = [s for s in streams if s[3]['capture_status'] == 'success']
+    require(bool(available), 'NO_PROCESS_CAPTURE', 'No process produced a candidate-entry image')
+    require(len(available) == 1, 'AMBIGUOUS_PROCESS_CAPTURE', 'Both processes produced a candidate-entry image')
+    role, run, events, verification = available[0]
+    report, regions = validate_candidate_image(run, events)
+    receipt.update(selected_role=role, selected_directory=str(run.directory.relative_to(parent.directory.parent)),
+                   selected_instance=run.analysis_instance_id)
+    if role == 'child':
+        origins = [e['data'] for e in events if e['event_type'] == 'fork_entry_stores'
+                   and e['trace_seq'] == report['capture_trace_seq']
+                   and e['data'].get('candidate_id') == report['capture_candidate_id']]
+        require(len(origins) == 1 and origins[0].get('address') == report['capture_pc']
+                and report['capture_trace_seq'] > fork['fork_trace_seq'],
+                'INCOMPLETE_FORK', 'Missing post-fork entry/store observation')
+        origin = origins[0]
+        require(all(type(origin.get(k)) is int and origin[k] >= 0 for k in
+                    ('entry_bytes', 'prefork_guest_store_bytes', 'child_guest_store_bytes'))
+                and 0 < origin['prefork_guest_store_bytes'] + origin['child_guest_store_bytes']
+                    <= origin['entry_bytes'] <= 15,
+                'INCOMPLETE_FORK', 'Invalid guest-store counts for the selected instruction')
+        receipt['entry_stores'] = origin
+    save(receipt_path, receipt)
+    return run, report, regions, verification, receipt, [s[1] for s in streams]
 
 
 def validate_candidate_image(run, events, *, trace_archive=False):
@@ -214,12 +300,30 @@ def validate_candidate_image(run, events, *, trace_archive=False):
 
 
 def _failure(error):
-    return dict(schema_version=1, status='FAIL', reason=getattr(error, 'reason', type(error).__name__),
-                errors=[str(error)], **SCOPE)
+    summary = dict(schema_version=1, status='FAIL', reason=getattr(error, 'reason', type(error).__name__),
+                   errors=[str(error)], **SCOPE)
+    if hasattr(error, 'mapping_diagnosis'):
+        summary['mapping_diagnosis'] = error.mapping_diagnosis
+    return summary
+
+
+def _mapping_failure(qemu, artifacts, hashes, case, output, executions, **options):
+    from unpacker.unpack_mapping import diagnose
+    folder = output / 'mapping-diagnosis'
+    try:
+        report = diagnose(qemu, artifacts['packed'], artifacts['rebuilt'], case, folder, executions,
+                          expected_hashes=hashes, **options)
+        receipt = dict(status=report['status'], case_id=case['id'], report='mapping-diagnosis/report.json')
+    except (OSError, subprocess.SubprocessError) as error:
+        receipt = dict(status='INCONCLUSIVE', case_id=case['id'], detail=str(error))
+    failure = UnpackError('CASE_EXECUTION_FAILED', f"Rebuilt SIGSEGV on {case['id']}. "
+                          f"Mapping diagnosis: {receipt['status']}.")
+    failure.mapping_diagnosis = receipt
+    return failure
 
 
 def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=120,
-                  rss_limit_mib=2048, capture_bytes=64 * 1024**2):
+                  rss_limit_mib=2048, capture_bytes=64 * 1024**2, follow_fork=False, diagnose_mappings=False):
     """Fresh capture/rebuild and selected-case differential runs; no OEP proof."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -253,6 +357,8 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
         sources.mkdir()
         source_files = (ROOT / 'unpack.py', ROOT / 'unpack_process.py',
                         ROOT / 'mvp/ct_elf.py', PROJECT / 'taintforge_env/phase1_runtime.py')
+        if diagnose_mappings:
+            source_files += (ROOT / 'unpack_mapping.py',)
         source_hashes = {}
         for path in source_files:
             name = str(path.relative_to(PROJECT))
@@ -267,16 +373,24 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
                   tuple('tf-max-capture-bytes=' + str(capture_bytes)
                         if value.startswith('tf-max-capture-bytes=') else value
                         for value in CAPTURE_EXTRAS))
+        if follow_fork:
+            extras += ('tf-follow-fork=on',)
         option = run.plugin_argument(ir=False, extra=extras)
         command = [str(qemu), '-plugin', option, '-0', 'target.elf', str(copied), *cases[0]['argv']]
         print('capture: new packed-ELF run; automatic candidate selection', flush=True)
         captured_process = run_process(command, cases[0], output / 'capture-process',
             timeout=timeout, file_limit=64 * 1024**2, rss_limit_mib=rss_limit_mib,
-            environment=environment)
+            environment=environment, wait_for_group=follow_fork)
         save(output / 'capture-process.json', captured_process)
         require(compare_results([captured_process]), 'CAPTURE_PROCESS_FAILED',
                 'Capture run signaled, timed out or exceeded a resource budget')
-        report, regions, verification = validate_capture(run)
+        family = None
+        if follow_fork:
+            run, report, regions, verification, family, process_runs = select_fork_capture(
+                run, captured_process, output / 'process-capture.json')
+        else:
+            process_runs = [run]
+            report, regions, verification = validate_capture(run)
         save(output / 'capture-verification.json', verification)
         rebuilt = output / 'rebuilt.elf'
         reconstruction = ct_elf.rebuild(run.paths['report'], run.paths['dump'], rebuilt)
@@ -285,7 +399,8 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
         artifact_hashes = {'packed': packed_sha256, 'rebuilt': reconstruction['elf_sha256']}
         require(file_digest(rebuilt) == artifact_hashes['rebuilt'],
                 'IDENTITY_CHANGED', 'Rebuilt ELF differs from its reconstruction receipt')
-        capture_hashes = {name: file_digest(path) for name, path in run.paths.items() if path.is_file()}
+        capture_hashes = {path: file_digest(path) for process in process_runs
+                          for path in process.paths.values() if path.is_file()}
         oracle_receipt = None
         # No original ELF is examined until after reconstruction from observed RAM.
         if oracle is not None:
@@ -325,18 +440,45 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
             for name, path in artifacts.items():
                 executions = []
                 row['executions'][name] = executions
+                execute = run_process
+                if follow_fork:
+                    role = family['selected_role'] if name == 'packed' else 'parent'
+                    execute = partial(run_fork_replay, plugin=runtime.plugin, payload_role=role)
                 for repeat in range(2):
-                    result = run_process([str(qemu), '-0', 'target.elf', str(path), *case['argv']],
-                        case, output / 'runs' / f'case-{index:03d}' / name / str(repeat),
-                        timeout=timeout, file_limit=1024**2, rss_limit_mib=rss_limit_mib,
-                        environment=environment)
+                    command = [str(qemu), '-0', 'target.elf', str(path), *case['argv']]
+                    directory = output / 'runs' / f'case-{index:03d}' / name / str(repeat)
+                    limits = dict(timeout=timeout, file_limit=1024**2, rss_limit_mib=rss_limit_mib,
+                                  environment=environment)
+                    result = execute(command, case, directory, **limits)
                     executions.append(result)
                     results.append(result)
                     save(output / 'comparisons.json', comparisons)
-                    require(compare_results([result]), 'CASE_EXECUTION_FAILED',
-                            'Execution signaled, timed out or exceeded a resource budget on case ' + case['id'])
-            require(compare_results(results), 'SELECTED_CASE_MISMATCH',
-                    'Behavior or repetition determinism differs on case ' + case['id'])
+                    limited = any(result[k] for k in ('timed_out', 'rss_limit_hit', 'output_limit_exceeded'))
+                    if (diagnose_mappings and name == 'rebuilt' and result['returncode'] == -signal.SIGSEGV
+                            and not limited and 'process_exit_error' not in result):
+                        error = _mapping_failure(qemu, artifacts, artifact_hashes, case, output,
+                            row['executions'], timeout=timeout, rss_limit_mib=rss_limit_mib,
+                            environment=environment, follow_fork=family is not None and family['fork'] is not None,
+                            replay_process=execute)
+                        row['mapping_diagnosis'] = error.mapping_diagnosis
+                        save(output / 'comparisons.json', comparisons)
+                        raise error
+                    if not follow_fork or limited:
+                        require(compare_results([result]), 'CASE_EXECUTION_FAILED',
+                                'Execution signaled, timed out or exceeded a resource budget on case ' + case['id'])
+                    if 'process_exit_error' in result:
+                        error = result['process_exit_error']
+                        raise UnpackError(error['reason'], f"{case['id']} ({name}): {error['detail']}")
+            stable = not follow_fork or all(compare_results(repeats, same_process_tree=True)
+                                            for repeats in row['executions'].values())
+            if not stable or not compare_results(results):
+                detail = 'Behavior or repetition determinism differs on case ' + case['id']
+                if follow_fork:
+                    for name, runs in row['executions'].items():
+                        outcomes = [{role: item['returncode'] for role, item in run['process_exits'].items()}
+                                    for run in runs]
+                        detail += f' | {name} exits {outcomes}'
+                raise UnpackError('SELECTED_CASE_MISMATCH', detail)
             row['matched'] = True
             save(output / 'comparisons.json', comparisons)
             print('unpack: matched ' + case['id'], flush=True)
@@ -344,13 +486,13 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
                 'IDENTITY_CHANGED', 'Packed input changed during execution')
         require(all(file_digest(path) == artifact_hashes[name] for name, path in artifacts.items()),
                 'IDENTITY_CHANGED', 'Reconstructed or original ELF changed during execution')
-        require(all(file_digest(run.paths[name]) == digest for name, digest in capture_hashes.items()),
+        require(all(file_digest(path) == digest for path, digest in capture_hashes.items()),
                 'IDENTITY_CHANGED', 'Captured evidence changed during differential execution')
         require(file_digest(qemu) == identity['sha256']
                 and file_digest(runtime.plugin) == runtime.plugin_sha256
                 and file_digest(runtime.manifest) == runtime.manifest_sha256,
                 'IDENTITY_CHANGED', 'Selected host runtime changed during execution')
-        summary = dict(schema_version=1, status=STATUS, errors=[], **SCOPE,
+        summary = dict(schema_version=1, status=FORK_STATUS if follow_fork else STATUS, errors=[], **SCOPE,
             packed_sha256=packed_sha256, rebuilt_sha256=artifact_hashes['rebuilt'],
             entry=ct_elf.integer(report['oep'], 'oep'), selected_candidate_id=report['capture_candidate_id'],
             capture_trace_seq=report['capture_trace_seq'], capture_case_id=cases[0]['id'],
@@ -368,6 +510,9 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
             original_program_headers_recovered=False, original_section_table_recovered=False,
             fresh_process_per_execution=True,
             scope='Observed selected candidate image and equivalence on the supplied finite case set under the selected trusted QEMU/plugin. No formal OEP theorem is established.')
+        if family is not None:
+            summary['process_capture'] = family
+            summary['comparison_fields'].append('process_exits')
         save(output / 'summary.json', summary)
         return summary
     except (UnpackError, ct_elf.CaptureError, Phase1RuntimeError, OSError, ValueError,
@@ -379,6 +524,8 @@ def unpack_sample(packed, output, *, qemu, plugin, cases, oracle=None, timeout=1
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('packed', type=Path)
+    parser.add_argument('--follow-fork', action='store_true',
+                        help='Follow one private i386 fork or fork-equivalent clone before the first OEP candidate')
     parser.add_argument('--cases', required=True, type=Path)
     parser.add_argument('--qemu', required=True, type=Path)
     parser.add_argument('--plugin', type=Path)
@@ -388,6 +535,8 @@ def main(argv=None):
     parser.add_argument('--timeout', type=float, default=120)
     parser.add_argument('--rss-limit-mib', type=int, default=2048)
     parser.add_argument('--capture-bytes', type=int, default=64 * 1024**2)
+    parser.add_argument('--diagnose-mappings', action='store_true',
+                        help='On a rebuilt SIGSEGV, trace a missing private RW mapping and replay a diagnostic copy')
     args = parser.parse_args(argv)
     output = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix='unpack-new.', dir=ROOT)) / 'probe'
     if output.exists() or output.is_symlink():
@@ -402,8 +551,9 @@ def main(argv=None):
             build_base = Path(tempfile.mkdtemp(prefix='unpack-build.', dir=output.parent))
             plugin = build_plugin(args.qemu_include or os.environ.get('TF_QEMU_INCLUDE'), build_base / 'plugin')
         report = unpack_sample(args.packed, output, qemu=args.qemu, plugin=plugin,
+            diagnose_mappings=args.diagnose_mappings,
             cases=cases, oracle=args.oracle, timeout=args.timeout,
-            rss_limit_mib=args.rss_limit_mib, capture_bytes=args.capture_bytes)
+            rss_limit_mib=args.rss_limit_mib, capture_bytes=args.capture_bytes, follow_fork=args.follow_fork)
         print(report['status'])
         return 0
     except (UnpackError, ct_elf.CaptureError, Phase1RuntimeError, OSError, ValueError,

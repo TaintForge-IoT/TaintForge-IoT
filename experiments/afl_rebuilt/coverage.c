@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 #include <glib.h>
 #include "qemu-plugin.h"
+#include "../../unpacker/test/process_event.h"
 
 #define MAP_SIZE 65536U
 #define MAX_BRANCHES 4096U
@@ -29,6 +31,21 @@ struct record {
     unsigned char map[MAP_SIZE];
     struct branch branches[MAX_BRANCHES];
 };
+/* Fixed-input tree replay uses one independently validated v1 record per PID. */
+#define TREE_PROCESSES 8
+struct slot {
+    int32_t pid;
+    uint32_t inherited_input;
+    struct record coverage;
+};
+_Static_assert(sizeof(struct slot) == 8 + sizeof(struct record), "coverage slot size");
+static struct slot *slots;
+static int tree_socket = -1;
+static int reserved_slot = -1;
+static bool fork_had_input;
+static void *mapping;
+static size_t mapping_size;
+
 struct instruction { uint32_t pc, next, target; bool conditional; };
 _Static_assert(sizeof(struct header) == 96, "coverage header size");
 _Static_assert(sizeof(struct branch) == 16, "branch record size");
@@ -161,11 +178,30 @@ static void syscall_enter(qemu_plugin_id_t id, unsigned int cpu, int64_t number,
     if (!record || cpu != 0) { invalid(); return; }
     pending_syscall = 0;
     pending_fd = a1;
-    /* This profile has one ELF image, process and vCPU. */
-    if (number == 2 || number == 11 || number == 120 || number == 190 || number == 358 || number == 435) {
-        invalid(); _exit(86);
+    if (tree_socket >= 0 && private_fork_i386(number, a1, a2)) {
+        /* Reserve before forking, so the process limit also bounds live children. */
+        for (int i = 1; i < TREE_PROCESSES; i++) {
+            int32_t free_slot = 0;
+            if (__atomic_compare_exchange_n(&slots[i].pid, &free_slot, -1, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                reserved_slot = i;
+                fork_had_input = record->h.started;
+                return;
+            }
+        }
+        invalid();
+        tf_process_event(tree_socket, 'L', TREE_PROCESSES, 0);
+        _exit(86);
+    }
+    if (process_transition_i386(number) || (tree_socket >= 0 && (number == 57 || number == 66))) {
+        invalid();
+        if (tree_socket >= 0) tf_process_event(tree_socket, '!', (int32_t)number, 0);
+        _exit(86);
     }
     if (number == 1 || number == 252) {
+        if (tree_socket >= 0 && !tf_process_event(tree_socket, 'X', a1 & 255, 0)) {
+            invalid(); _exit(86);
+        }
         record->h.exit_seen = 1;
         record->h.exit_code = a1 & 255;
     }
@@ -176,8 +212,27 @@ static void syscall_enter(qemu_plugin_id_t id, unsigned int cpu, int64_t number,
 
 static void syscall_return(qemu_plugin_id_t id, unsigned int cpu, int64_t number, int64_t result)
 {
-    (void)id; (void)number;
+    (void)id;
     if (!record || cpu != 0) { invalid(); return; }
+    if (tree_socket >= 0 && (number == 2 || number == 120) && reserved_slot > 0) {
+        struct slot *child = &slots[reserved_slot];
+        reserved_slot = -1;
+        if (result < 0) {
+            __atomic_store_n(&child->pid, 0, __ATOMIC_RELEASE);
+            return;
+        }
+        if (result == 0) {
+            /* Everything else (previous edge, open input fd) is private after fork. */
+            child->inherited_input = fork_had_input;
+            record = &child->coverage;
+            record->h.started = child->inherited_input;
+            __atomic_store_n(&child->pid, getpid(), __ATOMIC_RELEASE);
+        }
+        if (!tf_process_event(tree_socket, result ? 'F' : 'C', result, result ? result : getpid())) {
+            invalid(); _exit(86);
+        }
+        return;
+    }
     if (pending_syscall == 1 && result >= 0) input_fd = result;
     else if (pending_syscall == 2 && result == 0 && (int64_t)pending_fd == input_fd) input_fd = -1;
     else if (pending_syscall == 3 && result > 0) {
@@ -197,7 +252,7 @@ static void finished(qemu_plugin_id_t id, void *unused)
     if (record) {
         if (pending_branch) invalid();
         record->h.finished = 1;
-        munmap(record, sizeof(*record));
+        munmap(mapping, mapping_size);
         record = NULL;
     }
     free(input_path);
@@ -206,21 +261,40 @@ static void finished(qemu_plugin_id_t id, void *unused)
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                                          int argc, char **argv)
 {
-    if (info->system_emulation || strcmp(info->target_name, "i386") || argc != 2 ||
+    if (info->system_emulation || strcmp(info->target_name, "i386") || (argc != 2 && argc != 3) ||
         strncmp(argv[0], "output=", 7) || strncmp(argv[1], "input=/", 7)) return -1;
+    if (argc == 3) {
+        char *end;
+        if (strncmp(argv[2], "tree-fd=", 8)) return -1;
+        errno = 0;
+        long fd = strtol(argv[2] + 8, &end, 10);
+        if (errno || end == argv[2] + 8 || *end || fd < 3 || fd > INT_MAX) return -1;
+        tree_socket = (int)fd;
+    }
+    mapping_size = tree_socket < 0 ? sizeof(*record) : TREE_PROCESSES * sizeof(*slots);
     const char *path = argv[0] + 7;
     struct stat st;
     int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_size != (off_t)sizeof(struct record)) {
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_size != (off_t)mapping_size) {
         close(fd); return -1;
     }
-    record = mmap(NULL, sizeof(*record), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (record == MAP_FAILED) { record = NULL; return -1; }
-    if (memcmp(record->h.magic, "TFRCOV1", 8) || record->h.version != 1 || record->h.map_size != MAP_SIZE) goto fail;
-    const unsigned char *zero = (const unsigned char *)record + 16;
-    for (size_t i = 0; i < sizeof(*record) - 16; i++) if (zero[i]) goto fail;
+    if (mapping == MAP_FAILED) return -1;
+    if (tree_socket >= 0) slots = mapping;
+    for (int i = 0; i < (slots ? TREE_PROCESSES : 1); i++) {
+        if (slots && (slots[i].pid || slots[i].inherited_input)) goto fail;
+        record = slots ? &slots[i].coverage : mapping;
+        if (memcmp(record->h.magic, "TFRCOV1", 8) || record->h.version != 1 || record->h.map_size != MAP_SIZE) goto fail;
+        const unsigned char *zero = (const unsigned char *)record + 16;
+        for (size_t j = 0; j < sizeof(*record) - 16; j++) if (zero[j]) goto fail;
+    }
+    if (slots) {
+        record = &slots[0].coverage;
+        slots[0].pid = getpid();
+        if (!tf_process_event(tree_socket, 'S', 0, 0)) goto fail;
+    }
     input_path = strdup(argv[1] + 6);
     if (!input_path) goto fail;
     qemu_plugin_register_vcpu_tb_trans_cb(id, translate);
@@ -229,7 +303,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     qemu_plugin_register_atexit_cb(id, finished, NULL);
     return 0;
 fail:
-    munmap(record, sizeof(*record));
+    munmap(mapping, mapping_size);
     record = NULL;
     return -1;
 }
