@@ -511,6 +511,7 @@ typedef enum {
 
 typedef struct {
     int prot;
+    bool prot_from_initial_load;
     bool written;
     bool exec_after_write;
     bool dyn_exec;
@@ -832,7 +833,7 @@ static void runtime_scale_snapshot(const char *stage, uint64_t instructions) {
 //boundaries for main code
 static uint64_t g_main_lo = 0;
 static uint64_t g_main_hi = 0;
-static TfElfImage g_original_caller_image;
+static TfElfImage g_initial_i386_image;
 static bool g_main_known = false;
 static bool g_initial_taint_seeded = false;
 //ld base
@@ -3913,6 +3914,7 @@ static void apply_pending_mprotect(const pending_mmap_t *pending) {
         page_t *page = g_hash_table_lookup(pages, key);
         if (page) {
             page->prot = prot;
+            page->prot_from_initial_load = false;
             page->protection_epoch = pending->stage_owner &&
                 pending->stage_owner == page->mapping_owner &&
                 page->mapping_begin == page_start && page->mapping_end == page_end
@@ -4391,6 +4393,43 @@ static void stage_record_shared_store(page_t *source, uint64_t source_address, u
     }
 }
 
+static int elf_load_prot(const TfElfLoad *load) {
+    return ((load->flags & PF_R) ? 1 : 0) | ((load->flags & PF_W) ? 2 : 0) |
+           ((load->flags & PF_X) ? 4 : 0);
+}
+
+/* A PT_LOAD can start or end in the middle of a page. Verified LOADs
+ * do not share pages. A later unmap must never revive startup permissions. */
+static const TfElfLoad *initial_load_for_page(uint64_t address) {
+    const TfElfImage *image = &g_initial_i386_image;
+    const uint64_t mask = ~((uint64_t)page_size - 1);
+    if (!image->load_count || address < (image->lo & mask) || address >= image->hi ||
+        g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)address))
+        return NULL;
+    for (size_t i = 0; i < image->load_count; ++i) {
+        const TfElfLoad *load = &image->loads[i];
+        if (address >= (load->address & mask) && address < load->address + load->memory_size)
+            return load;
+    }
+    return NULL;
+}
+
+static void forget_initial_loads(void) {
+    if (!g_initial_i386_image.load_count)
+        return;
+    g_initial_i386_image.load_count = 0;
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, pages);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        page_t *page = value;
+        if (page->prot_from_initial_load) {
+            page->prot_from_initial_load = false;
+            page->prot = 0x3; /* Same fallback as an unclassified guest write. */
+        }
+    }
+}
+
 //mark write
 static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *writer,
                            uint64_t seq, uint32_t vcpu) {
@@ -4411,8 +4450,10 @@ static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *write
         uint32_t chunk = MIN(size, (uint32_t)page_size - offset);
         page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
         if (!page) {
+            const TfElfLoad *load = initial_load_for_page(page_addr);
             page = g_new0(page_t, 1);
-            page->prot = 0x3;
+            page->prot = load ? elf_load_prot(load) : 0x3;
+            page->prot_from_initial_load = load != NULL;
             g_hash_table_insert(pages, (gpointer)(uintptr_t)page_addr, page);
         }
         if (!page->wbitmap) {
@@ -4858,7 +4899,7 @@ static bool read_auxv_from_stack(void) {
     }
     page_size = (size_t)effective_page_size;
     if (is_i386 && page_size == TF_ELF_I386_PAGE_SIZE)
-        g_original_caller_image = image;
+        g_initial_i386_image = image;
     g_ld_base = at_base;
     g_stub_entry = at_entry;
     fprintf(stderr, "[WINDOW] auxv: main [0x%lx,0x%lx) ld_base=0x%lx entry=0x%lx bias=0x%lx\n",
@@ -4903,7 +4944,7 @@ static bool payload_loads_mapped(const TfElfImage *image) {
     const uint64_t mask = ~((uint64_t)page_size - 1);
     for (size_t i = 0; i < image->load_count; i++) {
         const TfElfLoad *load = &image->loads[i];
-        const int prot = ((load->flags & 4) >> 2) | (load->flags & 2) | ((load->flags & 1) << 2);
+        const int prot = elf_load_prot(load);
         for (uint64_t addr = load->address & mask; addr < load->address + load->memory_size;
              addr += page_size) {
             const page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
@@ -5056,6 +5097,29 @@ static bool payload_contains_page(const TfElfImage *image, uint64_t addr) {
     return false;
 }
 
+/* In-place restoration may never touch the data, rodata, or BSS used after
+ * the handoff. Include live startup LOAD pages in this snapshot only. */
+static GList *include_initial_load_pages(GList *keys, uint64_t max_bytes) {
+    const uint64_t mask = ~((uint64_t)page_size - 1);
+    uint64_t remaining = max_bytes / page_size;
+    for (size_t i = 0; i < g_initial_i386_image.load_count; ++i) {
+        const TfElfLoad *load = &g_initial_i386_image.loads[i];
+        for (uint64_t addr = load->address & mask; addr < load->address + load->memory_size;
+             addr += page_size) {
+            gpointer key = (gpointer)(uintptr_t)addr;
+            if (g_hash_table_contains(pages, key) || g_hash_table_contains(unmapped_pages, key) ||
+                addr_in_lib(addr))
+                continue;
+            keys = g_list_prepend(keys, key);
+            /* Include one excess page so capture records a budget gap. */
+            if (remaining == 0)
+                return g_list_sort(keys, compare_keys);
+            --remaining;
+        }
+    }
+    return g_list_sort(keys, compare_keys);
+}
+
 static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep_cand_t *candidate) {
     if (g_phase1.capture_at_entry && !g_main_known) {
         capture->status = "unsupported";
@@ -5080,12 +5144,17 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep
     bool header_seen = false;
     bool payload_found = find_payload_image(keys, candidate ? candidate->addr : 0, &payload, &header_seen);
     uint64_t inferred_start = 0, inferred_end = 0;
+    const TfElfLoad *entry_load = candidate && !candidate->mapping_epoch &&
+        candidate->guest_store_generation ? initial_load_for_page(candidate->code_page) : NULL;
     if (payload_found) {
         capture->layout = "mapped_elf_headers";
         fprintf(stderr, "[ELF-IMAGE] capture static payload base=0x%" PRIx64
                 " entry=0x%" PRIx64 " loads=%zu\n", payload.lo, candidate->addr, payload.load_count);
     } else if (!header_seen && find_headerless_payload(candidate, &inferred_start, &inferred_end)) {
         capture->layout = "observed_stage_rx_r_rw";
+    } else if (entry_load && (entry_load->flags & (PF_W | PF_X)) == (PF_W | PF_X)) {
+        capture->layout = "initial_elf_and_tracked_pages";
+        keys = include_initial_load_pages(keys, max_bytes);
     } else {
         capture->layout = "tracked_program_pages";
     }
@@ -5107,9 +5176,16 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep
     capture->code_generation = g_phase1.generation;
     for (GList *k = keys; k; k = k->next) {
         uint64_t address = (uint64_t)(uintptr_t)k->data;
-        page_t *page = g_hash_table_lookup(pages, k->data);
-        if (!page)
-            continue;
+        const page_t *page = g_hash_table_lookup(pages, k->data);
+        page_t initial = {0};
+        if (!page) {
+            /* Only include_initial_load_pages adds keys without page state. */
+            const TfElfLoad *load = initial_load_for_page(address);
+            if (!load)
+                continue;
+            initial.prot = elf_load_prot(load);
+            page = &initial;
+        }
         bool included = payload_found ? payload_contains_page(&payload, address) :
                         inferred_end ? inferred_start <= address && address < inferred_end :
                         page_is_program(address, page);
@@ -6196,15 +6272,11 @@ static bool stage_original_caller_bytes(uint64_t pc, uint32_t size) {
         return false;
     gpointer key = (gpointer)(uintptr_t)(pc & mask);
     const page_t *page = g_hash_table_lookup(pages, key);
-    if (g_hash_table_contains(unmapped_pages, key) ||
-        (page && (page->mapping_epoch || page->guest_store_generation || page->dyn_exec)))
+    if (page && (page->mapping_epoch || page->guest_store_generation || page->dyn_exec))
         return false;
-    for (size_t i = 0; i < g_original_caller_image.load_count; i++) {
-        const TfElfLoad *load = &g_original_caller_image.loads[i];
-        if ((load->flags & PF_X) && pc >= load->address && pc + size <= load->address + load->file_size)
-            return true;
-    }
-    return false;
+    const TfElfLoad *load = initial_load_for_page(pc & mask);
+    return load && (load->flags & PF_X) && pc >= load->address &&
+           pc + size <= load->address + load->file_size;
 }
 
 /* Bind one observed CALL, optionally through a single tail-JMP thunk, to
@@ -6956,6 +7028,11 @@ candidate_tracked:
             }
         }
         if (target_resolved) {
+            /* Register and memory CALLs use the same stage admission and
+             * return bookkeeping as direct CALLs. Keep indirect JMP/RET
+             * on their existing transfer path. */
+            if (is_i386 && meta->insn_id == X86_INS_CALL)
+                prev_call_or_jcc = exec_ctx;
             oep_cand_t *owner = stage_owner_for_instruction(exec_ctx, current_trace_seq_id,
                                                              cpu_index);
             prev_jump_site = vaddr;
@@ -7920,7 +7997,7 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
      * can identify a separate payload after a successful remap. */
     if (!syscall_failed && is_i386 && num == 163) {
         g_payload_mapping_floor = g_stage_syscall_ordinal;
-        g_original_caller_image.load_count = 0;
+        forget_initial_loads();
     }
     if (syscall_failed) {
         if (is_i386 && num == 6 && g_pending_fd.active &&

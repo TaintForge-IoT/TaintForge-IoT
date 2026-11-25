@@ -1,3 +1,7 @@
+.ifndef CALL_FORM
+    .set CALL_FORM, 0
+.endif
+
 .macro protect page, permissions
     mov $125, %eax
     mov $\page, %ebx
@@ -19,6 +23,11 @@
 .endm
 
 .macro payload
+.if CALL_FORM
+    /* An ordinary function prologue also occurs inside a restored image. */
+    push %ebp
+    mov %esp, %ebp
+.endif
     mov $4, %eax
     mov $1, %ebx
     mov $message, %ecx
@@ -72,7 +81,14 @@ stage:
     restore_payload
 .endif
 .if SCENARIO == 0 || SCENARIO == 4 || SCENARIO == 7 || SCENARIO == 9
+.if CALL_FORM == 2
+    mov $payload_entry, %ecx
+    call *%ecx
+.elseif CALL_FORM == 3
+    call *call_target
+.else
     call payload_entry
+.endif
 .elseif SCENARIO == 1 || SCENARIO == 5 || SCENARIO == 8 || SCENARIO == 10
     cmp %eax, %eax
     je payload_entry
@@ -109,6 +125,11 @@ payload_entry:
 body:
     payload
 body_end:
+.if CALL_FORM == 3
+.balign 4
+call_target:
+    .long payload_entry
+.endif
 message:
     .ascii "PHASE1_OEP_HANDOFF_OK\n"
 message_end:

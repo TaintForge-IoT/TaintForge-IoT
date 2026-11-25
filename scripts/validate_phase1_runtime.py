@@ -37,6 +37,12 @@ HANDOFF_CASES = (
     ("direct-call-within-restored-code", 9, ("stage",)),
     ("taken-jcc-within-restored-code", 10, ("stage",)),
 )
+FRAMED_CALL_CASES = (
+    ("after-producer-write", 0, ("stage", "payload_entry")),
+    ("after-executable-remap", 4, ()),
+    ("from-stub", 7, ("payload_entry",)),
+    ("inside-restored-code", 9, ("stage",)),
+)
 SEQUENTIAL_CASES = (
     ("fall-through", 0, ("payload_entry",)),
     ("same-page-after-return", 1, ("helper", "payload_entry")),
@@ -50,6 +56,13 @@ PAYLOAD_LOAD_CASES = (
     ("payload-wrong-entry", 1),
     ("payload-remapped-data", 2),
     ("payload-permission-mismatch", 3),
+)
+INITIAL_WX_CASES = (
+    ("initial-wx-written-entry", 0, ("payload_entry",)),
+    ("initial-wx-clean-entry", 1, ()),
+    ("initial-wx-write-to-data-only", 2, ()),
+    ("initial-wx-changed-mappings", 3, ("payload_entry",)),
+    ("initial-wx-replaced-entry", 4, ()),
 )
 CAPTURE_ENTRY = ("tf-capture=entry", "dse-check=off", "ir-trace-capacity=4096",
                  "tf-max-candidates=16", "tf-max-events=512", "runtime-log=summary")
@@ -222,8 +235,14 @@ def main() -> None:
                 ("fork", "phase1_two_layers.S", ("--defsym", "WITH_FORK=1"))]
     fixtures.extend((name, "phase1_cleanup_tail.S", ("--defsym", f"SCENARIO={variant}"))
                     for name, variant, _ in CLEANUP_CASES)
-    fixtures.extend((name, "phase1_oep_handoff.S", ("--defsym", f"SCENARIO={variant}"))
-                    for name, variant, _ in HANDOFF_CASES)
+    handoffs = [(name, ("--defsym", f"SCENARIO={variant}"), expected)
+                for name, variant, expected in HANDOFF_CASES]
+    for scenario, variant, expected in FRAMED_CALL_CASES:
+        for form, operand in ((1, "direct"), (2, "register"), (3, "memory")):
+            name = f"framed-{operand}-call-{scenario}"
+            definitions = ("--defsym", f"SCENARIO={variant}", "--defsym", f"CALL_FORM={form}")
+            handoffs.append((name, definitions, expected))
+    fixtures.extend((name, "phase1_oep_handoff.S", definitions) for name, definitions, _ in handoffs)
     fixtures.extend((name, "phase1_oep_sequential.S", ("--defsym", f"SCENARIO={variant}"))
                     for name, variant, _ in SEQUENTIAL_CASES)
     fixtures.extend((name, "phase1_payload_loads.S", ("--defsym", f"SCENARIO={variant}"))
@@ -236,6 +255,8 @@ def main() -> None:
                      ("--defsym", f"RETURNS={returns}", "--defsym", f"TAIL={tail}",
                       "--defsym", f"REENTER={reenter}"))
                     for name, returns, tail, reenter in jit_cases)
+    fixtures.extend((name, "phase1_initial_wx.S", ("--defsym", f"SCENARIO={variant}"))
+                    for name, variant, _ in INITIAL_WX_CASES)
     for name, source, definitions in fixtures:
         obj, binary = output / f"{name}.o", output / name
         subprocess.run(["as", "--32", *definitions, str(root / "tests" / source), "-o", str(obj)], check=True)
@@ -300,7 +321,7 @@ def main() -> None:
         assert code == 0, name
         validate_cleanup(attempt, binary, expected_transfer)
         results.append({"test": name, "status": "PASS"})
-    for name, _, expected_entries in HANDOFF_CASES:
+    for name, _, expected_entries in handoffs:
         binary = binaries[name]
         attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
         assert code == 0, name
@@ -343,6 +364,30 @@ def main() -> None:
         assert code == 0, name
         validate_payload_loads(attempt, binary, qemu, verified_image=variant == 0)
         results.append({"test": name, "status": "PASS"})
+    for name, variant, entries in INITIAL_WX_CASES:
+        binary = binaries[name]
+        attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
+        assert code == 0, name
+        validate_handoff(attempt, binary, entries)
+        if entries:
+            report, regions, _ = validate_capture(attempt)
+            assert report["capture_layout"] == "initial_elf_and_tracked_pages"
+            symbols = symbol_addresses(binary)
+            assert ct_elf.captured_bytes(regions, symbols["state"], 4096) == bytes(4096)
+            if variant == 3:
+                pages = {region["address"]: region["prot"] for region in regions}
+                assert symbols["hole_page"] not in pages and pages[symbols["changed_page"]] == 1
+            rebuilt = attempt.directory / "rebuilt.elf"
+            ct_elf.rebuild(attempt.paths["report"], attempt.paths["dump"], rebuilt)
+            replay = subprocess.run([str(qemu), str(rebuilt)], check=True, capture_output=True, timeout=30)
+            assert replay.stdout == (attempt.directory / "guest_stdout.log").read_bytes() and not replay.stderr
+        results.append({"test": name, "status": "PASS"})
+    attempt, code = run("attempt-initial-wx-budget", binary=binaries["initial-wx-written-entry"],
+                        ir=False, extra=(*CAPTURE_ENTRY, "tf-max-dump-bytes=4096"))
+    report = read_json(attempt.paths["report"])
+    assert code == 0 and attempt.verify()["capture_status"] == "partial"
+    assert any(gap["reason"] == "capture_budget_exhausted" for gap in report["capture_gaps"])
+    results.append({"test": "initial-wx-budget", "status": "PASS"})
     attempt, code = run("attempt-live", binary=binaries["live"], extra=("tf-selection-delay=8",), live=True)
     assert code == 0 and attempt.verify()["runtime_observed"]
     results.append({"test": "OEP event before exit; natural continuation; preserved stack", "status": "PASS"})
