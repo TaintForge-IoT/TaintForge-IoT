@@ -147,9 +147,13 @@ def verify_binding(binding, binding_path):
     plugin = private_path(binding['coverage_plugin'])
     require(plugin.is_file() and plugin.stat().st_nlink == 1
             and digest(plugin) == binding['coverage_plugin_sha256'], 'Coverage plugin changed')
+    size = RECORD_SIZE
+    if binding.get('fixed_fork_replay'):
+        from experiments.afl_rebuilt import fork_replay
+        size = fork_replay.MAX_PROCESSES * fork_replay.SLOT_SIZE
     record = run / 'output/coverage.bin'
     require(record.is_file() and not record.is_symlink() and record.stat().st_nlink == 1
-            and record.stat().st_size == RECORD_SIZE, 'Coverage output changed')
+            and record.stat().st_size == size, 'Coverage output changed')
     return run, root, bundle, manifest, plugin
 
 
@@ -194,6 +198,9 @@ def launch(binding_path):
     argument = '/__tf_coverage/' + plugin.name + ',output=/__tf_output/coverage.bin,input=/etc/dta-input'
     command = ['/__taintforge/bin/loader', '--inhibit-cache', '--library-path', '/__taintforge/lib',
                '/__taintforge/bin/qemu-i386', '-L', '/', '-plugin', argument, '/bin/sample.elf']
+    if binding.get('fixed_fork_replay'):
+        from .afl_rebuilt_tree import supervise
+        return supervise(binding, command)
     capsule_hardening.launch(binding, command)
 
 
@@ -205,7 +212,13 @@ def execute_case(root, data, out, active=None):
     for name in ('config', 'logs/capsule', 'output'):
         (out / name).mkdir(parents=True, exist_ok=True)
     (out / 'input').write_bytes(data)
-    write_map(out / 'output/coverage.bin')
+    tree = 'fixed_inputs' in manifest
+    if tree:
+        from experiments.afl_rebuilt.fork_replay import write_tree_map
+        require(hashlib.sha256(data).hexdigest() in manifest['fixed_inputs'], 'Input outside fixed corpus')
+        write_tree_map(out / 'output/coverage.bin')
+    else:
+        write_map(out / 'output/coverage.bin')
     store = EnvironmentSnapshotStore(root / 'snapshots')
     store.clone(manifest['snapshot_id'], out / 'rootfs')
     target = afl_file.guest_file(out / 'rootfs', '/etc/dta-input')
@@ -221,7 +234,9 @@ def execute_case(root, data, out, active=None):
         'attempt_id': 'rebuilt-' + nonce, 'lifecycle_attempt': nonce,
         'host_namespaces': {name: os.readlink('/proc/self/ns/' + name) for name in NAMESPACES},
         'settings': {'resources': capsule_resources.policy(512, manifest['case_seconds'] + 20),
-                     'hardening': capsule_hardening.policy(analysis_mib=256, export_mib=1, journal_mib=1)}}
+                     'hardening': capsule_hardening.policy(analysis_mib=256, export_mib=2 if tree else 1, journal_mib=1)}}
+    if tree:
+        binding['fixed_fork_replay'] = True
     if 'campaign_id' in manifest:
         binding['campaign_id'] = manifest['campaign_id']
     binding['attempt_contract_sha256'] = contract(binding)
@@ -238,6 +253,8 @@ def execute_case(root, data, out, active=None):
         command = ['sudo', 'unshare', '--mount', '--pid', '--fork', '--uts', '--ipc', '--net', '--',
             'env', 'PYTHONPATH=' + str(PROJECT), sys.executable, '-m', 'scripts.run_afl_rebuilt',
             'launch', '--binding', str(path)]
+        if tree:
+            command.insert(command.index('--uts'), '--mount-proc')
         executor = SubprocessCommandExecutor()
         try:
             result = capsule_resources.execute(binding, command, executor, cwd=PROJECT, check=False,
@@ -279,6 +296,23 @@ def execute_case(root, data, out, active=None):
                 and namespaces['host'] == binding['host_namespaces']
                 and all(namespaces['observed'][n] != namespaces['host'][n] for n in NAMESPACES),
                 'Namespace receipt does not match this input')
+        if tree:
+            from .afl_rebuilt_tree import collect
+            from unpacker.unpack_process import UnpackError
+            require(result.returncode == 0, 'Tree supervisor failed')
+            require(digest(out / 'rootfs/etc/dta-input') == binding['input_sha256'] and
+                    digest(out / 'rootfs/bin/sample.elf') == binding['target_sha256'], 'Input or image changed')
+            receipt.update(resources=resources, isolation={'network': 'none', 'chroot': True,
+                           'namespaces': namespaces['observed'], 'configured_uid': 65534, 'configured_gid': 65534})
+            try:
+                evidence, bitmap = collect(binding, out)
+                receipt.update(status='passed', **evidence)
+            except (UnpackError, RuntimeError) as exc:
+                receipt.update(status='quarantined', classification=getattr(exc, 'reason', 'UNVERIFIED_PROCESS_TREE'),
+                               detail=str(exc), feedback_signal=0, coverage={'status': 'unavailable'})
+                bitmap = bytes(MAP_SIZE)
+            (out / 'coverage.map').write_bytes(bitmap)
+            return receipt, bitmap
         try:
             report, bitmap = parse_map(out / 'output/coverage.bin', result.returncode)
         except RuntimeError:
@@ -317,7 +351,7 @@ def build_coverage_plugin(native):
                     '-I' + str(header.parent), str(source), '-o', str(native), *flags], check=True)
 
 
-def prepare(root, binary, seeds, qemu, plugin, case_seconds=5):
+def prepare(root, binary, seeds, qemu, plugin, case_seconds=5, *, fixed_fork_replay=False):
     root = private_path(root)
     require(not root.exists(), 'Use a new campaign directory')
     require(type(case_seconds) is int and 1 <= case_seconds <= 30, 'Invalid case deadline')
@@ -327,6 +361,7 @@ def prepare(root, binary, seeds, qemu, plugin, case_seconds=5):
         require(not path.is_symlink() and path.is_file() and 1 <= path.stat().st_size <= 4096, 'Invalid seed')
         corpus.append(path.read_bytes())
     require(corpus, 'Empty seed corpus')
+    require(not fixed_fork_replay or len(corpus) <= 64, 'Fixed replay supports up to 64 corpus entries')
     capsule_resources.preflight()
     root.mkdir(parents=True)
     for name in ('build', 'build/plugin', 'seeds', 'cases', 'baseline', 'proof'):
@@ -362,6 +397,8 @@ def prepare(root, binary, seeds, qemu, plugin, case_seconds=5):
         'case_seconds': case_seconds, 'phase1_executed': False, 'retirement_required': False,
         'coverage_scope': 'guest_tb_edges_after_first_input_read', 'parser_domain_provided': False,
         'protected_control_channel': False, 'hostile_sample_ready': False, 'cases': 0}
+    if fixed_fork_replay:
+        manifest['fixed_inputs'] = [hashlib.sha256(data).hexdigest() for data in corpus]
     write_json(root / 'campaign.json', manifest)
     return manifest
 
@@ -417,7 +454,7 @@ class Server:
             'input_sha256': result['input_sha256'],
             'coverage_sha256': hashlib.sha256(bitmap).hexdigest(),
             'feedback': 'zero_unverified' if result['status'] == 'quarantined' else 'verified_guest_coverage',
-            'verified_target_crash': False, 'verified_target_hang': False}
+            'verified_target_crash': bool(result.get('feedback_signal')), 'verified_target_hang': False}
         if self.campaign_id is not None:
             require(result.get('campaign_id') == self.campaign_id, 'Transport result belongs to a different campaign')
             record.update(schema=2, campaign_id=self.campaign_id, attempt_id=result['attempt_id'],
@@ -471,7 +508,7 @@ class Server:
                             'scope': 'UNVERIFIED; not an AFL target crash'})
                     self.count += 1
                     try:
-                        send_feedback(connection, bitmap)
+                        send_feedback(connection, bitmap, signal_number=result.get('feedback_signal', 0))
                     except (BrokenPipeError, ConnectionResetError) as exc:
                         # AFL may terminate its child when its campaign timer expires.
                         # The caller must still verify AFL's own successful exit.

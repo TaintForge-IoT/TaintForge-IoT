@@ -43,10 +43,11 @@ static struct slot *slots;
 static int tree_socket = -1;
 static int reserved_slot = -1;
 static bool fork_had_input;
+static bool fixed_input_replay;
 static void *mapping;
 static size_t mapping_size;
 
-struct instruction { uint32_t pc, next, target; bool conditional; };
+struct instruction { uint32_t pc, next, target; bool conditional, ud2; };
 _Static_assert(sizeof(struct header) == 96, "coverage header size");
 _Static_assert(sizeof(struct branch) == 16, "branch record size");
 static struct record *record;
@@ -116,6 +117,9 @@ static void instruction_exec(unsigned int cpu, void *userdata)
     if (!record || cpu != 0) { invalid(); return; }
     if (++steps > MAX_STEPS) { invalid(); _exit(86); }
     if (!record->h.started) return;
+    if (fixed_input_replay && insn->ud2 && !tf_process_event(tree_socket, 'T', (int32_t)insn->pc, 0)) {
+        invalid(); _exit(86);
+    }
     if (pending_branch) {
         if (insn->pc == pending_branch->next) save_branch(pending_branch->pc, false);
         else if (insn->pc == pending_branch->target) save_branch(pending_branch->pc, true);
@@ -154,6 +158,7 @@ static void translate(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             qemu_plugin_insn_data(insn, bytes, size) != size) { invalid(); _exit(86); }
         struct instruction *entry = &decoded[decoded_count++];
         *entry = (struct instruction){.pc = (uint32_t)pc, .next = (uint32_t)(pc + size)};
+        entry->ud2 = size == 2 && bytes[0] == 0x0f && bytes[1] == 0x0b;
         decode_branch(entry, bytes, size);
         qemu_plugin_register_vcpu_insn_exec_cb(insn, instruction_exec, QEMU_PLUGIN_CB_NO_REGS, entry);
     }
@@ -168,6 +173,30 @@ static bool path_matches(uint64_t address)
                 bytes->len == length && !memcmp(bytes->data, input_path, length);
     g_byte_array_free(bytes, true);
     return same;
+}
+
+/* linux-user shares descriptors with the guest. Reject operations capable of
+ * rewriting native evidence before dispatch on the fixed-input profile. */
+static bool replay_syscall(int64_t number, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    switch (number) {
+    case 1: case 252:              /* exit, exit_group */
+    case 3: case 180:              /* read, pread64 */
+    case 7: case 114:              /* waitpid, wait4 */
+    case 20: case 64: case 224:    /* getpid, getppid, gettid */
+    case 42: case 331:             /* pipe, pipe2 */
+        return true;
+    case 4: case 146:              /* write, writev */
+        return a1 == STDOUT_FILENO || a1 == STDERR_FILENO;
+    case 6:                        /* preserve standard descriptor identities */
+        return a1 > STDERR_FILENO;
+    case 5:                        /* open */
+        return !(a2 & ~(uint64_t)O_CLOEXEC) && path_matches(a1);
+    case 295:                      /* openat with the bound absolute path */
+        return !(a3 & ~(uint64_t)O_CLOEXEC) && path_matches(a2);
+    default:
+        return false;
+    }
 }
 
 static void syscall_enter(qemu_plugin_id_t id, unsigned int cpu, int64_t number,
@@ -196,6 +225,11 @@ static void syscall_enter(qemu_plugin_id_t id, unsigned int cpu, int64_t number,
     if (process_transition_i386(number) || (tree_socket >= 0 && (number == 57 || number == 66))) {
         invalid();
         if (tree_socket >= 0) tf_process_event(tree_socket, '!', (int32_t)number, 0);
+        _exit(86);
+    }
+    if (fixed_input_replay && !replay_syscall(number, a1, a2, a3)) {
+        invalid();
+        tf_process_event(tree_socket, 'U', (int32_t)number, 0);
         _exit(86);
     }
     if (number == 1 || number == 252) {
@@ -261,9 +295,13 @@ static void finished(qemu_plugin_id_t id, void *unused)
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                                          int argc, char **argv)
 {
-    if (info->system_emulation || strcmp(info->target_name, "i386") || (argc != 2 && argc != 3) ||
+    if (info->system_emulation || strcmp(info->target_name, "i386") || (argc < 2 || argc > 4) ||
         strncmp(argv[0], "output=", 7) || strncmp(argv[1], "input=/", 7)) return -1;
-    if (argc == 3) {
+    if (argc == 4) {
+        if (strcmp(argv[3], "fixed-input=on")) return -1;
+        fixed_input_replay = true;
+    }
+    if (argc >= 3) {
         char *end;
         if (strncmp(argv[2], "tree-fd=", 8)) return -1;
         errno = 0;

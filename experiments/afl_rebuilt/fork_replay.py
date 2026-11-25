@@ -17,6 +17,11 @@ EMPTY_RECORD = coverage.HEADER.pack(b'TFRCOV1\0', 1, coverage.MAP_SIZE, *([0] * 
 SLOT_SIZE = OWNER.size + coverage.RECORD_SIZE
 
 
+def write_tree_map(path):
+    with path.open('xb') as stream:
+        stream.write((OWNER.pack(0, 0) + EMPTY_RECORD) * MAX_PROCESSES)
+
+
 def collect_maps(path, process_tree):
     info = path.lstat()
     coverage.require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
@@ -80,8 +85,7 @@ def replay_case(store, snapshot_id, out, data, *, qemu, plugin, argv=(), timeout
     input_path.write_bytes(data)
     input_path.chmod(0o444)
     record = out / 'coverage.bin'
-    with record.open('xb') as stream:
-        stream.write((OWNER.pack(0, 0) + EMPTY_RECORD) * MAX_PROCESSES)
+    write_tree_map(record)
     plugin = Path(plugin).resolve(strict=True)
     coverage.require(not any(',' in str(p) for p in (record, plugin)), 'Comma in QEMU plugin argument')
     receipt = {'input_sha256': hashlib.sha256(data).hexdigest(), 'target_sha256': digest(target),

@@ -45,6 +45,7 @@ class RebuiltPayloadForks(unittest.TestCase):
         cls.pc = {name: int(address, 16) for address, _, name in (line.split() for line in symbols)}
         if not phase1:
             phase1 = unpack.build_plugin(include, cls.root / 'phase1')
+        cls.phase1 = Path(phase1).resolve(strict=True)
         output = cls.root / 'unpacked'
         result = unpack.unpack_sample(packed, output, qemu=cls.qemu, plugin=Path(phase1),
                                       cases=[{'id': 'capture'}], timeout=10)
@@ -259,6 +260,48 @@ class RebuiltPayloadForks(unittest.TestCase):
         self.assertEqual([normal, extra, crash, early, regular, final], [0, 0, 2, 2, 0, 0])
         self.assertIn(self.leaf_edge(), (with_edge - baseline) & with_signal & late_signal)
         self.assertEqual(baseline, clean)
+
+
+    @unittest.skipUnless(os.environ.get('TF_TEST_FORK_CAPSULE') == '1',
+                         'set TF_TEST_FORK_CAPSULE=1 for the systemd/cgroup integration')
+    def test_campaign_keeps_leaf_after_root_exit_and_cleans_next_case(self):
+        from scripts.run_afl_rebuilt import main
+
+        corpus = self.work / 'corpus'
+        corpus.mkdir()
+        modes = [7, 0, 11, 16, 96, 32, 0]
+        for i, mode in enumerate(modes):
+            (corpus / str(i)).write_bytes(bytes([mode]))
+        root = self.work / 'campaign'
+        self.assertEqual(main(['campaign', '--mode', 'fork-replay', '--binary', str(self.root / 'unpacked/rebuilt.elf'),
+            '--seeds', str(corpus), '--qemu', str(self.qemu), '--plugin', str(self.phase1),
+            '--case-seconds', '30', '--out', str(root)]), 0)
+        manifest = json.loads((root / 'campaign.json').read_text())
+        self.assertEqual([r['afl_showmap_returncode'] for r in manifest['observations']], [2, 0, 2, 0, 0, 0, 0])
+        cases = sorted((root / 'cases').iterdir())
+        results = [json.loads((case / 'result.json').read_text()) for case in cases]
+        maps = [(case / 'coverage.map').read_bytes() for case in cases]
+        self.assertEqual(len({r['attempt_id'] for r in results}), len(modes))
+        self.assertTrue(all(r['resources']['tree_empty'] for r in results))
+        self.assertEqual([r['input_sha256'] for r in results], [hashlib.sha256(bytes([m])).hexdigest() for m in modes])
+        first = results[0]
+        self.assertEqual(first['guest_exit'], 0)
+        _, leaf = self.roles(first)
+        self.assertEqual(first['guest_signals'], [{'pid': leaf['pid'], 'signal': signal.SIGILL,
+                                                  'guest_pc': self.pc['leaf_fault']}])
+        self.assertTrue(maps[0][self.leaf_edge()])
+        self.assertFalse(maps[1][self.leaf_edge()])
+        self.assertEqual(maps[1], maps[-1])
+        self.assertEqual(results[1]['guest_signals'], [])
+        self.assertEqual(len(results[2]['guest_signals']), 2)
+        self.assertEqual(self.roles(results[3])[1]['returncode'], 132)
+        self.assertEqual(len(results[4]['processes']), 8)
+        self.assertEqual((results[5]['status'], results[5]['classification']), ('quarantined', 'PROCESS_LIMIT'))
+        self.assertFalse(any(maps[5]))
+        for case, result in zip(cases, results):
+            delivery = json.loads((case / 'transport.json').read_text())
+            self.assertEqual(delivery['verified_target_crash'], bool(result.get('guest_signals')))
+            self.assertEqual(delivery['attempt_id'], result['attempt_id'])
 
 
 if __name__ == '__main__':

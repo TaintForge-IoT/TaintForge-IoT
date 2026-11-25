@@ -333,15 +333,20 @@ def _exit_packets(channel, root_pid, deadline):
         yield pid, kind, value, child_code
 
 
-def _process_tree(channel, root_pid, root_code, deadline, max_processes):
+def _process_tree(channel, root_pid, root_code, deadline, max_processes, *, traps=None):
     started, requested, parents = set(), {}, {root_pid: None}
     kernel_codes = {root_pid: root_code}
     for count, (pid, kind, value, child_code) in enumerate(_exit_packets(channel, root_pid, deadline), 1):
-        require(count <= 3 * max_processes - 1, 'INCOMPLETE_PROCESS_EXIT', 'Too many process observation packets')
+        require(count <= (4 if traps is not None else 3) * max_processes - 1, 'INCOMPLETE_PROCESS_EXIT', 'Too many process observation packets')
         if kind == ord('L') and value == max_processes:
             raise UnpackError('PROCESS_LIMIT', f'Tree replay reached the limit of {max_processes} processes')
         if kind == ord('!'):
             raise UnpackError('UNSUPPORTED_FORK_PROFILE', f'Unsupported process transition in replay (syscall {value})')
+        if traps is not None and kind == ord('U'):
+            raise UnpackError('UNVERIFIED_GUEST_IO', f'Syscall {value} outside fixed-input replay')
+        if traps is not None and kind == ord('T') and value and pid not in traps:
+            traps[pid] = value & 0xffffffff
+            continue
         if kind == (ord('S') if pid == root_pid else ord('C')) and value == 0 and pid not in started:
             started.add(pid)
         elif kind == ord('F') and value > 0 and value != pid and value not in parents:

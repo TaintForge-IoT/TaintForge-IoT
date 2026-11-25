@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -97,9 +98,10 @@ def main(argv=None):
     run = commands.add_parser('campaign')
     for name in ('binary', 'seeds', 'qemu', 'plugin', 'out'):
         run.add_argument('--' + name, type=Path, required=True)
-    run.add_argument('--mode', choices=('afl', 'focus', 'hybrid', 'hybrid-mixed'), default='afl',
+    run.add_argument('--mode', choices=('afl', 'focus', 'hybrid', 'hybrid-mixed', 'fork-replay'), default='afl',
                      help='afl=stock, focus=custom without DSE, hybrid=legacy custom+DSE, '
-                          'hybrid-mixed=stock AFL stages plus adaptive custom+DSE')
+                          'hybrid-mixed=stock AFL stages plus adaptive custom+DSE, '
+                          'fork-replay=fixed corpus with /etc/dta-input as argv[1]')
     run.add_argument('--seconds', type=int, default=180)
     run.add_argument('--case-seconds', type=int, default=5)
     run.add_argument('--max-cases', type=int, default=512)
@@ -123,17 +125,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.action == 'launch':
-            backend.launch(args.binding)
-            return 2
-        afl = shutil.which('afl-fuzz')
-        backend.require(afl, 'afl-fuzz is not installed')
+            return backend.launch(args.binding)
+        fixed = args.mode == 'fork-replay'
+        afl = shutil.which(os.environ.get('TF_AFL_SHOWMAP', 'afl-showmap') if fixed else 'afl-fuzz')
+        backend.require(afl, 'Missing afl-showmap' if fixed else 'Missing afl-fuzz')
         live_dse = args.mode in ('hybrid', 'hybrid-mixed')
         backend.require(args.custom_fuzz_count is None or
                         1 <= args.custom_fuzz_count <= 16,
                         '--custom-fuzz-count must be between 1 and 16')
         backend.require(args.mode != 'afl' or args.custom_fuzz_count is None,
                         '--custom-fuzz-count requires a hybrid/focus mutator')
-        stage_policy = resolve_afl_stage_policy(args.mode, args.afl_stage_policy)
+        stage_policy = None if fixed else resolve_afl_stage_policy(args.mode, args.afl_stage_policy)
         backend.require(not live_dse or args.flags_receipt is not None,
                         '--flags-receipt is required for audited DSE')
         root = backend.private_path(args.out)
@@ -148,7 +150,7 @@ def main(argv=None):
         if args.phase1_unpack_output is not None:
             from experiments.hybrid_rebuilt_v1.boundary import phase1_source
             phase1_record = phase1_source(args.phase1_unpack_output, target_sha256=backend.digest(binary))
-        prepared = backend.prepare(root, binary, seeds, qemu, plugin, args.case_seconds)
+        prepared = backend.prepare(root, binary, seeds, qemu, plugin, args.case_seconds, fixed_fork_replay=fixed)
         if args.target_sha256 is not None:
             backend.require(prepared['target_sha256'] == args.target_sha256,
                             'Prepared ELF differs from --target-sha256')
@@ -158,6 +160,10 @@ def main(argv=None):
             backend.write_json(root / 'campaign.json', manifest)
         controller, lib = None, None
         try:
+            if fixed:
+                from taintforge_env.afl_rebuilt_tree import replay_corpus
+                print(json.dumps(replay_corpus(root, backend.read_json(root / 'campaign.json'), afl), indent=2))
+                return 0
             if args.mode != 'afl':
                 controller, lib = prepare_hybrid(root, binary=binary, qemu=qemu, plugin=plugin,
                     flags_receipt=args.flags_receipt, stall_cases=args.stall_cases,
