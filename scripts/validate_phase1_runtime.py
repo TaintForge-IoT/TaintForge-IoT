@@ -179,6 +179,24 @@ def validate_payload_loads(attempt, binary, qemu, *, verified_image):
         assert set(expected).intersection(observed) == {symbols["payload_entry"]}
 
 
+def validate_jit_reentry(report, name):
+    first, second = report["observed_stage_candidates"]
+    assert second["helper_reentry_of"] == first["candidate_id"], name
+    assert report["capture_candidate_id"] == second["candidate_id"], name
+    assert first["helper_return_seq"] < second["entry_seq"] == report["capture_trace_seq"], name
+    unlinked = second.copy()
+    del unlinked["helper_reentry_of"]
+    for invalid in ([first, unlinked],
+                    [first, dict(second, helper_reentry_of=second["candidate_id"])],
+                    [dict(first, helper_return_seq=second["entry_seq"]), second]):
+        try:
+            ct_elf.validate_stage_selection(dict(report, observed_stage_candidates=invalid))
+        except ct_elf.CaptureError as exc:
+            assert exc.reason == "INVALID_STAGE_SELECTION", name
+        else:
+            raise AssertionError(f"{name}: accepted invalid same-generation reentry")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plugin", required=True, type=Path)
@@ -210,6 +228,14 @@ def main() -> None:
                     for name, variant, _ in SEQUENTIAL_CASES)
     fixtures.extend((name, "phase1_payload_loads.S", ("--defsym", f"SCENARIO={variant}"))
                     for name, variant in PAYLOAD_LOAD_CASES)
+    jit_cases = [(f"jit-{target}-{form}", returns, tail, reenter)
+                 for target, returns, reenter in (("helper", 1, 0), ("payload", 0, 0),
+                                                   ("helper-then-payload", 1, 1))
+                 for form, tail in (("call", 0), ("tail", 1))]
+    fixtures.extend((name, "phase1_jit_return.S",
+                     ("--defsym", f"RETURNS={returns}", "--defsym", f"TAIL={tail}",
+                      "--defsym", f"REENTER={reenter}"))
+                    for name, returns, tail, reenter in jit_cases)
     for name, source, definitions in fixtures:
         obj, binary = output / f"{name}.o", output / name
         subprocess.run(["as", "--32", *definitions, str(root / "tests" / source), "-o", str(obj)], check=True)
@@ -287,6 +313,29 @@ def main() -> None:
         attempt, code = run("attempt-" + name, binary=binary, ir=False, extra=CAPTURE_ENTRY)
         assert code == 0, name
         validate_sequential(name, attempt, binary, expected_entries)
+        results.append({"test": name, "status": "PASS"})
+    for name, returns, _, reenter in jit_cases:
+        attempt, code = run("attempt-" + name, binary=binaries[name], ir=False, extra=CAPTURE_ENTRY)
+        address = (attempt.directory / "guest_stdout.log").read_bytes()
+        assert code == 42 and len(address) == 4, name
+        target = int.from_bytes(address, "little")
+        capture = attempt.verify()
+        report = read_json(attempt.paths["report"])
+        events = attempt.events()
+        assert capture["runtime_observed"] and report["main_image_verified"], name
+        assert not any(e["event_type"] in ("data_loss", "profile_lost") for e in events), name
+        observed = [e["data"] for e in events if e["event_type"] == "oep_candidate_observed"]
+        assert observed and all(e["address"] == target for e in observed), name
+        if returns and not reenter:
+            assert int(report["oep"], 16) == 0 and capture["capture_status"] == "not_available", name
+        else:
+            validate_capture(attempt)
+            assert int(report["oep"], 16) == target and capture["capture_status"] == "success", name
+            if reenter:
+                events = [e for e in events if e["event_type"] == "oep_candidate_selected"]
+                assert len(events) == 1, name
+                assert report["capture_trace_seq"] == events[0]["data"]["observed_trace_seq"], name
+                validate_jit_reentry(report, name)
         results.append({"test": name, "status": "PASS"})
     for name, variant in PAYLOAD_LOAD_CASES:
         binary = binaries[name]

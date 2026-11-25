@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <elf.h>
 #include <ctype.h>
 #include <qemu-plugin.h>
 #include <capstone/capstone.h>
@@ -595,11 +596,16 @@ typedef struct {
     uint8_t *code_page_bytes;
     uint64_t call_continuation, caller_mapping_epoch, return_trace_seq;
     uint64_t same_page_successor_id;
+    uint64_t helper_call_seq, helper_return_pc, helper_stack_slot, helper_return_seq;
+    uint64_t helper_repeat_returns, helper_reentry_of;
     ProgramCapture capture;
 } oep_cand_t;
 
 static oep_cand_t *g_selected_candidate;
-static uint64_t g_candidate_count;
+static uint64_t g_candidate_count, g_next_candidate_id;
+/* Only one unchanged helper invocation is in flight in the one-vCPU profile. */
+static oep_cand_t *g_repeat_candidate, *g_repeat_origin;
+static void stage_publish_repeat(void);
 /* Mapping lifetimes and STORE ordinals are separate from code generations. */
 static uint64_t g_stage_syscall_ordinal, g_stage_guest_store_ordinal;
 static uint64_t g_payload_mapping_floor;
@@ -826,6 +832,7 @@ static void runtime_scale_snapshot(const char *stage, uint64_t instructions) {
 //boundaries for main code
 static uint64_t g_main_lo = 0;
 static uint64_t g_main_hi = 0;
+static TfElfImage g_original_caller_image;
 static bool g_main_known = false;
 static bool g_initial_taint_seeded = false;
 //ld base
@@ -4230,6 +4237,8 @@ static void stage_record_write(page_t *page, uint64_t address, uint32_t size,
             page->producer_valid = false;
         return;
     }
+    if (owner && owner == g_repeat_candidate)
+        stage_publish_repeat(); /* A producer ID may escape into another page. */
     uint64_t id = owner ? owner->candidate_id : 0;
     uint64_t end = address + size;
     if (page->producer_valid && page->producer_candidate_id == id &&
@@ -4584,7 +4593,7 @@ static double cand_confidence(const oep_cand_t *c) {
  * they cannot be selected or used as guest-STORE stage proof endpoints. */
 static bool cand_selection_eligible(const oep_cand_t *candidate) {
     return candidate && !candidate->stale && !candidate->superseded &&
-           (!g_stage_tail_file_profile || candidate->guest_store_generation);
+           !candidate->helper_return_seq && (!g_stage_tail_file_profile || candidate->guest_store_generation);
 }
 
 static const char *cand_write_origin(const oep_cand_t *candidate) {
@@ -4848,6 +4857,8 @@ static bool read_auxv_from_stack(void) {
                 (unsigned long)at_pagesz, (unsigned long)page_size);
     }
     page_size = (size_t)effective_page_size;
+    if (is_i386 && page_size == TF_ELF_I386_PAGE_SIZE)
+        g_original_caller_image = image;
     g_ld_base = at_base;
     g_stub_entry = at_entry;
     fprintf(stderr, "[WINDOW] auxv: main [0x%lx,0x%lx) ld_base=0x%lx entry=0x%lx bias=0x%lx\n",
@@ -5176,6 +5187,18 @@ static void capture_clear(ProgramCapture *capture) {
     memset(capture, 0, sizeof(*capture));
 }
 
+static void candidate_capture_event(const oep_cand_t *candidate) {
+    const ProgramCapture *capture = &candidate->capture;
+    char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
+                                    ",\"capture_trace_seq\":%" PRIu64
+                                    ",\"bytes\":%" PRIu64 "}",
+                                    candidate->candidate_id, capture->seq, capture->bytes);
+    tf_phase1_event(&g_phase1, "candidate_image_captured",
+                    capture->status ? capture->status : "error", "before_candidate_instruction",
+                    payload);
+    g_free(payload);
+}
+
 static void capture_candidate(oep_cand_t *candidate) {
     if (!g_phase1.capture_at_entry)
         return;
@@ -5197,14 +5220,8 @@ static void capture_candidate(oep_cand_t *candidate) {
     capture_image(capture, MIN(remaining, g_phase1.max_dump_bytes), candidate);
     if (capture->committed)
         g_candidate_capture_bytes += capture->bytes;
-    char *payload = g_strdup_printf("{\"candidate_id\":%" PRIu64
-                                    ",\"capture_trace_seq\":%" PRIu64
-                                    ",\"bytes\":%" PRIu64 "}",
-                                    candidate->candidate_id, capture->seq, capture->bytes);
-    tf_phase1_event(&g_phase1, "candidate_image_captured",
-                    capture->status ? capture->status : "error", "before_candidate_instruction",
-                    payload);
-    g_free(payload);
+    if (candidate != g_repeat_candidate)
+        candidate_capture_event(candidate);
 }
 
 static void adopt_capture(ProgramCapture *capture) {
@@ -5468,6 +5485,14 @@ static void append_stage_history(GString *output, const oep_cand_t *chosen) {
             cand_selection_eligible(c) ? "true" : "false", c->source_write_pc,
             c->source_write_seq, c->source_write_generation, c->transfer_seq, c->jump_site,
             c->written_begin, c->written_end, c->entry_size);
+        if (c->helper_return_seq)
+            g_string_append_printf(nodes, ",\"helper_call_seq\":%" PRIu64
+                ",\"helper_return_pc\":%" PRIu64 ",\"helper_return_seq\":%" PRIu64,
+                c->helper_call_seq, c->helper_return_pc, c->helper_return_seq);
+        if (c->helper_reentry_of)
+            g_string_append_printf(nodes, ",\"helper_reentry_of\":%" PRIu64, c->helper_reentry_of);
+        if (c->helper_repeat_returns)
+            g_string_append_printf(nodes, ",\"helper_repeat_returns\":%" PRIu64, c->helper_repeat_returns);
         if (g_stage_mapping_identity)
             g_string_append_printf(nodes,
                 ",\"mapping_epoch\":%" PRIu64 ",\"guest_store_generation\":%" PRIu64
@@ -5682,6 +5707,22 @@ static void phase1_candidate_event(const char *event, oep_cand_t *candidate, boo
     g_free(payload);
 }
 
+/* A repeated CALL gets a fresh entry image. Delay publication while it only
+ * executes local arithmetic. A guest store, syscall, new stage, invalidation
+ * or end of capture makes the occurrence independently relevant. */
+static void stage_publish_repeat(void) {
+    oep_cand_t *candidate = g_repeat_candidate;
+    if (!candidate)
+        return;
+    g_repeat_candidate = g_repeat_origin = NULL;
+    oep_cands = g_list_append(oep_cands, candidate);
+    ++g_candidate_count;
+    phase1_candidate_event("oep_candidate_observed", candidate, true);
+    if (g_phase1.capture_at_entry)
+        candidate_capture_event(candidate);
+    phase1_candidate_event("oep_candidate_evaluated", candidate, true);
+}
+
 static void stage_retract_selection(const char *reason) {
     if (g_selected_candidate) {
         phase1_candidate_event("oep_candidate_selection_retracted", g_selected_candidate, true);
@@ -5713,6 +5754,7 @@ static void stage_link_candidate(oep_cand_t *child, oep_cand_t *parent, const pa
 }
 
 static void phase1_invalidate(uint64_t address, uint32_t generation, const char *reason) {
+    stage_publish_repeat();
     bool changed = false;
     for (GList *entry = oep_cands; entry; entry = entry->next) {
         oep_cand_t *candidate = entry->data;
@@ -5866,6 +5908,7 @@ static void phase1_export(bool select_at_exit) {
         g_free(summary);
     }
     //oep choose
+    stage_publish_repeat();
     oep_cand_t *chosen = NULL;
     if (oep_found)
         chosen = g_selected_candidate;
@@ -6144,6 +6187,95 @@ static const TraceEntry *stage_fallthrough_source(const page_t *page, uint64_t p
     return prior;
 }
 
+/* Only untouched, file-backed instruction bytes in the verified main image
+ * can establish an ordinary caller. Unknown or replaced pages give no evidence. */
+static bool stage_original_caller_bytes(uint64_t pc, uint32_t size) {
+    const uint64_t mask = ~((uint64_t)page_size - 1);
+    if (!size || size > MAX_INSN_BYTES || pc > UINT32_MAX - size ||
+        (pc & mask) != ((pc + size - 1) & mask))
+        return false;
+    gpointer key = (gpointer)(uintptr_t)(pc & mask);
+    const page_t *page = g_hash_table_lookup(pages, key);
+    if (g_hash_table_contains(unmapped_pages, key) ||
+        (page && (page->mapping_epoch || page->guest_store_generation || page->dyn_exec)))
+        return false;
+    for (size_t i = 0; i < g_original_caller_image.load_count; i++) {
+        const TfElfLoad *load = &g_original_caller_image.loads[i];
+        if ((load->flags & PF_X) && pc >= load->address && pc + size <= load->address + load->file_size)
+            return true;
+    }
+    return false;
+}
+
+/* Bind one observed CALL, optionally through a single tail-JMP thunk, to
+ * the concrete return address already on this invocation's i386 stack. */
+static bool stage_bind_helper_call(oep_cand_t *candidate, uint64_t transfer_seq) {
+    const TraceEntry *call = trace_find_seq(g_trace, transfer_seq, NULL);
+    if (!call || call->vcpu_index != candidate->vcpu ||
+        !stage_original_caller_bytes(call->pc, call->size))
+        return false;
+    const InsnMeta *meta = meta_lookup_id(call->meta_id);
+    if (meta && meta->insn_id == X86_INS_JMP && transfer_seq > 1) {
+        call = trace_find_seq(g_trace, transfer_seq - 1, NULL);
+        if (!call || call->vcpu_index != candidate->vcpu ||
+            !stage_original_caller_bytes(call->pc, call->size))
+            return false;
+        meta = meta_lookup_id(call->meta_id);
+    }
+    if (!meta || meta->insn_id != X86_INS_CALL)
+        return false;
+    uint64_t continuation = call->pc + call->size, stack, value;
+    if (!stage_original_caller_bytes(continuation, 1) ||
+        !dse_read_reg(DTA_REG_RSP, &stack) ||
+        !guest_read_uint((uint32_t)stack, 4, &value) || value != continuation)
+        return false;
+    candidate->helper_call_seq = call->seq_id;
+    candidate->helper_return_pc = continuation;
+    candidate->helper_stack_slot = (uint32_t)stack;
+    candidate->helper_return_seq = 0;
+    return true;
+}
+
+static void stage_note_helper_return(const InsnExecCtx *continuation, uint64_t seq, uint32_t vcpu) {
+    oep_cand_t *candidate = g_active_candidate;
+    if (!candidate || !candidate->helper_call_seq || candidate->helper_return_seq ||
+        candidate->vcpu != vcpu || candidate->epoch != g_phase1.epoch ||
+        !cand_selection_eligible(candidate) || prev_jump_owner_id != candidate->candidate_id ||
+        !prev_mem_target_valid || prev_mem_taddr != candidate->helper_stack_slot ||
+        continuation->pc != candidate->helper_return_pc ||
+        !stage_original_caller_bytes(continuation->pc, continuation->size))
+        return;
+    const TraceEntry *prior = trace_find_seq(g_trace, prev_jump_seq_id, NULL);
+    const InsnDesc *desc = prior ? trace_insn_desc_get(g_trace, prior->insn_desc_id) : NULL;
+    if (!desc || desc->effects.branch_kind != TRACE_BRANCH_RETURN)
+        return;
+    if (candidate == g_repeat_candidate) {
+        /* No publication or ownership escaped. The preserved first observation
+         * represents this return too, without exhausting snapshot/event limits. */
+        if (candidate->capture.committed) {
+            if (unlink(candidate->capture.path) != 0) {
+                g_phase1.storage_failed = true;
+                stage_publish_repeat();
+                return;
+            }
+            g_candidate_capture_bytes -= candidate->capture.bytes;
+        }
+        capture_clear(&candidate->capture);
+        g_free(candidate->code_page_bytes);
+        g_free(candidate);
+        g_active_candidate = g_repeat_origin;
+        ++g_repeat_origin->helper_repeat_returns;
+        page_t *page = stage_page_for_pc(g_repeat_origin->addr);
+        if (page)
+            page->candidate_seq = g_repeat_origin->observed_seq;
+        g_repeat_candidate = g_repeat_origin = NULL;
+        return;
+    }
+    candidate->helper_return_seq = seq;
+    if (g_selected_candidate == candidate)
+        stage_retract_selection("anonymous_helper_returned_to_original_caller");
+}
+
 static void stage_note_call_return(uint64_t pc, uint64_t seq, uint32_t vcpu) {
     oep_cand_t *candidate = g_active_candidate;
     if (!candidate || !candidate->call_continuation || candidate->return_trace_seq ||
@@ -6166,7 +6298,8 @@ static oep_cand_t *stage_same_page_helper(const page_t *page, uint64_t pc,
     uint64_t page_mask = ~((uint64_t)page_size - 1U);
     if (!is_i386 || !page || !helper || !helper->return_trace_seq ||
         helper->return_trace_seq > prev_jump_seq_id || helper->vcpu != vcpu ||
-        helper->epoch != g_phase1.epoch || !cand_selection_eligible(helper) ||
+        helper->epoch != g_phase1.epoch || helper->stale || helper->superseded ||
+        (!helper->helper_return_seq && !cand_selection_eligible(helper)) ||
         helper->code_page != (pc & page_mask) || page->candidate_seq != helper->observed_seq ||
         page->mapping_epoch != helper->mapping_epoch || page->gen_written != helper->code_generation ||
         !stage_entry_covered(page, pc, size) || page->producer_write_seq >= helper->observed_seq ||
@@ -6535,14 +6668,28 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     if (prev_jump_matches && prev_mem_target_valid) {
         prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
     }
-    if (prev_jump_matches)
+    if (prev_jump_matches) {
         stage_note_call_return(vaddr, current_trace_seq_id, cpu_index);
+        stage_note_helper_return(exec_ctx, current_trace_seq_id, cpu_index);
+    }
 
     bool cleanup_entry = stage_cleanup_entry(exec_ctx, cur_pg, current_trace_seq_id,
                                               cpu_index, prev_jump_matches);
     bool new_layer = cleanup_entry || stage_is_new_entry(cur_pg, vaddr, meta->size,
                                         current_trace_seq_id, now_unpacked,
                                         prev_jump_matches);
+    /* A later handoff can reuse the exact bytes of a returned function.
+     * Deduplicate repeat calls, but give a new handoff its own entry snapshot. */
+    oep_cand_t *helper = g_active_candidate, *repeat_origin = NULL;
+    if (!new_layer && prev_jump_matches && cur_pg && helper && helper->helper_return_seq &&
+        !helper->stale && !helper->superseded && helper->vcpu == cpu_index &&
+        helper->epoch == g_phase1.epoch && helper->addr == vaddr &&
+        helper->mapping_epoch == cur_pg->mapping_epoch &&
+        helper->code_generation == cur_pg->gen_written &&
+        (prev_jump_site & ~((uint64_t)page_size - 1)) != helper->code_page) {
+        new_layer = true;
+        repeat_origin = helper;
+    }
     /* A CALL/Jcc entry must overlap a guest write in the current mapping. */
     if (new_layer && prev_call_or_jcc && !insn_is_unpacked(vaddr, meta->size, true))
         new_layer = false;
@@ -6577,7 +6724,9 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
     if (cur_pg)
         cur_pg->exec_seen = true;
 
-    if (new_layer && g_candidate_count >= g_phase1.max_candidates) {
+    if (new_layer)
+        stage_publish_repeat();
+    if (new_layer && (g_candidate_count >= g_phase1.max_candidates || g_next_candidate_id == UINT64_MAX)) {
         tf_phase1_profile_lost(&g_phase1, "candidate_budget_exhausted");
         return;
     }
@@ -6598,7 +6747,7 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         }
         candidate->generation = g_layer;
         candidate->icount = g_icount;
-        candidate->candidate_id = ++g_candidate_count;
+        candidate->candidate_id = ++g_next_candidate_id;
         candidate->observed_seq = current_trace_seq_id;
         candidate->code_generation = cur_pg->gen_written;
         candidate->mapping_epoch = cur_pg->mapping_epoch;
@@ -6613,6 +6762,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->entry_size = meta->size;
         candidate->transfer_seq = prev_jump_matches ? prev_jump_seq_id : 0;
         candidate->code_page = vaddr & ~((uint64_t)page_size - 1U);
+        if (repeat_origin)
+            candidate->helper_reentry_of = repeat_origin->candidate_id;
         if (prev_call_or_jcc && prev_jump_matches && prev_call_or_jcc->meta->insn_id == X86_INS_CALL &&
             !insn_is_unpacked(prev_call_or_jcc->pc, prev_call_or_jcc->size, true)) {
             candidate->call_continuation = (uint32_t)(prev_call_or_jcc->pc + prev_call_or_jcc->size);
@@ -6633,6 +6784,14 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         cur_pg->candidate_generation = cur_pg->gen_written;
         if (parent)
             stage_link_candidate(candidate, parent, cur_pg);
+        else if (g_phase1.enabled && is_i386 && candidate->transfer_seq && cur_pg->private_anonymous_mmap &&
+                 cur_pg->guest_store_generation && !page_overlaps_main(candidate->code_page))
+            stage_bind_helper_call(candidate, candidate->transfer_seq);
+        if (repeat_origin && candidate->helper_call_seq && !g_fork_child && !g_dse_check_enabled &&
+            !g_ir_enabled && g_retire.state == TF_RETIRE_OFF) {
+            g_repeat_origin = repeat_origin;
+            g_repeat_candidate = candidate;
+        }
         candidate->target_tainted = prev_target_tainted;
         ir_plugin_check(vcpu_state, cpu_index, prev_jump_seq_id, IR_RUNTIME_CANDIDATE, vaddr,
                         prev_target_reg);
@@ -6642,7 +6801,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         candidate->dse.candidate_query = DSE_SOLVER_NOT_RUN;
         candidate->dse.alternative_query = DSE_SOLVER_NOT_RUN;
 
-        phase1_candidate_event("oep_candidate_observed", candidate, false);
+        if (candidate != g_repeat_candidate)
+            phase1_candidate_event("oep_candidate_observed", candidate, false);
         if (g_fork_child)
             fork_entry_stores(candidate);
         capture_candidate(candidate);
@@ -6669,6 +6829,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         }
         if (!g_dse_check_enabled)
             candidate->dse.reason = DSE_REASON_DISABLED;
+        if (candidate == g_repeat_candidate)
+            goto candidate_tracked;
         if (g_dse_check_enabled && prev_jump_matches) {
             TF_RUNTIME_SCOPE(&g_runtime_diag, TF_PHASE_DSE);
             DseRelevanceContext relevance_context = {
@@ -6723,6 +6885,8 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         }
         phase1_candidate_event("oep_candidate_evaluated", candidate, false);
         oep_cands = g_list_append(oep_cands, candidate);
+        ++g_candidate_count;
+candidate_tracked:
         g_active_candidate = candidate;
         g_layer_has_cand = true;
         g_last_cand_icount = g_icount;
@@ -7005,6 +7169,7 @@ static void vcpu_syscall_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_
     (void)a8;
     if (!phase1_admit())
         return;
+    stage_publish_repeat();
     g_cleanup_transfer.candidate_id = 0;
     if (g_stage_syscall_ordinal == UINT64_MAX) {
         tf_phase1_profile_lost(&g_phase1, "mapping_syscall_ordinal_exhausted");
@@ -7753,8 +7918,10 @@ static void vcpu_syscall_ret_impl(qemu_plugin_id_t id, unsigned int vcpu_idx, in
     }
     /* The page table does not model i386 mremap. Only fresh mmap lifetimes
      * can identify a separate payload after a successful remap. */
-    if (!syscall_failed && is_i386 && num == 163)
+    if (!syscall_failed && is_i386 && num == 163) {
         g_payload_mapping_floor = g_stage_syscall_ordinal;
+        g_original_caller_image.load_count = 0;
+    }
     if (syscall_failed) {
         if (is_i386 && num == 6 && g_pending_fd.active &&
             g_pending_fd.kind == PENDING_FD_CLOSE) {

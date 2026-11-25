@@ -109,7 +109,8 @@ def validate_stage_selection(report):
         elif 'write_origin' in row:
             reject('Page-write origin classification requires V7')
     by_id, children, previous_id, previous_seq = {}, {}, 0, 0
-    last_generation_at_pc = {}
+    last_stage_at_pc = {}
+    returned_helpers = set()
     last_store_at_pc = {}
     for row in nodes:
         if not isinstance(row, dict):
@@ -128,9 +129,41 @@ def validate_stage_selection(report):
                 any(type(row.get(key)) is not bool for key in
                     ('stale', 'superseded', 'selected', 'selection_eligible'))):
             reject('Invalid stage order, identity or state')
-        if address in last_generation_at_pc and generation <= last_generation_at_pc[address]:
+        helper_fields = ('helper_call_seq', 'helper_return_seq', 'helper_return_pc')
+        if any(key in row for key in (*helper_fields, 'helper_repeat_returns')):
+            call = number(row, 'helper_call_seq')
+            returned = number(row, 'helper_return_seq')
+            continuation = number(row, 'helper_return_pc', 2**32 - 1)
+            transfer = number(row, 'transfer_seq')
+            source = number(row, 'transfer_pc', 2**32 - 1)
+            if (not mapping_identity or not number(row, 'mapping_epoch') or
+                    not number(row, 'guest_store_generation') or parent or row['selected'] or
+                    row['selection_eligible'] or not call or transfer - call not in (0, 1) or
+                    transfer + 1 != seq or returned <= seq or not continuation or
+                    source // PAGE == address // PAGE or continuation // PAGE == address // PAGE or
+                    (call == transfer and not source < continuation <= source + 15) or
+                    (file_identity and row.get('backing_file_id') != -1) or
+                    ('helper_repeat_returns' in row and not number(row, 'helper_repeat_returns'))):
+                reject('Invalid returned-helper observation')
+            returned_helpers.add(ident)
+        prior = last_stage_at_pc.get(address)
+        reentry = 'helper_reentry_of' in row
+        if reentry:
+            origin = number(row, 'helper_reentry_of')
+            # This exception records another invocation of unchanged code.
+            # A parent edge still requires an independently observed guest STORE.
+            if (not prior or origin != prior['candidate_id'] or origin not in returned_helpers or
+                    parent or prior['superseded'] or not mapping_identity or
+                    any(row.get(k) != prior[k] for k in
+                        ('code_generation', 'guest_store_generation', 'mapping_epoch',
+                         'entry_size', 'epoch', 'vcpu')) or
+                    not prior['helper_return_seq'] <= number(row, 'transfer_seq') == seq - 1 or
+                    number(row, 'transfer_pc', 2**32 - 1) // PAGE == address // PAGE or
+                    (file_identity and row.get('backing_file_id') != -1)):
+                reject('Invalid same-generation helper reentry')
+        elif prior and generation <= prior['code_generation']:
             reject('Repeated stage PC lacks a later code generation')
-        last_generation_at_pc[address] = generation
+        last_stage_at_pc[address] = row
         if mapping_identity:
             for key in mapping_keys:
                 number(row, key)
@@ -144,7 +177,7 @@ def validate_stage_selection(report):
                         any(number(row,key) for key in ('source_write_pc','source_write_seq',
                             'source_write_generation','written_begin','written_end'))):
                     reject('Kernel or unknown page cannot supply guest STORE evidence')
-            if (not observation_only and address in last_store_at_pc and
+            if (not observation_only and not reentry and address in last_store_at_pc and
                     row['guest_store_generation'] <= last_store_at_pc[address]):
                 reject('Repeated stage PC lacks a later guest STORE')
             if not observation_only:
@@ -238,6 +271,7 @@ def validate_stage_selection(report):
                 (row['superseded_by_candidate_id'] not in children[ident]
                  if children[ident] else row['superseded_by_candidate_id'] != 0) or
                 row['selection_eligible'] != (not row['stale'] and not row['superseded'] and
+                    ident not in returned_helpers and
                     (file_version != 7 or row['write_origin'] == 'observed_guest_store_page'))):
             reject('Stage eligibility or supersession differs from observed edges')
         if row['selected']:
