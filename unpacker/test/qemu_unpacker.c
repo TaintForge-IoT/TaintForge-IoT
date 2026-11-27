@@ -509,6 +509,8 @@ typedef enum {
     ARCH_UNKNOWN
 } arch_t;
 
+enum { WX_EXECUTED = 1, WX_STORED };
+
 typedef struct {
     int prot;
     bool prot_from_initial_load;
@@ -518,6 +520,8 @@ typedef struct {
     uint64_t write_count;
     uint64_t last_write;
     uint8_t *wbitmap;
+    uint8_t *wx_access; /* Per-byte execution and deferred STOREs in a private RWX page. */
+    bool track_wx_access;
     uint8_t *inherited_writes; /* guest STORE bits present at child creation */
     uint32_t gen_written;
     bool exec_seen;
@@ -534,6 +538,7 @@ typedef struct {
     uint32_t producer_write_generation, producer_vcpu;
     uint64_t mapping_epoch, guest_store_generation, producer_writer_mapping_epoch;
     bool private_anonymous_mmap;
+    uint64_t fixed_rw_length; /* Exact mmap length on its first page only. */
     uint64_t mapping_owner, mapping_begin, mapping_end, protection_epoch;
     uint64_t protection_seq;
     /* Kind zero is deliberately anonymous/initial for zero-initialized pages.
@@ -545,8 +550,13 @@ typedef struct {
 } page_t;
 
 typedef struct {
+    uint64_t start, length, mapping_epoch, access_pc, access_address, access_seq;
+} ZeroMapping;
+
+typedef struct {
     char *path;
     GString *regions, *gaps;
+    ZeroMapping zero;
     uint64_t base, bytes, seq, epoch, pc;
     uint32_t code_generation;
     bool base_set, committed;
@@ -563,6 +573,7 @@ static void page_destroy(void *pointer) {
         g_free(page->wbitmap);
     }
     g_free(page->inherited_writes);
+    g_free(page->wx_access);
     tf_retire_wipe(page, sizeof(*page));
     g_explicitly_wiped_bytes += sizeof(*page);
     ++g_released_pages;
@@ -2993,6 +3004,26 @@ static bool dse_mem_access_value_u64(qemu_plugin_meminfo_t info, uint32_t size,
     }
 }
 
+static page_t *stage_page_for_pc(uint64_t pc);
+
+static void note_zero_mapping_access(const InsnExecCtx *insn, uint32_t vcpu,
+                                     uint64_t address, uint32_t size) {
+    oep_cand_t *candidate = g_active_candidate;
+    ZeroMapping *zero = &candidate->capture.zero;
+    if (zero->access_seq || candidate->stale || candidate->superseded || vcpu != candidate->vcpu ||
+        address < zero->start || address >= zero->start + zero->length ||
+        size > zero->start + zero->length - address ||
+        size > page_size - (address & (page_size - 1)))
+        return;
+    const page_t *code = stage_page_for_pc(insn->pc), *data = stage_page_for_pc(address);
+    if (code && code->mapping_epoch == candidate->mapping_epoch && (code->prot & 4) &&
+        data && data->mapping_epoch == zero->mapping_epoch && data->prot == 3) {
+        zero->access_pc = insn->pc;
+        zero->access_address = address;
+        zero->access_seq = g_phase1.trace_seq;
+    }
+}
+
 static void dse_on_mem_impl(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
                             void *ud) {
     if (!phase1_admit())
@@ -3009,6 +3040,9 @@ static void dse_on_mem_impl(unsigned int vcpu, qemu_plugin_meminfo_t info, uint6
     }
     uint32_t size = 1U << qemu_plugin_mem_size_shift(info);
     bool context_valid = transfer->active && transfer->pc == vcpu_state->current_ip;
+    if (context_valid && exec_ctx && exec_ctx->pc == vcpu_state->current_ip &&
+        g_active_candidate && g_active_candidate->capture.zero.length)
+        note_zero_mapping_access(exec_ctx, vcpu, vaddr, size);
     if (qemu_plugin_mem_is_store(info)) {
         uint64_t stored_value = 0;
         bool stored_value_valid = dse_mem_access_value_u64(info, size, &stored_value);
@@ -3751,6 +3785,7 @@ static void stage_mapping_backing(page_t *page, const pending_mmap_t *pending,
 static void stage_reset_mapping_page(page_t *page, int prot, uint64_t mapping_epoch) {
     g_free(page->wbitmap);
     g_free(page->inherited_writes);
+    g_free(page->wx_access);
     memset(page, 0, sizeof(*page));
     page->prot = prot;
     page->mapping_epoch = mapping_epoch;
@@ -3852,6 +3887,12 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
         }
         page->mapping_epoch = pending->syscall_ordinal;
         page->private_anonymous_mmap = private_anonymous;
+        if (addr == mapped_addr && pending->requested_addr == mapped_addr && private_anonymous &&
+            pending->flags == (GUEST_MAP_FIXED | GUEST_MAP_PRIVATE | GUEST_MAP_ANONYMOUS) &&
+            pending->prot == 3 && pending->fd == -1 && !pending->offset)
+            page->fixed_rw_length = pending->size;
+        page->track_wx_access = g_phase1.capture_at_entry && is_i386 && page_size == TF_ELF_I386_PAGE_SIZE &&
+                                private_anonymous && fixed && pending->prot == 7;
         if (private_anonymous && pending->prot == 3 && pending->stage_owner) {
             page->mapping_owner = pending->stage_owner;
             page->mapping_begin = page_start;
@@ -4464,7 +4505,14 @@ static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *write
             page->wbitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
         }
         clear_store_bits(page->inherited_writes, offset, chunk);
-        if (page->exec_seen || page->exec_after_write)
+        /* A STORE to data in the same RWX page as the entry is not a code
+         * rewrite. If those bytes subsequently execute, invalidate at that
+         * instruction before evaluating its transfer. */
+        bool defer = page->wx_access && page->prot == 7 &&
+                     !memchr(page->wx_access + offset, WX_EXECUTED, chunk);
+        if (defer)
+            memset(page->wx_access + offset, WX_STORED, chunk);
+        else if (page->exec_seen || page->exec_after_write || page->wx_access)
             phase1_invalidate(page_addr, write_generation, "write_to_executed_code");
         page->written = true;
         page->write_count++;
@@ -4474,7 +4522,8 @@ static void mark_written(uint64_t vaddr, uint32_t size, const InsnExecCtx *write
         stage_record_write(page, vaddr, chunk, owner, writer, seq, write_generation, vcpu);
         if (page->backing_shared)
             stage_record_shared_store(page, vaddr, chunk, owner, writer, seq, write_generation, vcpu);
-        page->exec_seen = false;
+        if (!defer)
+            page->exec_seen = false;
         if (g_layer_has_cand) {
             g_layer_dirty = true;
         }
@@ -5120,6 +5169,43 @@ static GList *include_initial_load_pages(GList *keys, uint64_t max_bytes) {
     return g_list_sort(keys, compare_keys);
 }
 
+/* A headerless loader can allocate BSS separately from executable pages.
+ * Witness zeros at entry, then require a payload access in the same mapping
+ * lifetime before publishing the segment. Ambiguous RW allocations abstain. */
+static void capture_zero_mapping(ProgramCapture *capture, const GList *keys,
+                                 const oep_cand_t *candidate, uint64_t remaining) {
+    const page_t *entry = stage_page_for_pc(candidate->addr);
+    if (!candidate->guest_store_generation || !page_is_payload_mapping(candidate->code_page, entry))
+        return;
+    const page_t *allocation = NULL;
+    uint64_t start = 0;
+    for (const GList *k = keys; k; k = k->next) {
+        uint64_t addr = (uint64_t)(uintptr_t)k->data;
+        const page_t *p = g_hash_table_lookup(pages, k->data);
+        if (!p || !p->fixed_rw_length || p->prot != 3 || !page_is_payload_mapping(addr, p))
+            continue;
+        if (allocation)
+            return;
+        start = addr;
+        allocation = p;
+    }
+    if (!allocation || start < 0x10000 || start >= (UINT64_C(1) << 32) ||
+        allocation->fixed_rw_length > remaining / page_size * page_size ||
+        allocation->fixed_rw_length > (UINT64_C(1) << 32) - start)
+        return;
+    static const uint8_t zeros[TF_ELF_I386_PAGE_SIZE];
+    uint8_t bytes[sizeof(zeros)];
+    for (uint64_t addr = start; addr < start + allocation->fixed_rw_length; addr += page_size) {
+        const page_t *p = stage_page_for_pc(addr);
+        if (!p || p->mapping_epoch != allocation->mapping_epoch || p->prot != 3 ||
+            page_is_program(addr, p) || !guest_read_bytes(addr, bytes, sizeof(bytes)) ||
+            memcmp(bytes, zeros, sizeof(bytes)))
+            return;
+    }
+    capture->zero = (ZeroMapping){.start = start, .length = allocation->fixed_rw_length,
+                                  .mapping_epoch = allocation->mapping_epoch};
+}
+
 static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep_cand_t *candidate) {
     if (g_phase1.capture_at_entry && !g_main_known) {
         capture->status = "unsupported";
@@ -5234,6 +5320,9 @@ static void capture_image(ProgramCapture *capture, uint64_t max_bytes, const oep
         }
         g_byte_array_free(data, TRUE);
     }
+    if (candidate && candidate->mapping_epoch && ok && !partial && !header_seen &&
+        !inferred_end && is_i386 && page_size == TF_ELF_I386_PAGE_SIZE)
+        capture_zero_mapping(capture, keys, candidate, max_bytes - capture->bytes);
     g_list_free(keys);
     g_string_append(capture->regions, "],\n");
     g_string_append(capture->gaps, "]");
@@ -5399,6 +5488,14 @@ static void write_report(void) {
             g_candidate_capture_bytes, g_dse_check_enabled ? "true" : "false",
             trace_archive_enabled() ? "true" : "false", g_main_known ? "true" : "false",
             g_trace_capacity);
+    if (g_selected_candidate && image_captured && g_capture_seq == g_selected_candidate->capture.seq &&
+        g_selected_candidate->capture.zero.access_seq) {
+        const ZeroMapping *zero = &g_selected_candidate->capture.zero;
+        fprintf(f_json, "  \"observed_zero_fill\":{\"address\":%" PRIu64 ",\"length\":%" PRIu64
+                ",\"mapping_epoch\":%" PRIu64 ",\"access_pc\":%" PRIu64 ",\"access_address\":%" PRIu64
+                ",\"access_seq\":%" PRIu64 "},\n", zero->start, zero->length, zero->mapping_epoch,
+                zero->access_pc, zero->access_address, zero->access_seq);
+    }
     fprintf(f_json, "  \"concrete_auxiliary_policy\":\"%s\",\n",
             capture_sparse_auxiliary() ? "syscall_boundaries" : "every_instruction");
     if (g_phase1.enabled)
@@ -6196,6 +6293,22 @@ static page_t *stage_page_for_pc(uint64_t pc) {
     return g_hash_table_lookup(pages, (gpointer)(uintptr_t)address);
 }
 
+static void note_wx_execution(page_t *page, uint64_t pc, unsigned size) {
+    if (!page || !page->track_wx_access)
+        return;
+    if (!page->wx_access) {
+        page->wx_access = g_try_malloc0(page_size);
+        if (!page->wx_access) {
+            page->track_wx_access = false;
+            return;
+        }
+    }
+    unsigned offset = pc & (page_size - 1);
+    if (memchr(page->wx_access + offset, WX_STORED, size))
+        phase1_invalidate(pc - offset, page->gen_written, "write_to_executed_code");
+    memset(page->wx_access + offset, WX_EXECUTED, size);
+}
+
 static uint64_t stage_mapping_epoch_for_pc(uint64_t pc) {
     const page_t *page = stage_page_for_pc(pc);
     return page ? page->mapping_epoch : 0;
@@ -6715,6 +6828,17 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         if (g_ir_has_probe && vaddr == g_ir_probe_pc)
             ir_plugin_check(vcpu_state, cpu_index, current_trace_seq_id, IR_RUNTIME_PROBE, 0, -1);
     }
+    bool now_unpacked = meta && insn_is_unpacked(vaddr, meta->size, false);
+    page_t *cur_pg = now_unpacked ? stage_page_for_pc(vaddr) : NULL;
+    if (g_phase1.capture_at_entry && g_stage_mapping_identity && is_i386 &&
+        page_size == TF_ELF_I386_PAGE_SIZE) {
+        unsigned first = MIN(exec_ctx->size, page_size - (vaddr & (page_size - 1)));
+        /* A fresh fixed executable mapping is dyn_exec, even before a STORE.
+         * An instruction with no decoded metadata still occupies code bytes. */
+        note_wx_execution(meta ? cur_pg : stage_page_for_pc(vaddr), vaddr, first);
+        if (first < exec_ctx->size)
+            note_wx_execution(stage_page_for_pc(vaddr + first), vaddr + first, exec_ctx->size - first);
+    }
     if (!meta) {
         g_cleanup_transfer.candidate_id = 0;
         prev_jump_pending = false;
@@ -6730,10 +6854,6 @@ static void vcpu_insn_exec_impl(unsigned int cpu_index, void *udata) {
         prev_jump_owner_id = 0;
         return;
     }
-    //detect mov to upacked code
-    bool now_unpacked = insn_is_unpacked(vaddr, meta->size, false);
-    page_t *cur_pg = now_unpacked ? stage_page_for_pc(vaddr) : NULL;
-
     bool prev_jump_matches = prev_jump_pending && prev_jump_seq_id &&
                              prev_jump_seq_id != UINT64_MAX &&
                              prev_jump_seq_id + 1 == current_trace_seq_id;

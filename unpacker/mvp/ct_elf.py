@@ -431,6 +431,8 @@ def load_capture(report_path, dump_path):
                        or selected[0].get('code_generation') != executable['code_generation']):
         raise CaptureError('STALE_CANDIDATE', 'Selected candidate does not identify the captured entry generation')
     validate_stage_selection(report)
+    if 'observed_zero_fill' in report:
+        _validate_zero_fill(report, checked, selected)
     return report, checked
 
 
@@ -489,11 +491,35 @@ def _captured_tls(report, regions, entry):
     return _tls_segment(tls, loads, MAX_BYTES)
 
 
+def _validate_zero_fill(report, regions, selected):
+    zero = report['observed_zero_fill']
+    fields = ('address', 'length', 'mapping_epoch', 'access_pc', 'access_address', 'access_seq')
+    if not isinstance(zero, dict) or any(type(zero.get(key)) is not int for key in fields):
+        raise CaptureError('INVALID_CAPTURE', 'Incomplete zero-fill mapping evidence')
+    start, length = zero['address'], zero['length']
+    end = start + length
+    if (report.get('main_image_verified') is not True or
+            report.get('capture_method') != 'candidate_entry_before_instruction' or
+            report.get('capture_layout') != 'tracked_program_pages' or
+            len(selected) != 1 or selected[0].get('candidate_id') != report.get('capture_candidate_id') or
+            not selected[0].get('mapping_epoch') or not selected[0].get('guest_store_generation') or
+            zero['mapping_epoch'] <= 0 or zero['mapping_epoch'] == selected[0]['mapping_epoch'] or
+            not 0 < integer(report.get('capture_trace_seq'), 'capture_trace_seq') <= zero['access_seq'] or
+            start < 0x10000 or start % PAGE or end > 2**32 or
+            not 0 < length <= MAX_BYTES - sum(r['size'] for r in regions) or
+            not start <= zero['access_address'] < end or
+            not any(r['prot'] & 4 and r['address'] <= zero['access_pc'] < r['address'] + r['size']
+                    for r in regions) or
+            any(r['address'] < end and start < r['address'] + r['size'] for r in regions)):
+        raise CaptureError('INVALID_CAPTURE', 'Unbound or overlapping zero-fill mapping')
+
+
 def rebuild(report_path, dump_path, output):
     output = Path(output)
     report, regions = load_capture(report_path, dump_path)
     entry = integer(report['oep'], 'oep')
     tls = _captured_tls(report, regions, entry)
+    zero = report.get('observed_zero_fill')
     groups = []
     for region in regions:
         if groups and groups[-1]['address'] + groups[-1]['size'] == region['address'] and groups[-1]['prot'] == region['prot']:
@@ -501,9 +527,12 @@ def rebuild(report_path, dump_path, output):
             groups[-1]['size'] += region['size']
         else:
             groups.append(dict(address=region['address'], size=region['size'], prot=region['prot'], parts=[region['data']]))
+    if zero:
+        groups.append(dict(address=zero['address'], size=0, memsz=zero['length'], prot=3, parts=[]))
+        groups.sort(key=lambda group: group['address'])
     phnum = len(groups) + 3 + (tls is not None)
     header_size = (ELF_HEADER.size + phnum * PROGRAM_HEADER.size + PAGE - 1) // PAGE * PAGE
-    header_address = regions[0]['address'] - header_size
+    header_address = groups[0]['address'] - header_size
     if header_address < 0x10000:
         raise CaptureError('UNSUPPORTED_PROFILE', 'No space below the image for separate ELF metadata')
     ident = b'\x7fELF\x01\x01\x01' + bytes(9)
@@ -519,8 +548,10 @@ def rebuild(report_path, dump_path, output):
         prot = group['prot']
         flags = (4 if prot & 1 else 0) | (2 if prot & 2 else 0) | (1 if prot & 4 else 0)
         phdrs.append(PROGRAM_HEADER.pack(PT_LOAD, offset, group['address'], group['address'],
-                                         group['size'], group['size'], flags, PAGE))
+                                         group['size'], group.get('memsz', group['size']), flags, PAGE))
         loads.append(dict(address=group['address'], offset=offset, size=group['size'], flags=flags))
+        if 'memsz' in group:
+            loads[-1]['memsz'] = group['memsz']
         offset += group['size']
     if tls is not None:
         address, filesz, align = tls['address'], tls['filesz'], tls['align']
@@ -555,6 +586,11 @@ def rebuild(report_path, dump_path, output):
         if verified.get('tls') != tls:
             raise CaptureError('REBUILD_MISMATCH', 'Rebuilt PT_TLS differs from the capture')
         for load in loads:
+            if not load['size']:
+                if not any(p['address'] == load['address'] and p['filesz'] == 0 and
+                           p['memsz'] == load['memsz'] and p['flags'] == 6 for p in verified['loads']):
+                    raise CaptureError('REBUILD_MISMATCH', 'Missing zero-fill PT_LOAD')
+                continue
             raw = verified['data'][load['offset']:load['offset'] + load['size']]
             if raw != captured_bytes(regions, load['address'], load['size']):
                 raise CaptureError('REBUILD_MISMATCH', 'Rebuilt PT_LOAD bytes differ from the capture')
@@ -575,4 +611,6 @@ def rebuild(report_path, dump_path, output):
                 process_snapshot=False, oep_proof='NOT_ESTABLISHED')
     if tls_receipt is not None:
         receipt['tls'] = tls_receipt
+    if zero:
+        receipt['observed_zero_fill'] = zero
     return receipt
