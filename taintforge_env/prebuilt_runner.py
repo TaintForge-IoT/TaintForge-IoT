@@ -30,12 +30,14 @@ from .environment_snapshot import (
     scan_environment,
     tree_digest
 )
+from .repair_files import CATALOG
 from .execution_backend import (
     ExecutionBackendError,
     ExecutionBackendKind,
     ExecutionBackendResolver,
     ExecutionPlan,
     TraceBackend,
+    host_chroot,
     resolve_runtime_guest_binary,
     resolve_runtime_host_binary
 )
@@ -773,13 +775,13 @@ rmdir {qemu_internal} >/dev/null 2>&1 || true
 """.rstrip()
             execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
-    chroot "$ROOTFS" "$QEMU_GUEST" -strace "$GUEST_BINARY" \
+    "$CHROOT" "$ROOTFS" "$QEMU_GUEST" -strace "$GUEST_BINARY" \
     2> >(tee "$QEMU_TRACE" >&2)"""
         else:
             execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
     strace -ff -yy -s 4096 -o "$STRACE_BASE" \
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
-    chroot "$ROOTFS" "$GUEST_BINARY"
+    "$CHROOT" "$ROOTFS" "$GUEST_BINARY"
 """.rstrip()
 
         return f"""#!/usr/bin/env bash
@@ -793,6 +795,7 @@ STARTED_MARKER={started}
 EXIT_FILE={exit_file}
 TIMEOUT_SECONDS={timeout_value}
 SANDBOX_HOSTNAME={hostname}
+CHROOT={shlex.quote(host_chroot())}
 cleanup() {{
     umount -l "$PROC_DIR" >/dev/null 2>&1 || true
     {qemu_cleanup}
@@ -958,6 +961,7 @@ exit "$status"
                 str(context.run_dir / "logs" / "syscall_events.jsonl"),
                 "--target-arch",
                 context.execution_plan.target.arch,
+                "--guest-cwd", "/",
             ]
             binding_path = context.run_dir / "config/phase1_binding.json"
             if binding_path.is_file():
@@ -1000,6 +1004,9 @@ exit "$status"
                                      context.network_repair_policy.sha256)
             options = ["--network-repair-policy", str(context.run_dir / "config/network_repair_policy.json"),
                        "--network-policy", str(context.run_dir / "config/network_policy.json")]
+        catalog = context.template_runtime_path.parent / CATALOG
+        if catalog.is_file():
+            options.extend(["--repair-files", str(catalog)])
         self.executor.run(
             [
                 sys.executable,
@@ -1008,7 +1015,11 @@ exit "$status"
                 str(context.run_dir / "config" / "runtime_requirements.json"),
                 "--out",
                 str(context.run_dir / "config" / "repair_plan.json"),
-            ] + options, cwd=self.config.project_root,check=True)
+                *options,
+            ],
+            cwd=self.config.project_root,
+            check=True,
+        )
 
     def _generate_report(self, context: PreparedRunContext) -> None:
         self.executor.run(
@@ -1115,7 +1126,8 @@ exit "$status"
         return self.network_backend_factory(backend_config, self.executor)
 
     def _check_host_dependencies(self, context: PreparedRunContext) -> None:
-        required = ("sudo","unshare","bash","mount","umount","ip","hostname","timeout","chroot","tee")
+        host_chroot()
+        required = ("sudo","unshare","bash","mount","umount","ip","hostname","timeout","tee")
         if context.execution_plan.backend == ExecutionBackendKind.NATIVE:
             required = (*required, "strace")
         if self.config.network_mode in {"controlled", "replay", "record"}:

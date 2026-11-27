@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from taintforge_env.repair_files import load_catalog
 from taintforge_env.repair_planner import RepairPlanner, RepairPlanningError
 
 
@@ -28,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--network-repair-policy", type=Path)
     parser.add_argument("--network-policy", type=Path)
+    parser.add_argument("--repair-files", type=Path, help="bound catalog of supplied guest files")
     return parser.parse_args()
 
 
@@ -38,7 +40,10 @@ def main() -> int:
         from taintforge_env.network_policy import load_network_policy
         authorization = NetworkRepairPolicy.load(args.network_repair_policy) if args.network_repair_policy else None
         active = load_network_policy(args.network_policy) if args.network_policy else None
-        plan = RepairPlanner(network_repair_policy=authorization, network_policy=active).plan_file(args.requirements, args.out)
+        supplied = load_catalog(args.repair_files) if args.repair_files else {}
+        plan = RepairPlanner(
+            network_repair_policy=authorization, network_policy=active, supplied_files=supplied,
+        ).plan_file(args.requirements, args.out)
     except (RepairPlanningError, ValueError, OSError) as exc:
         print(f"[!] Repair planning failed: {exc}")
         return 2

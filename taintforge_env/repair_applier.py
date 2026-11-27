@@ -6,12 +6,13 @@ import os
 import re
 import stat
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import repair_files
 from .repair_plan import (
     RepairActionKind,
     RepairDecision,
@@ -186,9 +187,20 @@ class _PreparedNetworkRepair:
 
 
 @dataclass(slots=True, frozen=True)
+class _PreparedFileRepair:
+    decision: RepairDecision
+    rootfs: Path
+    source: repair_files.SuppliedFile
+
+
+_PreparedRepair = _PreparedDirectoryRepair | _PreparedNetworkRepair | _PreparedFileRepair
+
+
+@dataclass(slots=True, frozen=True)
 class RepairApplierConfig:
     allowed_actions: tuple[RepairActionKind, ...] = (
         RepairActionKind.CREATE_DIRECTORY,
+        RepairActionKind.PROVIDE_FILE,
     )
     denied_prefixes: tuple[str, ...] = (
         "/proc",
@@ -203,11 +215,15 @@ class RepairApplier:
 
     The applier does not infer new repairs. It validates the persisted plan,
     verifies the exact runtime-requirements input used by the planner, performs
-    a complete preflight before mutation, and rolls back directories created by
+    a complete preflight before mutation, and rolls back files and directories created by
     the current transaction when an application error occurs.
     """
 
-    def __init__(self, config: RepairApplierConfig | None = None) -> None:
+    def __init__(
+        self, config: RepairApplierConfig | None = None, *,
+        supplied_files: dict[str, repair_files.SuppliedFile] | None = None,
+    ) -> None:
+        self.supplied_files = supplied_files or {}
         self.config = config or RepairApplierConfig()
 
     def apply_file(
@@ -253,8 +269,9 @@ class RepairApplier:
         )
 
         results: list[RepairDecisionResult] = []
-        prepared: list[_PreparedDirectoryRepair | _PreparedNetworkRepair] = []
+        prepared: list[_PreparedRepair] = []
         created_paths: list[Path] = []
+        file_identities = {}
         rollback_errors: list[str] = []
 
         try:
@@ -283,7 +300,7 @@ class RepairApplier:
             results = self._apply_prepared(
                 prepared,
                 initial_results=results,
-                created_paths=created_paths,
+                created_paths=created_paths, file_identities=file_identities,
             )
 
             report = RepairApplicationReport(
@@ -301,7 +318,7 @@ class RepairApplier:
             return report
 
         except Exception as exc:
-            rollback_errors.extend(self._rollback(created_paths))
+            rollback_errors.extend(self._rollback(created_paths, file_identities))
 
             failed_results = self._mark_rolled_back(
                 results,
@@ -334,10 +351,10 @@ class RepairApplier:
         dry_run: bool,
         requirements_path: Path | None = None,
     ) -> tuple[
-        list[_PreparedDirectoryRepair | _PreparedNetworkRepair],
+        list[_PreparedRepair],
         list[RepairDecisionResult],
     ]:
-        prepared: list[_PreparedDirectoryRepair | _PreparedNetworkRepair] = []
+        prepared: list[_PreparedRepair] = []
         results: list[RepairDecisionResult] = []
         virtually_created: set[Path] = set()
 
@@ -391,11 +408,30 @@ class RepairApplier:
                     "Validated offline network configuration; requires a fresh execution attempt.",
                     network_service=selection))
                 continue
-            if decision.action not in self.config.allowed_actions:
+            if decision.action not in self.config.allowed_actions or (
+                decision.action == RepairActionKind.PROVIDE_FILE and not self.supplied_files
+            ):
                 raise RepairApplicationError(
                     f"automatic action {decision.action.value} is not enabled "
                     f"by this applier version ({decision.decision_id})"
                 )
+
+            if decision.action == RepairActionKind.PROVIDE_FILE:
+                guest = self._validate_guest_path(decision.resource)
+                source = self.supplied_files.get(guest)
+                if (source is None or decision.requirement_kind != "filesystem" or decision.operation != "path_exists"
+                        or dict(decision.parameters) != source.parameters()):
+                    raise RepairApplicationError(f"file repair has no matching supplied content: {guest}")
+                exists = repair_files.matches_or_missing(rootfs, guest, source)
+                prepared.append(_PreparedFileRepair(decision, rootfs, source))
+                target = rootfs / guest.lstrip("/")
+                results.append(RepairDecisionResult(
+                    decision_id=decision.decision_id, requirement_id=decision.requirement_id,
+                    action=decision.action.value, resource=guest,
+                    status=RepairResultStatus.ALREADY_SATISFIED if exists else RepairResultStatus.PLANNED,
+                    target_path=str(target), created_paths=() if exists else (str(target),),
+                    reason="Verified explicit content binding and guest destination."))
+                continue
 
             if decision.action == RepairActionKind.CREATE_DIRECTORY:
                 item = self._prepare_directory(
@@ -439,6 +475,14 @@ class RepairApplier:
                 f"{decision.action.value}"
             )
 
+        file_paths = {PurePosixPath(item.decision.resource) for item in prepared
+                      if isinstance(item, _PreparedFileRepair)}
+        if file_paths:
+            for item in prepared:
+                path = PurePosixPath(item.decision.resource)
+                if (isinstance(item, _PreparedDirectoryRepair) and path in file_paths
+                        or any(parent in file_paths for parent in path.parents)):
+                    raise RepairApplicationError(f"planned directory conflicts with a supplied file: {path}")
         return prepared, results
 
     def _prepare_directory(
@@ -508,10 +552,11 @@ class RepairApplier:
 
     def _apply_prepared(
         self,
-        prepared: list[_PreparedDirectoryRepair | _PreparedNetworkRepair],
+        prepared: list[_PreparedRepair],
         *,
         initial_results: list[RepairDecisionResult],
         created_paths: list[Path],
+        file_identities: dict,
     ) -> list[RepairDecisionResult]:
         by_decision = {
             result.decision_id: result for result in initial_results
@@ -526,6 +571,15 @@ class RepairApplier:
                     "Recorded authorized offline service configuration for the next environment version; guest behavior is unvalidated.",
                     network_service=item.selection)
                 continue
+            if isinstance(item, _PreparedFileRepair):
+                start = len(created_paths)
+                repair_files.install_file(item.rootfs, item.decision.resource, item.source, created_paths, file_identities)
+                paths = tuple(str(path) for path in created_paths[start:])
+                result = by_decision[item.decision.decision_id]
+                by_decision[item.decision.decision_id] = replace(result, created_paths=paths,
+                    status=RepairResultStatus.APPLIED if paths else RepairResultStatus.ALREADY_SATISFIED,
+                    reason="Verified supplied file bytes in the repaired rootfs.")
+                continue
             if item.already_satisfied:
                 continue
 
@@ -533,7 +587,6 @@ class RepairApplier:
             for path in item.create_paths:
                 try:
                     path.mkdir(mode=item.mode)
-                    os.chmod(path, item.mode)
                 except FileExistsError:
                     entry_stat = path.lstat()
                     if stat.S_ISLNK(entry_stat.st_mode):
@@ -553,6 +606,7 @@ class RepairApplier:
                     ) from exc
 
                 created_paths.append(path)
+                os.chmod(path, item.mode)
                 actually_created.append(str(path))
 
             by_decision[item.decision.decision_id] = RepairDecisionResult(
@@ -580,11 +634,17 @@ class RepairApplier:
         ]
 
     @staticmethod
-    def _rollback(created_paths: list[Path]) -> list[str]:
+    def _rollback(created_paths: list[Path], file_identities: dict) -> list[str]:
         errors: list[str] = []
         for path in reversed(created_paths):
             try:
-                path.rmdir()
+                if path in file_identities:
+                    info = path.lstat()
+                    if (info.st_dev, info.st_ino) != file_identities[path]:
+                        raise OSError("file changed since publication")
+                    path.unlink()
+                else:
+                    path.rmdir()
             except FileNotFoundError:
                 continue
             except OSError as exc:

@@ -48,6 +48,7 @@ from .progress_oracle import (
     ProgressOracleError,
 )
 from .repair_applier import RepairApplicationError, RepairApplier, RepairApplierConfig
+from .repair_files import SuppliedFile
 from .repair_plan import RepairPlan, RepairPlanValidationError
 
 
@@ -444,7 +445,7 @@ class IterationController:
             )
         return manifest
 
-    def prepare_next(self) -> PreparedIteration:
+    def prepare_next(self, *, supplied_files: dict[str, SuppliedFile] | None = None) -> PreparedIteration:
         with self._locked():
             manifest = self.load()
             if manifest.state != SessionState.ACTIVE:
@@ -534,6 +535,7 @@ class IterationController:
                     repair_application_bytes,
                     environment_manifest,
                 ) = self._build_repaired_snapshot(
+                    supplied_files=supplied_files,
                     store=store,
                     parent_snapshot_id=parent_snapshot_id,
                     plan_path=plan_path,
@@ -976,6 +978,7 @@ class IterationController:
     def _build_repaired_snapshot(
         self,
         *,
+        supplied_files: dict[str, SuppliedFile] | None,
         store: EnvironmentSnapshotStore,
         parent_snapshot_id: str,
         plan_path: Path,
@@ -1000,7 +1003,9 @@ class IterationController:
             try:
                 from .network_repair import bound_policy
                 authorization = bound_policy(self.session_dir)
-                RepairApplier(RepairApplierConfig(network_repair_policy=authorization)).apply_file(
+                RepairApplier(
+                    RepairApplierConfig(network_repair_policy=authorization), supplied_files=supplied_files,
+                ).apply_file(
                     plan_path=plan_path,
                     requirements_path=requirements_path,
                     rootfs=candidate_rootfs,

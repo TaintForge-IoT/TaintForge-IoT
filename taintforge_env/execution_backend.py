@@ -21,6 +21,14 @@ class ExecutionBackendError(RuntimeError):
     """Raised when no safe execution backend can satisfy the runtime."""
 
 
+def host_chroot() -> str:
+    """Resolve the host executable before launching with the guest's clean PATH."""
+    path = shutil.which("chroot") or shutil.which("chroot", path="/usr/sbin:/sbin")
+    if path is None:
+        raise ExecutionBackendError("host chroot executable is missing")
+    return str(Path(path).absolute())
+
+
 class ExecutionBackendKind(StrEnum):
     NATIVE = "native"
     QEMU_USER = "qemu_user"

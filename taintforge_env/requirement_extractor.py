@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Iterable
 
+from .guest_paths import open_flags, regular_read_flags
 from .observations import ObservationBundle
 from .network_events import network_flow_key, normalize_network_event
 from .network_endpoints import OUTBOUND
@@ -36,6 +37,10 @@ PATH_EXISTS_SYSCALLS = {
     "stat",
     "lstat",
     "newfstatat",
+    "stat64",
+    "lstat64",
+    "fstatat64",
+    "faccessat2",
     "access",
     "faccessat",
     "readlink",
@@ -165,7 +170,7 @@ class RequirementExtractor:
 
             syscall = str(event.get("syscall") or "")
             errno = self._optional_string(event.get("errno"))
-            path = self._optional_string(event.get("path"))
+            path = self._optional_string(event.get("resolved_path")) or self._optional_string(event.get("path"))
             return_value = self._optional_int(event.get("return_value"))
 
             if errno == "ENOSYS":
@@ -260,7 +265,7 @@ class RequirementExtractor:
         return_value: int | None,
     ) -> None:
         args = str(event.get("args") or "")
-        flags = self._extract_open_flags(args)
+        flags = open_flags(syscall, args)
         evidence = self._syscall_evidence(event, index)
         blocking = self._blocking_after(events, index)
 
@@ -299,6 +304,13 @@ class RequirementExtractor:
                 return
 
             if syscall in PATH_EXISTS_SYSCALLS:
+                details = {"syscall": syscall}
+                observed = event.get("path") or ""
+                if event.get("path_resolution"):
+                    details.update(observed_path=observed, path_resolution=event["path_resolution"])
+                if (regular_read_flags(flags) and observed and event.get("path_resolution") != "unresolved"
+                        and observed.rsplit("/", 1)[-1] not in {"", ".", ".."}):
+                    details["read_only_file"] = "true"
                 kind = (
                     RequirementKind.DEVICE
                     if path == "/dev" or path.startswith("/dev/")
@@ -314,7 +326,7 @@ class RequirementExtractor:
                     repairable=True,
                     errno=errno,
                     evidence=evidence,
-                    details={"syscall": syscall},
+                    details=details,
                 )
                 return
 
@@ -710,14 +722,9 @@ class RequirementExtractor:
         )
 
     @staticmethod
-    def _extract_open_flags(args: str) -> set[str]:
-        return set(re.findall(r"\bO_[A-Z0-9_]+\b", args))
-
-    @staticmethod
     def _parent_directory(path: str) -> str:
         pure = PurePosixPath(path)
-        parent = str(pure.parent)
-        return parent if parent not in {"", "."} else "/"
+        return str(pure.parent)
 
     @staticmethod
     def _optional_string(value: Any) -> str | None:

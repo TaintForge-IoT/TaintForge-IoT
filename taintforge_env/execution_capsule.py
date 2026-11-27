@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 
+from taintforge_env.execution_backend import host_chroot
 from experiments.execution_capsule_probe import controller as probe
 
 PROFILE = "controlled-i386-handoff-v1"
@@ -397,7 +398,7 @@ def supervise(binding, ipc):
                 plugins.insert(0, owner_argument)
             else:
                 plugins.append(owner_argument)
-        command = ["chroot", binding["rootfs"], "/__taintforge/bin/loader", "--inhibit-cache",
+        command = [host_chroot(), binding["rootfs"], "/__taintforge/bin/loader", "--inhibit-cache",
                    "--library-path", "/__taintforge/lib", "/__taintforge/bin/qemu-i386", "-L", "/", "-strace"]
         for plugin in plugins:
             command += ["-plugin", plugin]

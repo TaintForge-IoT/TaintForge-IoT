@@ -1,49 +1,38 @@
-#python3 rebuild_elf.py -b unpacked.bin -j unpacked.json -e original.elf -o rebuilt.elf
+#!/usr/bin/env python3
+"""Rebuild a static i386 ELF from Phase 1 capture metadata and observed pages."""
 import argparse
+import json
+from pathlib import Path
 import sys
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Rebuild ELF from unpacker dump with original reference"
-    )
-    parser.add_argument(
-        "-b", "--bin", required=True,
-        help="Path to unpacked binary (raw memory dump)"
-    )
-    parser.add_argument(
-        "-j", "--json", required=True,
-        help="Path to unpacked json"
-    )
-    parser.add_argument(
-        "-e", "--elf", required=True,
-        help="Path to original packed ELF"
-    )
-    parser.add_argument(
-        "-o", "--output", default="rebuilt.elf",
-        help="Output path for rebuilt ELF (default: rebuilt.elf)"
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Print detailed merge log"
-    )
-    
-    args = parser.parse_args()
-    
-    # Validate inputs exist
-    for path_attr, label in [("bin", "Dump binary"), ("json", "JSON metadata"), ("elf", "Original ELF")]:
-        import os
-        if not os.path.exists(getattr(args, path_attr)):
-            print(f"[-] Error: {label} not found: {getattr(args, path_attr)}", file=sys.stderr)
-            sys.exit(1)
-    
-    return args
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from unpacker.mvp.ct_elf import CaptureError, rebuild
 
 
-def main():
-    args = parse_args()
-    print(f"[+] Dump binary : {args.bin}")
-    print(f"[+] JSON metadata: {args.json}")
-    print(f"[+] Original ELF : {args.elf}")
-    print(f"[+] Output       : {args.output}")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-b", "--bin", type=Path, required=True, help="Phase 1 unpacked.bin")
+    parser.add_argument("-j", "--json", type=Path, required=True, help="Phase 1 unpacked.json")
+    parser.add_argument("-e", "--elf", type=Path,
+                        help="legacy optional packed input, unused in capture-based reconstruction")
+    parser.add_argument("-o", "--output", type=Path, default=Path("rebuilt.elf"))
+    parser.add_argument("-v", "--verbose", action="store_true", help="print the reconstruction receipt")
+    args = parser.parse_args(argv)
+    try:
+        if args.elf is not None and not args.elf.is_file():
+            raise FileNotFoundError(f"packed reference does not exist: {args.elf}")
+        receipt = rebuild(args.json, args.bin, args.output)
+    except CaptureError as exc:
+        print(f"{exc.reason}: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"Reconstruction failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(receipt, indent=2) if args.verbose else f"{args.output}  sha256={receipt['elf_sha256']}")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

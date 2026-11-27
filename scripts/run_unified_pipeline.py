@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Run the original i386 ELF with Phase 1 instrumentation in a Phase 2 attempt."""
+"""Run an original or reconstructed i386 ELF in an instrumented Phase 2 attempt."""
 from __future__ import annotations
 
 import argparse
+import ctypes
 import ipaddress
 import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 from taintforge_env.elf_runtime import provision_guest
 from taintforge_env.attempt_finalization import error_text
+from taintforge_env.repair_files import CATALOG, write_catalog
 from taintforge_env.network_policy import load_network_policy
 from taintforge_env.synthesis_loop import EnvironmentSynthesisLoop, LoopOutcome, SynthesisLoopConfig
 from taintforge_env.unified_runtime import build_bundle, check_runtime_inputs, write_json
@@ -20,7 +23,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def prepare(args) -> dict:
-    out = args.out.expanduser().resolve()
+    selected_out = args.out.expanduser().absolute()
+    out = selected_out.parent.resolve() / selected_out.name
     if out.exists() or out.is_symlink():
         raise ValueError(f"output directory already exists; use resume or a new --out: {out}")
     if args.network != "none" and args.network_policy is None:
@@ -98,8 +102,8 @@ def prepare(args) -> dict:
         args.capsule_probe = True
     elif args.capsule_owner_mode != "remove" or args.capsule_owner_order != "after" or (args.capsule_memory_mib != 1024 and not (args.capsule_phase1_retirement or args.retire_phase1)):
         raise ValueError("owner and resource options require --capsule-lifecycle")
-    if bool(args.binary) == bool(args.capsule_probe):
-        raise ValueError("select exactly one of --binary or --capsule-probe")
+    if sum(bool(item) for item in (args.binary, args.rebuilt_from, args.capsule_probe)) != 1:
+        raise ValueError("select exactly one of --binary, --rebuilt-from or a capsule fixture")
     capsule_config = input_config
     if args.capsule_probe:
         from taintforge_env.execution_capsule import settings
@@ -165,25 +169,56 @@ def prepare(args) -> dict:
         dns_server = str(ipaddress.IPv4Address(dns_server))
         if policy is not None and not any(s.protocol_hint == "dns" and s.remote_ip == dns_server and s.remote_port == 53 for s in policy.services):
             raise ValueError("guest DNS server must match a port-53 DNS endpoint in --network-policy")
-    out.mkdir(parents=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    bundle_options = {}
+    if observer_option is not None:
+        bundle_options["network_observer"] = observer_option
+    if receipt is not None:
+        bundle_options["flags_receipt"] = receipt
+    with tempfile.TemporaryDirectory(prefix=".tf-prepare-", dir=out.parent) as staging:
+        stage = Path(staging)
+        launch = _prepare_files(
+            args, stage, out, selected, binary, capsule_config, policy, dns_server,
+            bundle_options=bundle_options, repair_policy_path=repair_option,
+        )
+        # Publish the complete tree in one Linux operation, even if a competing
+        # run or an unrelated empty directory appeared after the initial check.
+        libc = ctypes.CDLL(None, use_errno=True)
+        at_fdcwd, rename_noreplace = -100, 1
+        if libc.renameat2(at_fdcwd, os.fsencode(stage), at_fdcwd, os.fsencode(out), rename_noreplace) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(out))
+    return launch
+
+
+def _prepare_files(args, stage, out, selected, binary, capsule_config, policy, dns_server, *,
+                   bundle_options, repair_policy_path):
+    qemu, plugin = Path(selected["qemu"]["path"]), Path(selected["plugin"])
     capsule_build = None
     if capsule_config is not None:
         if args.retire_phase1:
             from experiments.retirement_observer.controller import build_plugin
-            capsule_build = build_plugin(out / "capsule_build")
+            from taintforge_env import input_retirement
+            capsule_build = build_plugin(stage / "capsule_build")
             capsule_build["profile"] = input_retirement.PROFILE
         elif args.capsule_phase1_retirement:
             from taintforge_env.phase1_retirement import build
-            capsule_build = build(out / "capsule_build", trigger=args.capsule_retirement_trigger)
+            capsule_build = build(stage / "capsule_build", trigger=args.capsule_retirement_trigger)
         elif args.capsule_lifecycle:
             from experiments.execution_capsule_lifecycle import controller as lifecycle
             lifecycle.audit(PROJECT_ROOT)
-            capsule_build = lifecycle.build(out / "capsule_build")
+            capsule_build = lifecycle.build(stage / "capsule_build")
         else:
-            capsule_build = probe.build(out / "capsule_build")
+            from experiments.execution_capsule_probe import controller as probe
+            capsule_build = probe.build(stage / "capsule_build")
         if not args.retire_phase1:
             binary = Path(capsule_build["guest"])
-    template = out / "template"
+    rebuilt = None
+    if args.rebuilt_from:
+        from taintforge_env.rebuilt_input import import_rebuilt
+        binary = stage / "input/rebuilt.elf"
+        rebuilt = import_rebuilt(args.rebuilt_from, binary)
+    template = stage / "template"
     rootfs = template / "rootfs"
     for name in ("proc", "dev", "tmp", "bin", "etc", "var/tmp", "run", "root"):
         (rootfs / name).mkdir(parents=True, exist_ok=True)
@@ -197,7 +232,7 @@ def prepare(args) -> dict:
         # The caller may move the source after preparation; captured memory is
         # never used as the next executable.
         from taintforge_env.elf_runtime import copy_file
-        saved_input = out / "input/sample.elf"
+        saved_input = stage / "input/sample.elf"
         copy_file(rootfs / guest.lstrip("/"), saved_input,
                   expected=guest_runtime["target"]["sha256"], executable=True)
         binary = saved_input
@@ -205,40 +240,54 @@ def prepare(args) -> dict:
         raise ValueError("the Phase 1 v1 integration profile supports Linux i386 ELF only")
     config = template / "config"
     bundle_path = config / "analyzer_runtime"
-    observer_kwargs = {"network_observer": observer_option} if observer_option else {}
-    if receipt is not None:
-        observer_kwargs['flags_receipt'] = receipt
-    bundle = build_bundle(bundle_path, qemu=qemu, plugin=plugin, capsule_probe=capsule_build, **observer_kwargs)
+    bundle = build_bundle(bundle_path, qemu=qemu, plugin=plugin, capsule_probe=capsule_build, **bundle_options)
     if capsule_config is not None:
         bundled_qemu = next(item for item in bundle["files"] if item["path"] == bundle["qemu"])
         if bundled_qemu["sha256"] != selected["qemu"]["sha256"]:
             raise ValueError("selected QEMU changed while preparing the capsule bundle")
+    def published(path):
+        path = Path(path)
+        return str(out / path.relative_to(stage)) if path.is_relative_to(stage) else str(path)
+
+    if capsule_build is not None:
+        build_receipt = stage / "capsule_build/build.json"
+        record = dict(capsule_build)
+        for key in ("guest", "plugin", "lifecycle_plugin"):
+            if key in record:
+                record[key] = published(record[key])
+        write_json(build_receipt, record)
+    guest_runtime["target"]["path"] = published(guest_runtime["target"]["path"])
+    for item in guest_runtime["files"]:
+        item["source"] = published(item["source"])
     write_json(config / "guest_runtime.json", guest_runtime)
+    if args.repair_file:
+        write_catalog(config / CATALOG, args.repair_file)
     if policy is not None:
         write_json(config / "network_policy.json", policy.to_dict())
     (rootfs / "etc/resolv.conf").write_text(f"nameserver {dns_server}\noptions timeout:2 attempts:1\n" if dns_server else "# No DNS endpoint configured\n")
     (rootfs / "etc/nsswitch.conf").write_text("hosts: files dns\n")
     (rootfs / "etc/hosts").write_text("127.0.0.1 localhost\n")
-    # The copied original ELF, its interpreter and libraries form the seed.
-    # A raw Phase 1 memory capture is never passed to exec as an ELF file.
-    runtime = {"schema_version": 1, "arch": "i386", "rootfs": str(rootfs),
-               "host_binary": str(binary), "host_binary_path": str(binary),
+    # Bind paths in the final session tree, including a retained rebuilt executable.
+    runtime = {"schema_version": 1, "arch": "i386", "rootfs": published(rootfs),
+               "host_binary": published(binary), "host_binary_path": published(binary),
                "guest_binary": guest, "guest_binary_path": guest, "qemu_required": True,
                "guest_library_path": guest_runtime["library_path"],
                "network_mode": args.network, "allow_internet": False,
-               "phase1": {"bundle_path": str(bundle_path), "bundle_sha256": bundle["bundle_sha256"],
+               "phase1": {"bundle_path": published(bundle_path), "bundle_sha256": bundle["bundle_sha256"],
                           "options": args.phase1_option}}
+    if rebuilt is not None:
+        runtime["rebuilt_input"] = rebuilt
     if capsule_config is not None:
         runtime["capsule"] = capsule_config
     write_json(config / "runtime.json", runtime)
-    launch = {"schema_version": 1, "session_dir": str(out / "session"), "template_run_dir": str(template),
-              "project_root": str(PROJECT_ROOT), "snapshot_store": str(out / "snapshots"), "seed_rootfs": str(rootfs),
-              "binary_path": str(binary), "network_mode": args.network,
+    launch = {"schema_version": 1, "session_dir": str(out / "session"), "template_run_dir": published(template),
+              "project_root": str(PROJECT_ROOT), "snapshot_store": str(out / "snapshots"), "seed_rootfs": published(rootfs),
+              "binary_path": published(binary), "network_mode": args.network,
               "target_spec_path": str(args.target_spec.expanduser().resolve()) if args.target_spec else None,
               "replay_store_path": str(args.replay_store.expanduser().resolve()) if args.replay_store else None,
-              "network_repair_policy_path": str(repair_option.absolute()) if repair_option else None,
+              "network_repair_policy_path": str(repair_policy_path.absolute()) if repair_policy_path else None,
               "timeout_seconds": args.timeout, "max_iterations": args.max_iterations}
-    write_json(out / "unified_launch.json", launch)
+    write_json(stage / "unified_launch.json", launch)
     return launch
 
 
@@ -280,8 +329,15 @@ def run_session(out: Path, launch: dict, *, max_steps: int, initialize_only=Fals
             "report_markdown": str(session_dir / "synthesis_report.md"),
             "event_log": str(session_dir / "synthesis_events.jsonl"),
         }
+    runtime = _saved_result(Path(launch["template_run_dir"]) / "config/runtime.json")
+    rebuilt = runtime.get("rebuilt_input")
+    launch_source = "rebuilt_elf" if rebuilt is not None else "original_elf"
+    if runtime.get("status") == "unavailable":
+        launch_source = "unavailable"
     report = {"schema_version": 1, **result_data, "execution_model": "one_qemu_process_per_attempt",
-              "launch_source": "original_elf", "memory_isolation": "not_implemented", "fuzzing_ready": False}
+              "launch_source": launch_source, "memory_isolation": "not_implemented", "fuzzing_ready": False}
+    if rebuilt is not None:
+        report["rebuilt_input"] = rebuilt
     index = result_data["last_iteration_index"]
     if isinstance(index, int) and index >= 0:
         directory = session_dir / f"iterations/{index:04d}/run"
@@ -315,8 +371,10 @@ def _saved_result(path: Path) -> dict:
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="prepare a fresh environment and run the original ELF")
+    run = commands.add_parser("run", help="prepare a fresh environment and run the selected ELF")
     run.add_argument("--binary", type=Path)
+    run.add_argument("--rebuilt-from", type=Path, metavar="UNPACK_DIR",
+                     help="use the verified rebuilt.elf from a completed unpacker.unpack run")
     run.add_argument("--retire-phase1", action="store_true",
         help="M3: static i386 input, current heuristic verdict, independent observer and fresh repair attempts")
     run.add_argument("--retirement-selection-delay", type=int, default=16)
@@ -354,6 +412,8 @@ def parser():
     run.add_argument("--qemu", help="dynamic qemu-i386 path; defaults to PATH")
     run.add_argument("--sysroot", type=Path, default=Path("/"), help="source of matching guest loader/libraries; never executed")
     run.add_argument("--library-dir", action="append", default=[], help="additional absolute search path inside --sysroot")
+    run.add_argument("--repair-file", action="append", default=[], metavar="/GUEST/PATH=HOST_FILE",
+                     help="supply exact bytes for a subsequently observed missing read-only file")
     run.add_argument("--extra-library", action="append", default=[], help="explicit dlopen dependency, e.g. libvendor.so")
     run.add_argument("--network", choices=("none", "controlled", "record", "replay"), default="none")
     run.add_argument("--network-policy", type=Path)

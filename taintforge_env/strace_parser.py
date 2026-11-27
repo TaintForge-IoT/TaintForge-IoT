@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from .guest_paths import GuestPaths
 from .syscall_result import parse_result, syscall_success
 from .network_endpoints import SocketTraceTracker, printed_endpoint
 
@@ -42,6 +43,10 @@ PATH_SYSCALLS = {
     "lstat",
     "fstat",
     "newfstatat",
+    "stat64",
+    "lstat64",
+    "fstatat64",
+    "faccessat2",
     "access",
     "faccessat",
     "readlink",
@@ -146,6 +151,8 @@ class SyscallEvent:
     endpoint_reason: Optional[str] = None
     endpoint_observer_status: Optional[str] = None
     endpoint_observation_seq: Optional[int] = None
+    resolved_path: Optional[str] = None
+    path_resolution: Optional[str] = None
 
 
 class StraceParserError(RuntimeError):
@@ -164,7 +171,7 @@ def parse_strace_logs(log_dir: str | Path, out_path: str | Path) -> dict:
     events: list[SyscallEvent] = []
 
     for path in strace_files:
-        events.extend(parse_strace_file(path))
+        events.extend(parse_strace_file(path, single_trace=len(strace_files) == 1))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -208,11 +215,14 @@ def is_successful_chroot_line(line: str) -> bool:
 def is_guest_execve_line(line: str) -> bool:
     return GUEST_EXEC_RE.match(line) is not None
 
-def parse_strace_file(path: Path) -> list[SyscallEvent]:
+def parse_strace_file(path: Path, *, single_trace: bool = True) -> list[SyscallEvent]:
     events: list[SyscallEvent] = []
     sockets = SocketTraceTracker()
 
     execution_context = "host_wrapper"
+    locations = GuestPaths()
+    if not single_trace:
+        locations.lose_context()
 
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8", errors="replace").splitlines(),
@@ -225,6 +235,7 @@ def parse_strace_file(path: Path) -> list[SyscallEvent]:
 
         if "<unfinished ...>" in line or "resumed>" in line:
             sockets.reset()
+            locations.lose_context()
             continue
 
         if is_guest_execve_line(line):
@@ -241,6 +252,7 @@ def parse_strace_file(path: Path) -> list[SyscallEvent]:
             if parsed.pid is None and re.fullmatch(r"strace\.[0-9]+", path.name):
                 parsed.pid = int(path.name.split(".")[1])
             sockets.apply(parsed)
+            locations.observe(parsed)
             events.append(parsed)
 
         if is_successful_chroot_line(line):

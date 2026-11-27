@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from taintforge_env.repair_files import load_catalog
 from taintforge_env.iteration_controller import (
     DEFAULT_DISCOVERY_GOAL_ID,
     IterationController,
@@ -39,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare the next clean execution rootfs",
     )
     prepare.add_argument("--session-dir", type=Path, required=True)
+    prepare.add_argument("--repair-files", type=Path, help="catalog of explicitly supplied guest files")
 
     complete = subparsers.add_parser(
         "complete",
@@ -88,7 +90,8 @@ def main() -> int:
 
         controller = IterationController(args.session_dir)
         if args.command == "prepare":
-            prepared = controller.prepare_next()
+            supplied = load_catalog(args.repair_files) if args.repair_files else {}
+            prepared = controller.prepare_next(supplied_files=supplied)
             print(f"[+] Prepared iteration: {prepared.record.index}")
             print(f"[+] Environment snapshot: {prepared.environment_snapshot_id}")
             print(f"[+] Environment manifest: {prepared.environment_manifest_id}")
@@ -120,7 +123,7 @@ def main() -> int:
             print(f"[+] Iterations: {len(manifest.iterations)}")
             return 0
         raise AssertionError(args.command)
-    except (IterationControllerError, OSError) as exc:
+    except (IterationControllerError, OSError, ValueError) as exc:
         print(f"[!] Iteration controller failed: {exc}")
         return 2
 

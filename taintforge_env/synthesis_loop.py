@@ -19,6 +19,7 @@ from .iteration_controller import (
     SessionManifest,
     SessionState,
 )
+from .repair_files import CATALOG, load_catalog
 from .execution_backend import (
     ExecutionBackendError,
     ExecutionBackendResolver,
@@ -189,6 +190,10 @@ class EnvironmentSynthesisLoop:
     def run(self) -> SynthesisLoopResult:
         with self._loop_locked():
             controller, session, binding = self._open_or_initialize()
+            supplied_files = {}
+            for item in binding["template_config_files"]:
+                if Path(item["path"]).name == CATALOG:
+                    supplied_files = load_catalog(Path(item["path"]), expected_sha256=item["sha256"])
             invocation_id = int(binding.get("invocations", 0)) + 1
             executions = 0
             self._append_event(
@@ -280,7 +285,7 @@ class EnvironmentSynthesisLoop:
 
                     latest = session.iterations[-1] if session.iterations else None
                     if latest is None or latest.state == IterationState.COMPLETED:
-                        prepared = controller.prepare_next()
+                        prepared = controller.prepare_next(supplied_files=supplied_files)
                         latest = prepared.record
                         self._append_event(
                             "iteration_prepared",
@@ -814,6 +819,7 @@ class EnvironmentSynthesisLoop:
             "library_resolution.json",
             "network_policy.json",
             "guest_runtime.json",
+            CATALOG,
         )
         entries: list[dict[str, Any]] = []
         for name in names:

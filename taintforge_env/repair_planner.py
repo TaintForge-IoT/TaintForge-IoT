@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
+from .repair_files import SuppliedFile
 from .repair_plan import (
     RepairActionKind,
     RepairDecision,
@@ -48,8 +49,11 @@ class RepairPlanner:
     later automation is permitted to apply it without human review.
     """
 
-    def __init__(self, config: RepairPlannerConfig | None = None, *, network_repair_policy=None,
-                 network_policy=None) -> None:
+    def __init__(
+        self, config: RepairPlannerConfig | None = None, *, network_repair_policy=None,
+        network_policy=None, supplied_files: dict[str, SuppliedFile] | None = None,
+    ) -> None:
+        self.supplied_files = supplied_files or {}
         self.config = config or RepairPlannerConfig()
         self.network_repair_policy = network_repair_policy
         self.network_policy = network_policy
@@ -271,6 +275,15 @@ class RepairPlanner:
             )
 
         if requirement.operation == "path_exists":
+            supplied = self.supplied_files.get(requirement.resource)
+            if (supplied is not None and requirement.status == RequirementStatus.UNMET
+                    and requirement.errno == "ENOENT" and dict(requirement.details).get("read_only_file") == "true"
+                    and requirement.confidence >= self.config.minimum_auto_confidence
+                    and not _is_pseudo_filesystem_path(requirement.resource)):
+                return self._decision(requirement, action=RepairActionKind.PROVIDE_FILE,
+                    disposition=RepairDisposition.AUTO_CANDIDATE, priority=priority, risk=RepairRisk.LOW,
+                    automatic_allowed=True, reason="A missing read-only file has explicitly supplied contents.",
+                    parameters=supplied.parameters())
             return self._decision(
                 requirement,
                 action=RepairActionKind.PROVIDE_FILE,

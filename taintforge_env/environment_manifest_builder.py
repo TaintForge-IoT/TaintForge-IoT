@@ -27,6 +27,7 @@ from .progress_oracle import (
     IterationObservation,
     ProgressOracleError,
 )
+from .repair_files import observe_file
 from .repair_plan import (
     RepairActionKind,
     RepairDisposition,
@@ -244,13 +245,10 @@ def derive_environment_manifest_from_repair(
                 confidence=ManifestConfidence.HYPOTHESIS, status=ManifestEntryStatus.ACTIVE)
             entries = _merge_entry(entries, replacement)
             continue
-        if decision.action != RepairActionKind.CREATE_DIRECTORY:
-            raise EnvironmentManifestBuilderError(
-                "selected repair action has no manifest mapping: "
-                f"{decision.action.value}"
-            )
-
-        replacement = _directory_entry(
+        if decision.action not in {RepairActionKind.CREATE_DIRECTORY, RepairActionKind.PROVIDE_FILE}:
+            raise EnvironmentManifestBuilderError(f"selected repair has no manifest mapping: {decision.action.value}")
+        replacement = _filesystem_entry(
+            action=decision.action,
             rootfs=rootfs,
             contract=source_contract,
             decision_id=decision_id,
@@ -284,8 +282,9 @@ def derive_environment_manifest_from_repair(
     )
 
 
-def _directory_entry(
+def _filesystem_entry(
     *,
+    action: RepairActionKind,
     rootfs: Path,
     contract: AttemptContract,
     decision_id: str,
@@ -294,24 +293,37 @@ def _directory_entry(
     observation_sha256: str,
     application_sha256: str,
 ) -> ManifestEntry:
-    mode_raw = parameters.get("mode")
-    parents = parameters.get("parents")
-    if (
-        not isinstance(mode_raw, str)
-        or re.fullmatch(r"0?[0-7]{3}", mode_raw) is None
-        or parents is not True
-    ):
-        raise EnvironmentManifestBuilderError(
-            f"directory repair {decision_id} lacks exact mode/parents semantics"
-        )
-    mode = _observed_directory_mode(rootfs, resource, decision_id)
-    value_payload = {
-        "action": RepairActionKind.CREATE_DIRECTORY.value,
-        "mode": mode,
-        "parents": True,
-        "resource": resource,
-    }
-    value_sha256 = _canonical_sha256(value_payload)
+    if action == RepairActionKind.PROVIDE_FILE:
+        try:
+            observed = observe_file(rootfs, resource)
+        except (OSError, ValueError) as exc:
+            raise EnvironmentManifestBuilderError(f"cannot verify supplied guest file {resource}: {exc}") from exc
+        if parameters != observed.parameters():
+            raise EnvironmentManifestBuilderError(f"supplied guest file differs from the repair plan: {resource}")
+        kind, provider = ManifestResourceKind.FILE, "supplied_file"
+        value_sha256 = observed.sha256
+        value_id = f"file-{value_sha256[:12]}"
+    else:
+        mode_raw = parameters.get("mode")
+        parents = parameters.get("parents")
+        if (
+            not isinstance(mode_raw, str)
+            or re.fullmatch(r"0?[0-7]{3}", mode_raw) is None
+            or parents is not True
+        ):
+            raise EnvironmentManifestBuilderError(
+                f"directory repair {decision_id} lacks exact mode/parents semantics"
+            )
+        mode = _observed_directory_mode(rootfs, resource, decision_id)
+        value_payload = {
+            "action": RepairActionKind.CREATE_DIRECTORY.value,
+            "mode": mode,
+            "parents": True,
+            "resource": resource,
+        }
+        value_sha256 = _canonical_sha256(value_payload)
+        kind, provider = ManifestResourceKind.DIRECTORY, "static_directory"
+        value_id = f"directory-{mode}-{value_sha256[:12]}"
     evidence = tuple(
         sorted(
             (
@@ -333,12 +345,12 @@ def _directory_entry(
     )
     return ManifestEntry(
         resource_id=f"fs:{resource}",
-        kind=ManifestResourceKind.DIRECTORY,
+        kind=kind,
         lifecycle_scope=LifecycleScope.UNKNOWN,
         first_seen_stage=contract.initial_stage,
         first_seen_attempt_id=contract.attempt_id,
-        provider="static_directory",
-        value_id=f"directory-{mode}-{value_sha256[:12]}",
+        provider=provider,
+        value_id=value_id,
         value_sha256=value_sha256,
         evidence=evidence,
         confidence=ManifestConfidence.OBSERVED,

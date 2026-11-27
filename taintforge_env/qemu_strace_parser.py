@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .guest_paths import GuestPaths
 from .log_io import LogReadError, MAX_LOG_LINE_BYTES, iter_log_lines
 from .syscall_result import parse_result
 from .network_endpoints import CAPTURED, EndpointCapture, EndpointCaptureError, SocketTraceTracker, printed_endpoint
@@ -31,6 +33,7 @@ def parse_qemu_strace(
     endpoint_events: str | Path | None = None,
     session_id: str | None = None,
     attempt_id: str | None = None,
+    initial_guest_cwd: str | None = None,
 ) -> dict[str, Any]:
     source = Path(input_path)
     destination = Path(out_path)
@@ -79,6 +82,7 @@ def parse_qemu_strace(
 
     statistics = {"lines_total": 0, "ignored_lines": 0, "skipped_unfinished_lines": 0,
                   "max_line_bytes": MAX_LOG_LINE_BYTES}
+    locations = GuestPaths(initial_guest_cwd)
     temporary_paths = []
     try:
         sockets = SocketTraceTracker(target_arch=target_arch)
@@ -91,11 +95,17 @@ def parse_qemu_strace(
                     statistics["lines_total"] = line_number
                     line = raw_line.strip()
                     if "<unfinished ...>" in line or ("<... " in line and " resumed>" in line):
+                        locations.lose_context()
                         statistics["skipped_unfinished_lines"] += 1
                         sockets.reset()
                         continue
                     event = parse_strace_line(line, source.name, line_number, "guest") if line else None
                     if event is None:
+                        ended = re.match(r"^(\d{1,10}) (?:exit|exit_group)\(-?\d+\)$", line)
+                        if ended:
+                            locations.exit(int(ended[1]))
+                        elif re.match(r"^\d+ (?:[a-z_]+\(|Unknown syscall)", line):
+                            locations.lose_context()
                         statistics["ignored_lines"] += 1
                         continue
                     if event.syscall.lower() in CAPTURED:
@@ -105,6 +115,7 @@ def parse_qemu_strace(
                     sockets.apply(event)
                     if capture is not None:
                         capture.enrich(event)
+                    locations.observe(event)
                     payload = asdict(event)
                     payload.update(trace_backend="qemu_strace", target_arch=target_arch)
                     stream.write(json.dumps(payload, ensure_ascii=False) + "\n")

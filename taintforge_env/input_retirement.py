@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 
+from taintforge_env.execution_backend import host_chroot
 from experiments.retirement_observer import controller as observer
 from . import capsule_resources, phase1_retirement as retirement, retirement_mappings
 from .attempt import AttemptContract
@@ -297,7 +298,7 @@ def supervise(binding, ipc):
             warm.start()
             arg += ',afl-warm=/__taintforge_capsule/afl-warm.sock,afl-warm-rss=' + str(binding['afl_warm']['max_rss_mib'])
         plugins = plugin_arguments(binding, phase, arg)
-        command = ["chroot", binding["rootfs"], "/__taintforge/bin/loader", "--inhibit-cache",
+        command = [host_chroot(), binding["rootfs"], "/__taintforge/bin/loader", "--inhibit-cache",
             "--library-path", "/__taintforge/lib", "/__taintforge/bin/qemu-i386", "-L", "/", "-strace",
             *plugins, binding["guest_binary"]]
         result["command"] = command

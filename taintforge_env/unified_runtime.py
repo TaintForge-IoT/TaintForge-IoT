@@ -278,7 +278,8 @@ def prepare_attempt(context, temporary: Path) -> dict:
     verify_bundle(destination, plan.analyzer_bundle_sha256)
     Phase1Run, Phase1Runtime, _ = phase1_api()
     runtime = Phase1Runtime.load(destination / manifest["plugin"])
-    options = json.loads(context.template_runtime_path.read_text())["phase1"].get("options", [])
+    template_runtime = json.loads(context.template_runtime_path.read_text())
+    options = template_runtime["phase1"].get("options", [])
     if not isinstance(options, list) or not all(isinstance(option, str) for option in options):
         raise UnifiedRuntimeError("phase1 options must be a list of strings")
     receipt = destination/manifest['flags_receipt'] if 'flags_receipt' in manifest else None
@@ -301,7 +302,8 @@ def prepare_attempt(context, temporary: Path) -> dict:
                "bundle_sha256": manifest["bundle_sha256"], "plugin": manifest["plugin"],
                "plugin_argument": ",".join(parts), "output_directory": str(context.run_dir / "logs" / "phase1"),
                "control_channel_protection": "unverified", "process_checkpoint": False,
-               "execution_model": "original_elf_one_qemu_process_per_attempt"}
+               "execution_model": ("rebuilt_elf_one_qemu_process_per_attempt" if "rebuilt_input" in template_runtime
+                                   else "original_elf_one_qemu_process_per_attempt")}
     if "network_observer" in manifest:
         from .network_observer import plugin_argument
         (temporary / "logs/network_endpoints").mkdir(mode=0o700)
@@ -316,7 +318,7 @@ def prepare_attempt(context, temporary: Path) -> dict:
     if "capsule" in manifest:
         from .execution_capsule import prepare_binding
         prepare_binding(context, temporary, manifest, binding)
-    elif "capsule" in json.loads(context.template_runtime_path.read_text()):
+    elif "capsule" in template_runtime:
         raise UnifiedRuntimeError("capsule settings require a bound capsule runtime")
     return binding
 
@@ -456,7 +458,7 @@ mount -o remount,bind,ro {quote(str(tool_mount))}
         observer_argument = " -plugin " + quote(binding["network_observer"]["plugin_argument"])
     execution = f"""timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \\
     env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \\
-    chroot "$ROOTFS" {GUEST_TOOL_DIR}/bin/loader --inhibit-cache \\
+    "$CHROOT" "$ROOTFS" {GUEST_TOOL_DIR}/bin/loader --inhibit-cache \\
     --library-path {GUEST_TOOL_DIR}/lib "$QEMU_GUEST" -L / -strace \\
     -plugin {quote(binding['plugin_argument'])}{observer_argument} {guest_env} "$GUEST_BINARY" \\
     2> >(tee "$QEMU_TRACE" >&2)"""

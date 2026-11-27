@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from taintforge_env.repair_files import load_catalog
 from taintforge_env.repair_applier import (
     RepairApplicationError,
     RepairApplier,
@@ -50,6 +51,7 @@ def parse_args() -> argparse.Namespace:
         help="Validate and report changes without mutating rootfs",
     )
     parser.add_argument("--network-repair-policy", type=Path)
+    parser.add_argument("--repair-files", type=Path, help="catalog of explicitly supplied guest files")
     return parser.parse_args()
 
 
@@ -59,7 +61,10 @@ def main() -> int:
     try:
         from taintforge_env.network_repair import NetworkRepairPolicy
         authorization = NetworkRepairPolicy.load(args.network_repair_policy) if args.network_repair_policy else None
-        report = RepairApplier(RepairApplierConfig(network_repair_policy=authorization)).apply_file(
+        supplied = load_catalog(args.repair_files) if args.repair_files else {}
+        report = RepairApplier(
+            RepairApplierConfig(network_repair_policy=authorization), supplied_files=supplied,
+        ).apply_file(
             plan_path=args.plan,
             requirements_path=args.requirements,
             rootfs=args.rootfs,

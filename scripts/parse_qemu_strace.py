@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--endpoint-events")
     parser.add_argument("--endpoint-session")
     parser.add_argument("--endpoint-attempt")
+    parser.add_argument("--guest-cwd", help="known initial working directory inside the guest")
     args = parser.parse_args()
 
     try:
@@ -32,8 +33,9 @@ def main() -> None:
             endpoint_events=args.endpoint_events,
             session_id=args.endpoint_session,
             attempt_id=args.endpoint_attempt,
+            initial_guest_cwd=args.guest_cwd,
         )
-    except QemuStraceParserError as exc:
+    except (QemuStraceParserError, ValueError) as exc:
         print(f"[!] QEMU strace parsing failed: {exc}")
         raise SystemExit(1) from exc
 
